@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gwprov"
+dynamic = ["version"]
+description = "Reusable provisioning and control tools for Game & Watch devices and GWemu"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-2.0-only"
+dependencies = ["gnwmanager"]
+
+[project.optional-dependencies]
+device = ["gnwmanager"]
+media = ["littlefs-python>=0.9", "PyYAML>=6"]
+dist = ["wasmtime>=20"]
+dev = ["pytest>=8", "ruff>=0.9"]
+
+[project.scripts]
+gwprov = "gwprov.cli:main"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gwprov"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

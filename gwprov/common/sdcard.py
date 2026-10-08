@@ -17,6 +17,7 @@ running device, and a card in a reader without three copies of the recipe.
 import os
 import shutil
 import subprocess
+import sys
 
 # The firmware expects an MBR with a FAT32 primary partition starting at 1 MiB.
 # mtools addresses that as `img@@1M`. A bare filesystem image is simply not
@@ -126,22 +127,26 @@ def create_image(path, size_mb=128, label="RETROGO", script=None):
     """
     script = script or os.path.join(os.path.dirname(__file__), "..",
                                     "make_sdcard_image.py")
-    subprocess.run(["python3", script, path, "--size-mb", str(size_mb)],
+    subprocess.run([sys.executable, script, path, "--size-mb", str(size_mb)],
                    check=True)
     subprocess.run(["mformat", "-i", f"{path}{MTOOLS_PARTITION_OFFSET}",
                     "-F", "-v", label, "::"], check=True)
     return path
 
 
-def push_tree(manager, local_dir):
+def push_tree(manager, local_dir, *, exclude_names=()):
     """Copy a directory tree onto the card, preserving layout."""
-    local_dir = local_dir.rstrip("/")
+    local_dir = os.fspath(local_dir).rstrip("/")
+    excluded = set(exclude_names)
     for root, dirs, files in os.walk(local_dir):
+        dirs[:] = sorted(name for name in dirs if name not in excluded)
         rel = os.path.relpath(root, local_dir)
         remote_dir = "" if rel == "." else rel.replace(os.sep, "/")
         if remote_dir:
             manager.mkdir(remote_dir)
         for name in sorted(files):
+            if name in excluded:
+                continue
             remote = f"{remote_dir}/{name}" if remote_dir else name
             manager.push_file(os.path.join(root, name), remote)
 

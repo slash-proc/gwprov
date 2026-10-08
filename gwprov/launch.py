@@ -8,6 +8,12 @@ import subprocess
 from .profiles import DeviceProfile
 
 
+def _sd_image_format(path: Path) -> str:
+    """Return the block format for an SD image from its file signature."""
+    with path.open('rb') as image:
+        return 'qcow2' if image.read(4) == b'QFI\xfb' else 'raw'
+
+
 def launch_profile(directory: str | Path, *, headless: bool = False, audio: bool = False,
                    timeline: str | None = None, gdb_port: int | None = None,
                    qmp_socket: str | None = None) -> int:
@@ -18,14 +24,14 @@ def launch_profile(directory: str | Path, *, headless: bool = False, audio: bool
     for prop,path in [('bank1-image',profile.bank1),('bank2-image',profile.bank2),
                       ('extflash-image',profile.extflash)]:
         cmd += ['-global', f'gnw-h7b0-soc.{prop}={path}']
-    rdp = profile.root / 'rdp-state.bin'
-    if not rdp.exists():rdp = profile.root / 'rdp.bin'
-    cmd += ['-global',f'gnw-h7b0-soc.rdp-image={rdp}']
     cmd += ['-display', 'none' if headless else 'gwemu', '-audiodev',
             'sdl3,id=snd0' if audio else 'none,id=snd0',
             '-global', 'gnw-h7b0-sai1.audiodev=snd0']
     if profile.resolved_sd:
-        cmd += ['-drive',f'if=sd,format=raw,file={profile.resolved_sd}']
+        if not profile.resolved_sd.is_file():
+            raise ValueError(f'profile SD image is missing: {profile.resolved_sd}')
+        image_format = _sd_image_format(profile.resolved_sd)
+        cmd += ['-drive',f'if=sd,format={image_format},file={profile.resolved_sd}']
     if gdb_port is not None:cmd += ['-gdb',f'tcp:127.0.0.1:{gdb_port}']
     if qmp_socket:cmd += ['-qmp',f'unix:{Path(qmp_socket).resolve()},server=on,wait=off']
     config = profile.root / 'gwemu.toml'

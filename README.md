@@ -10,6 +10,12 @@ Run from the gwprov checkout. Keep generated content, profiles and environments 
 `dev-local/`, which is ignored by Git. The final launch requires `gwemu` on PATH;
 a wrapper named `gwemu` on PATH is also supported.
 
+On macOS, install Python and mtools with Homebrew first (`brew install python@3.11
+mtools`). Apple's system Python is older than gwprov's supported Python version.
+Create the environment with `python3.11 -m venv dev-local/venv` instead of the
+`python3` command below. GWemu must also be available on PATH; gwprov does not
+install or build the emulator.
+
 ```bash
 cd /path/to/gwprov
 python3 -m venv dev-local/venv
@@ -21,6 +27,10 @@ python -m pip install -r requirements.txt
 
 # Optional: enable Bash completion in this shell.
 eval "$(gwprov completion bash)"
+
+# In zsh, initialize completion first, then load gwprov's completion function.
+# autoload -Uz compinit && compinit
+# eval "$(gwprov completion zsh)"
 ```
 
 `requirements.txt` installs the `dist` and `media` extras from `pyproject.toml`,
@@ -85,9 +95,11 @@ non-recursive. Actual released converter WASM runs through Wasmtime.
 For a project that is not published in the GWRG catalog yet, use
 `gwprov project stage-local` after `gwprov retro-go install`. The JSON manifest
 names each local source and its destination under `frogfs/` or `littlefs/`;
-mapped FrogFS artifacts also declare their relocation base. Paths in `source`
-are relative to the manifest unless absolute. Optional `sha256` values pin a
-source file.
+mapped core artifacts declare their link-time relocation base. Paths in
+`source` are relative to the manifest unless absolute. Optional `sha256`
+values pin a source file. For `variant: "sd"`, `path` is relative to the SD
+card root, such as `cores/example.bin` or `roms/nes/example.nes`; a mapped core
+artifact uses that same `cores/` path and includes its `relocBase`.
 
 ```json
 {
@@ -103,14 +115,26 @@ source file.
       {"source": "build/example.bin", "path": "frogfs/homebrews/Example.bin"},
       {"source": "build/example.xip", "path": "frogfs/cores/example.xip",
        "mapped": {"relocBase": "0xDEC00000"}}
-    ]
+    ],
+    "symbols": [{"source": "build/example.elf"}]
   }
 }
 ```
 
 `stage-local` writes the release install ownership marker, checks for path
-collisions, and stages beside the content root. It does not publish the project
-or run converters.
+collisions, removes obsolete files previously owned by the same target, and
+stages beside the content root. It does not publish the project or run converters.
+An optional `target.symbols` array can name local ELF sources using `source`,
+optional `filename`, and optional `sha256` fields. `profile create` carries
+those files into the profile's debug directory without copying them onto media.
+
+An SD manifest uses the same shape with `"variant": "sd"` and card-root paths:
+
+```json
+{"schemaVersion":1,"repo":"local/example","tag":"poc","project":"example",
+ "variant":"sd","target":{"id":"gnw-retro-go","files":[
+   {"source":"build/example.bin","path":"cores/example.bin"}]}}
+```
 
 ### Create the profile and launch GWemu
 
@@ -175,13 +199,21 @@ gwprov gwemu watch --profile "$profile" --symbols "$app_elf" \
   --duration 30 --stall-after 3
 ```
 
-`watch` works with any core or homebrew ELF. It always samples ARM PC, SP, and
+`profile create` copies published target ELF symbols (or local `target.symbols`)
+into `debug/apps/`; `diagnose`, `watch`, and `debug python --profile` load them
+automatically. `--symbols ELF` adds another ELF when needed. `watch` works with
+any core or homebrew ELF. It always samples ARM PC, SP, and
 LR; it also auto-detects common 32-bit progress counters (`heartbeat`,
 `frame_count`, `frame_counter`, and `progress_count`) and guest-PC globals ending
 in `_cur_pc`, `_current_pc`, `_resume_pc`, or `_guest_pc`. Projects can specify
 their own symbols with repeatable `--progress-symbol`, `--guest-pc-symbol`, and
-`--u32` options, and can include pointed-to memory with `--deref SYMBOL:SIZE`.
+`--u32` options, can read structs directly with `--bytes SYMBOL:SIZE`, and can
+include pointed-to memory with `--deref SYMBOL:SIZE`.
 Fault-handler symbols are discovered from the loaded firmware and app ELFs.
+For relocated code or data in NOR, `watch` rebases symbols from a target pointer
+using repeatable `--rebase SECTION=POINTER_SYMBOL`. The DKC example above names
+its section and runtime-base symbol explicitly; other projects use their own
+ELF section and pointer symbol names.
 
 On a fault-handler hit, stagnant guest PC, stagnant progress counters, or a
 stable ARM PC/SP/LR location, gwprov writes a JSON report and PNG under
@@ -222,8 +254,14 @@ its interpreter PC and useful counters explicitly:
 gwprov gwemu watch --profile "$profile" --symbols "$app_elf" \
   --progress-symbol dkc1_gwrg_host_heartbeat \
   --progress-symbol dkc1_gwrg_frame_count \
-  --guest-pc-symbol g_interp816_cur_pc
+  --guest-pc-symbol g_interp816_cur_pc \
+  --rebase .xip_dkc1=dkc1_xip_runtime_base
 ```
+
+`--rebase` explicitly connects an ELF section's link-time address to a
+target-side pointer that contains its runtime base. The CLI has no project-name
+special cases; supply one entry for each relocated section that should be
+symbolized.
 
 The `dbg` object stays connected for the whole REPL session. It provides
 `dbg.halt()`, `dbg.resume()`, `dbg.step()`, `dbg.regs()`, `dbg.where()`,
@@ -251,10 +289,22 @@ resetting or flashing the device. The matching firmware ELF is loaded with
 `--profile`, while app ELFs are passed with repeatable `--symbols` options.
 
 The variant comes from `.gwprov-firmware.json`, written by `retro-go install`.
-`profile create` currently supports **flash** assembly; SD content can be staged
-with `--variant sd`, but this profile-assembly workflow does not yet pack SD images.
-Flash content lives in `flash/frogfs/` and `flash/littlefs/`. The generated profile
-contains bank-1 and bank-2 images, an extflash image, configuration and provenance.
+`profile create` selects flash or SD assembly from `.gwprov-firmware.json`. Flash
+content lives in `flash/frogfs/` and `flash/littlefs/`; SD content lives in `sd/`
+and is packed into a bundled FAT32 image. The generated profile contains bank-1
+and bank-2 images, extflash, configuration and provenance. Set `--sd-size-mib`
+to choose the bundled SD image capacity.
+
+For SD firmware, use an SD content root throughout staging; `profile create`
+detects the variant from that root and bundles its files into the profile:
+
+```bash
+sd_content=dev-local/content/retro-go-sd
+gwprov retro-go install --variant sd --output "$sd_content"
+gwprov project install tgb --variant sd --output "$sd_content"
+gwprov profile create dev-local/profiles/retro-go-sd --content "$sd_content" \
+  --sd-size-mib 256
+```
 
 Bank 1 uses the official `gnw_bootloader.bin` linked at `0x08000000`, obtained with
 gnwmanager's bindings. Bank 2 contains the released Retro-Go firmware. This is a
@@ -263,8 +313,10 @@ and its `0x08032000` bootloader. No handcrafted bank-1 stub is used in new profi
 The bootloader cache stays in `.gwprov-cache/` beside the content root, and the
 profile records the resolved version and computed hash.
 
-Capacity defaults to the smallest of **64, 128 or 256 MiB** that fits the packed
-content and LittleFS partition. LittleFS defaults to 2 MiB at the top of the chip.
+Flash capacity defaults to the smallest of **64, 128 or 256 MiB** that fits the
+packed content and LittleFS partition. LittleFS defaults to 2 MiB at the top of
+the chip. SD profiles bundle a 128 MiB FAT32 image by default; `--sd-size-mib`
+changes its size.
 To pin capacity or choose another bootloader, use a new instance directory:
 
 ```bash
@@ -368,8 +420,11 @@ gwprov media frogfs --retro-go-root references/game-and-watch-retro-go-sd [packe
 gwprov ofw patch mario --source-tree ../qemu-gnw --backup-dir backup --output-dir build/ofw [patch options]
 ```
 
-Enable Bash completion in the current shell with `eval "$(gwprov completion bash)"`. It loads
-curated project names on the first project-argument completion and reuses them in that shell.
+Enable Bash completion in the current shell with `eval "$(gwprov completion bash)"`. In zsh,
+run `autoload -Uz compinit && compinit` followed by `eval "$(gwprov completion zsh)"`.
+Both modes complete the command tree, new GWemu commands, common options, and directory
+arguments. Bash loads curated project names on the first project-argument completion and
+reuses them in that shell.
 
 The target-neutral APIs are under `gwprov.common`: `Image` and `Target` select media and destination, `sdcard.compose()` describes SD contents, and target-specific SD managers write to an image, a mounted card, or the device. A `.tl` timeline can be replayed by GWemu or injected into compatible firmware through the probe.
 
@@ -396,7 +451,7 @@ outputs follow the manifest's homebrew/core, system, `dataDir`, and firmware dir
 Converter inputs may be files or directories. Use `--input SLOT=FILE` and repeat it for
 multiple files, or use `--input-dir SLOT=DIR` for the files directly inside a directory. For a
 converter with exactly one input slot, `--input-dir DIR` is shorthand for that slot. Directory
-inputs are non-recursive so unrelated nested content is not consumed. Bash completion suggests
+inputs are non-recursive so unrelated nested content is not consumed. Bash and zsh completion suggest
 folders after `--input-dir`, `--firmware-dir`, `--game-dir`, and `--bios-dir`. Files are
 checked against the declared extension, size, SHA-1 variants, `strict`, `allowMultiple`, and
 `maxCount` rules before a converter runs. Converter execution requires `pip install -e '.[dist]'`;
@@ -409,7 +464,8 @@ Core firmware files can be supplied as `--firmware ID=FILE` or found by declared
 are staged with `--game SYSTEM=FILE` or `--game-dir SYSTEM=DIR`. Shipped firmware files are
 fetched and SHA-256 checked automatically. A project-owned staging marker allows later installs
 of the same target to replace its own files, while unrelated existing files are protected from
-overwrite.
+overwrite. Published `target.symbols` ELFs are also fetched and hash-checked, stored outside the
+device filesystem tree, and copied into profiles for automatic symbolication.
 
 Example: Doom's core and shipped shareware game install without a user WAD; optional WADs can
 be passed with `--input base=doom.wad`. Zelda 3 can take one base ROM and several recognized

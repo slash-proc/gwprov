@@ -61,12 +61,17 @@ def _profile_create(args) -> int:
     from gwprov.provision import create_profile
     report = create_profile(args.directory, content=args.content, name=args.name,
                             littlefs_mib=args.littlefs_mib, extflash_mib=args.extflash_mib,
+                            sd_size_mib=args.sd_size_mib, sd_label=args.sd_label,
                             bootloader_repo=args.bootloader_repo,
                             bootloader_version=args.bootloader_version,
                             bootloader_file=args.bootloader_file)
-    print(f"Created {args.directory}: FrogFS {report['layout']['frogfsBytes']} bytes; "
-          f"LittleFS {report['layout']['littlefsBytes']} bytes; "
-          f"{report['layout']['extflashBytes'] // (1024 * 1024)} MiB extflash")
+    if report.get('variant') == 'sd':
+        print(f"Created {args.directory}: SD image {report['layout']['sdImageBytes']} bytes; "
+              f"{report['layout']['extflashBytes'] // (1024 * 1024)} MiB extflash")
+    else:
+        print(f"Created {args.directory}: FrogFS {report['layout']['frogfsBytes']} bytes; "
+              f"LittleFS {report['layout']['littlefsBytes']} bytes; "
+              f"{report['layout']['extflashBytes'] // (1024 * 1024)} MiB extflash")
     print(f"Boot with: gwprov gwemu run --profile {args.directory}")
     return 0
 
@@ -167,14 +172,17 @@ def _gwemu_diagnose(args) -> int:
     from gwprov.gwemu_manager import diagnose_instance
     return diagnose_instance(args.profile, symbols=args.symbols,
                              output=args.output, max_frames=args.max_frames,
-                             inspect_u32=args.u32, inspect_deref=args.deref)
+                             inspect_u32=args.u32, inspect_deref=args.deref,
+                             inspect_bytes=args.bytes)
 
 def _gwemu_watch(args) -> int:
     from gwprov.gwemu_manager import watch_instance
     return watch_instance(args.profile, symbols=args.symbols,
                           progress_symbols=args.progress_symbol,
                           guest_pc_symbols=args.guest_pc_symbol,
+                          rebase_symbols=args.rebase,
                           watch_u32=args.u32, watch_deref=args.deref,
+                          watch_bytes=args.bytes,
                           heartbeat_symbol=args.heartbeat_symbol,
                           frame_symbol=args.frame_symbol,
                           interval=args.interval,
@@ -204,6 +212,8 @@ def _debug_python(args) -> int:
         if not firmware_symbols.is_file():
             raise ValueError(f"profile has no bundled firmware symbols: {firmware_symbols}")
         symbol_paths.insert(0, str(firmware_symbols))
+        app_symbols = sorted((firmware_symbols.parent / "apps").rglob("*.elf"))
+        symbol_paths[1:1] = [str(path) for path in app_symbols]
     return python_shell(target=args.target, host=args.host, port=args.port,
                         openocd_port=args.openocd_port, symbols=symbol_paths,
                         qmp_socket=args.qmp_socket)
@@ -509,20 +519,25 @@ _gwprov_complete() {
     candidates=$(gwprov tree 2>/dev/null | awk 'substr($0,1,2)=="  " && substr($0,3,1)!=" " {sub(/^  /, ""); sub(/ — .*/, ""); print}')
   elif (( COMP_CWORD == 2 )); then
     case "${COMP_WORDS[1]}" in
-      project) candidates="list versions info install" ;;
+      project) candidates="list versions info install stage-local" ;;
       retro-go) candidates="install build config" ;;
-      gwemu) candidates="run" ;;
+      gwemu) candidates="start stop pause resume ps screenshot diagnose watch run debug" ;;
       ofw) candidates="patch" ;;
       media) candidates="frogfs littlefs inventory compare" ;;
       sd) candidates="create compose" ;;
       input) candidates="tap" ;;
       profile) candidates="create stock show" ;;
-      completion) candidates="bash" ;;
+      completion) candidates="bash zsh" ;;
       *) candidates="" ;;
     esac
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == project ]]; then
     case "${COMP_WORDS[2]-}" in
       list|versions|info|install) candidates=$(_gwprov_project_names) ;;
+      stage-local)
+        COMPREPLY=()
+        while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -f -- "$cur")
+        return
+        ;;
       *) candidates="" ;;
     esac
   else
@@ -532,12 +547,110 @@ _gwprov_complete() {
       project:versions) candidates="--output" ;;
       project:info) candidates="--version --output" ;;
       project:install) candidates="--version --target --variant --output --input --input-dir --firmware --firmware-dir --bios --bios-dir --game --game-dir --dry-run" ;;
+      project:stage-local) candidates="--output" ;;
+      gwemu:start) candidates="--profile --gdb-port --qmp-socket --audio --headless" ;;
+      gwemu:stop) candidates="--profile --pid --timeout" ;;
+      gwemu:pause|gwemu:resume) candidates="--profile" ;;
+      gwemu:ps) candidates="--output" ;;
+      gwemu:screenshot) candidates="--profile --pid --output" ;;
+      gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes" ;;
+      gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --interval --stall-after --duration --output" ;;
+      gwemu:run) candidates="--profile --gdb-port --qmp-socket --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
+      gwemu:debug) candidates="--profile --gdb-port --qmp-socket --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running" ;;
+      debug:python) candidates="--target --host --port --openocd-port --qmp-socket --profile --symbols" ;;
+      media:inventory) candidates="--profile --image --filesystem --offset --size --block-size --shared-sd-root --output" ;;
+      media:compare) candidates="--mode" ;;
+      profile:stock) candidates="--backup-dir --locked --model --extflash-mib" ;;
+      profile:create) candidates="--content --name --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file" ;;
+      completion) candidates="bash zsh" ;;
       *) candidates="" ;;
     esac
   fi
   COMPREPLY=( $(compgen -W "${candidates} ${extra_candidates}" -- "${cur}") )
 }
 complete -F _gwprov_complete gwprov""")
+    return 0
+
+
+def _completion_zsh(args) -> int:
+    print(r'''#compdef gwprov
+_gwprov_project_names() {
+  local catalog
+  catalog=$(gwprov project list --output json 2>/dev/null) || return
+  print -r -- "${(f)$(python3 -c 'import json,sys,urllib.parse; projects=json.load(sys.stdin)["projects"]; [(print(p["project"]), print((urllib.parse.urlparse(p["versionsUrl"]).hostname or "").split(".",1)[0]+"/"+p["project"])) for p in projects]' <<< "$catalog")}"
+}
+_gwprov() {
+  local cur prev context candidates prefix pathpart
+  local -a words_to_add
+  cur=${words[CURRENT]}
+  prev=${words[CURRENT-1]}
+  context="${words[2]}:${words[3]}"
+
+  case "$cur" in
+    --input-dir=*|--firmware-dir=*|--bios-dir=*|--game-dir=*|--content=*|--profile=*|--output=*|--bootloader-file=*|--backup-dir=*)
+      prefix=${cur%%=*}=; pathpart=${cur#*=}
+      IPREFIX=$prefix PREFIX=$pathpart _files -/
+      return
+      ;;
+    --variant=*) IPREFIX=--variant= PREFIX=${cur#*=}; compadd -- flash sd; return ;;
+  esac
+  case "$prev" in
+    --input-dir|--firmware-dir|--bios-dir|--game-dir|--content|--profile|--output|--bootloader-file|--backup-dir)
+      _files -/; return ;;
+    --variant) compadd -- flash sd; return ;;
+  esac
+
+  if (( CURRENT == 2 )); then
+    candidates="$(gwprov tree 2>/dev/null | awk 'substr($0,1,2)=="  " && substr($0,3,1)!=" " {sub(/^  /, ""); sub(/ — .*/, ""); print}')"
+  elif (( CURRENT == 3 )); then
+    case ${words[2]} in
+      project) candidates="list versions info install stage-local" ;;
+      retro-go) candidates="install build config" ;;
+      gwemu) candidates="start stop pause resume ps screenshot diagnose watch run debug" ;;
+      ofw) candidates="patch" ;;
+      media) candidates="frogfs littlefs inventory compare" ;;
+      sd) candidates="create compose" ;;
+      input) candidates="tap" ;;
+      profile) candidates="create stock show" ;;
+      debug) candidates="python" ;;
+      completion) candidates="bash zsh" ;;
+      *) candidates="" ;;
+    esac
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == project ]]; then
+    case ${words[3]} in
+      list|versions|info|install) candidates="$( _gwprov_project_names )" ;;
+      stage-local) _files; return ;;
+      *) candidates="" ;;
+    esac
+  else
+    case "$context" in
+      project:list) candidates="--firmware-repo --output" ;;
+      project:versions) candidates="--output" ;;
+      project:info) candidates="--version --output" ;;
+      project:install) candidates="--version --target --variant --output --input --input-dir --firmware --firmware-dir --bios --bios-dir --game --game-dir --dry-run" ;;
+      project:stage-local) candidates="--output" ;;
+      gwemu:start) candidates="--profile --gdb-port --qmp-socket --audio --headless" ;;
+      gwemu:stop) candidates="--profile --pid --timeout" ;;
+      gwemu:pause|gwemu:resume) candidates="--profile" ;;
+      gwemu:ps) candidates="--output" ;;
+      gwemu:screenshot) candidates="--profile --pid --output" ;;
+      gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes" ;;
+      gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --interval --stall-after --duration --output" ;;
+      gwemu:run) candidates="--profile --gdb-port --qmp-socket --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
+      gwemu:debug) candidates="--profile --gdb-port --qmp-socket --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running" ;;
+      debug:python) candidates="--target --host --port --openocd-port --qmp-socket --profile --symbols" ;;
+      media:inventory) candidates="--profile --image --filesystem --offset --size --block-size --shared-sd-root --output" ;;
+      media:compare) candidates="--mode" ;;
+      profile:stock) candidates="--backup-dir --locked --model --extflash-mib" ;;
+      profile:create) candidates="--content --name --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file" ;;
+      *) candidates="" ;;
+    esac
+    candidates="$candidates --help -h"
+  fi
+  words_to_add=( ${(z)candidates} )
+  compadd -- $words_to_add
+}
+compdef _gwprov gwprov''')
     return 0
 
 
@@ -566,8 +679,8 @@ def build_parser() -> argparse.ArgumentParser:
     tree = commands.add_parser("tree", help="list all commands and their short descriptions")
     tree.set_defaults(handler=_command_tree)
     completion = commands.add_parser("completion", help="print shell completion setup")
-    completion.add_argument("shell", choices=("bash",))
-    completion.set_defaults(handler=_completion_bash)
+    completion.add_argument("shell", choices=("bash", "zsh"))
+    completion.set_defaults(handler=lambda args: _completion_bash(args) if args.shell == "bash" else _completion_zsh(args))
 
     debug_tools = commands.add_parser("debug", help="interactive target debugging")
     debug_commands = debug_tools.add_subparsers(dest="debug_command", required=True)
@@ -710,6 +823,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="read a symbol-addressed 32-bit target value (repeatable)")
     diagnose.add_argument("--deref", action="append", default=[], metavar="SYMBOL[+OFFSET]:SIZE",
                           help="read bytes from a pointer-valued global, e.g. --deref g_ppu:16 (repeatable)")
+    diagnose.add_argument("--bytes", action="append", default=[], metavar="SYMBOL[+OFFSET]:SIZE",
+                          help="read bytes directly from a symbol, e.g. --bytes g_cpu:56 (repeatable)")
     diagnose.set_defaults(handler=_gwemu_diagnose)
 
     watch = gwemu_commands.add_parser(
@@ -721,10 +836,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="32-bit counter that should change during healthy execution (repeatable)")
     watch.add_argument("--guest-pc-symbol", action="append", default=[], metavar="SYMBOL",
                        help="32-bit guest instruction PC to monitor for stagnation (repeatable)")
+    watch.add_argument("--rebase", action="append", default=[], metavar="SECTION=POINTER_SYMBOL",
+                       help="rebase an ELF section from a target pointer-valued symbol (repeatable)")
     watch.add_argument("--u32", action="append", default=[], metavar="SYMBOL",
                        help="include an additional 32-bit symbol in every sample and report")
     watch.add_argument("--deref", action="append", default=[], metavar="SYMBOL[+OFFSET]:SIZE",
                        help="include bytes through a pointer-valued global in a trigger report")
+    watch.add_argument("--bytes", action="append", default=[], metavar="SYMBOL[+OFFSET]:SIZE",
+                       help="include bytes directly from a global in a trigger report")
     watch.add_argument("--heartbeat-symbol", help=argparse.SUPPRESS)
     watch.add_argument("--frame-symbol", help=argparse.SUPPRESS)
     watch.add_argument("--interval", type=float, default=0.5)
@@ -829,13 +948,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     profile = commands.add_parser("profile", help="create and inspect provisioned GWemu instances")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True)
-    create = profile_commands.add_parser("create", help="pack flash content and create a bootable GWemu instance")
+    create = profile_commands.add_parser("create", help="pack flash or SD content into a bootable GWemu instance")
     create.add_argument("directory")
     create.add_argument("--content", required=True, help="root populated by retro-go install and project install")
     create.add_argument("--name")
     create.add_argument("--littlefs-mib", type=int, default=2)
+    create.add_argument("--sd-size-mib", type=int, default=128,
+                        help="capacity of the bundled FAT32 image for SD firmware (default: 128)")
+    create.add_argument("--sd-label", default="RETROGO",
+                        help="volume label for the bundled SD image")
     create.add_argument("--extflash-mib", type=int, choices=(64, 128, 256),
-                        help="chip capacity; default: smallest of 64/128/256 MiB that fits")
+                        help="chip capacity; flash defaults to the smallest size that fits, SD defaults to 64 MiB")
     create.add_argument("--bootloader-repo", default="sylverb/game-and-watch-bootloader")
     create.add_argument("--bootloader-version", default="v1.0.8", help="release tag or latest")
     create.add_argument("--bootloader-file", help="use a local binary linked at 0x08000000")

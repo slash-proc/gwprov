@@ -81,6 +81,7 @@ class Profile(unittest.TestCase):
             (content/'flash/littlefs/cores/gba.bin').write_bytes(b'core')
             (content/'.gwprov-firmware.json').write_text(json.dumps({
                 'variant':'flash','littlefsBlockSize':4096,
+                'files':['firmware/intflash.bin'],
                 'firmware':{'providesAbi':{'version':2,'size':908},'superblock':self.declaration}}))
             before={str(p.relative_to(content)):p.read_bytes() for p in content.rglob('*') if p.is_file()}
             profile=Path(tmp)/'profile'

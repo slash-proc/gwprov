@@ -9,7 +9,7 @@ description = "Reusable provisioning and control tools for Game & Watch devices 
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-2.0-only"
-dependencies = ["gnwmanager", "pyelftools>=0.29"]
+dependencies = ["gnwmanager", "pyelftools>=0.29", "tomli>=2; python_version < '3.11'"]
 
 [project.optional-dependencies]
 device = ["gnwmanager"]

@@ -521,6 +521,7 @@ def install_project(
     collisions: set[str] = set()
     mapped_artifacts: list[dict[str, Any]] = []
     converter_inputs: list[dict[str, Any]] = []
+    symbol_files: list[tuple[Path, bytes]] = []
 
     def add(relative: Path, data: bytes, origin: str, *, allow_identical: bool = False, mapped: bool = False) -> None:
         if variant == "flash":
@@ -547,6 +548,22 @@ def install_project(
         if is_mapped:
             mapped_artifacts.append({"path": (_target_dir(target, "artifact") / filename).as_posix(),
                                      "relocBase": artifact.get("relocBase")})
+    symbol_specs = target.get("symbols", [])
+    if not isinstance(symbol_specs, list):
+        raise ValueError("target symbols must be a list")
+    identity = _safe_relpath(resolved.repo.replace("/", "--"))
+    for spec in symbol_specs:
+        if not isinstance(spec, dict):
+            raise ValueError("target symbols entries must be objects")
+        filename = _plain_name(spec.get("filename", ""))
+        data = _fetch_checked(base, spec)
+        if filename.lower().endswith(".elf") and not data.startswith(b"\x7fELF"):
+            raise ValueError(f"published debug symbols are not an ELF file: {filename}")
+        relative = _safe_relpath(
+            f"projects/{identity.as_posix()}/{target['id']}/{filename}")
+        if any(path == relative for path, _ in symbol_files):
+            raise ValueError(f"duplicate target debug symbol destination: {relative}")
+        symbol_files.append((relative, data))
     # Shipped system games and firmware are declarations in the manifest, not core artifacts.
     systems = target.get("systems", []) if kind == "core" else []
     systems_by_id = {system.get("id"): system for system in systems if isinstance(system, dict)}
@@ -782,7 +799,8 @@ def install_project(
     # release-verified shipped bytes and represent the game only once in the staging plan.
     if dry_run:
         return {"repo": resolved.repo, "tag": resolved.version.get("tag"), "target": target.get("id"),
-                "variant": variant, "files": [p.as_posix() for p, _, _ in planned], "dry_run": True}
+                "variant": variant, "files": [p.as_posix() for p, _, _ in planned],
+                "symbols": [p.as_posix() for p, _ in symbol_files], "dry_run": True}
 
     # Refuse to overwrite unrelated files. A prior gwprov-owned project install may be upgraded in place.
     marker = root / variant / ".gwprov-projects.json"
@@ -790,6 +808,7 @@ def install_project(
     project_key = f"{resolved.repo}:{target['id']}"
     old = ownership.get(project_key, {})
     prior_files = {str(name).casefold() for name in old.get("files", [])}
+    prior_symbols = {str(name) for name in old.get("symbols", [])}
     for relative, _, origin in planned:
         destination = root / variant / relative
         cursor = root
@@ -799,6 +818,15 @@ def install_project(
                 raise ValueError(f"refusing to follow symlink in install path: {cursor}")
         if destination.exists() and relative.as_posix().casefold() not in prior_files:
             raise ValueError(f"refusing to overwrite existing file not owned by this project: {destination} ({origin})")
+    for relative, _data in symbol_files:
+        destination = root / "debug" / relative
+        cursor = root
+        for part in ("debug", *relative.parts):
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError(f"refusing to follow symlink in debug symbol path: {cursor}")
+        if destination.exists() and relative.as_posix() not in prior_symbols:
+            raise ValueError(f"refusing to overwrite unowned debug symbols: {destination}")
 
     # Stage beside the destination, then move only the planned files into place.
     root.parent.mkdir(parents=True, exist_ok=True)
@@ -813,15 +841,34 @@ def install_project(
             destination = root / variant / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             source.replace(destination)
+        for relative, data in symbol_files:
+            source = stage / "debug" / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(data)
+            destination = root / "debug" / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(destination)
+        new_symbol_paths = {relative.as_posix() for relative, _ in symbol_files}
+        for old_symbol in prior_symbols - new_symbol_paths:
+            old_path = Path(old_symbol)
+            if old_path.is_absolute() or ".." in old_path.parts:
+                continue
+            stale = root / "debug" / old_path
+            if any(part.is_symlink() for part in (stale, *stale.parents) if part.exists()):
+                continue
+            if stale.is_file():
+                stale.unlink()
         metadata = {"repo": resolved.repo, "tag": resolved.version.get("tag"),
                     "project": manifest.get("project"), "target": target.get("id"),
                     "variant": variant, "files": [p.as_posix() for p, _, _ in planned],
                     "requiresAbi": target.get("requiresAbi"), "mapped": mapped_artifacts,
-                    "inputs": converter_inputs}
+                    "inputs": converter_inputs,
+                    "symbols": sorted(new_symbol_paths)}
         ownership[project_key] = metadata
         root.mkdir(parents=True, exist_ok=True)
         metadata_path = marker
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(json.dumps(ownership, indent=2) + "\n", encoding="utf-8")
     return {"repo": resolved.repo, "tag": resolved.version.get("tag"), "target": target.get("id"),
-            "variant": variant, "files": [p.as_posix() for p, _, _ in planned], "dry_run": False}
+            "variant": variant, "files": [p.as_posix() for p, _, _ in planned],
+            "symbols": sorted(new_symbol_paths), "dry_run": False}

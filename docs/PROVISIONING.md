@@ -4,6 +4,10 @@ Run these commands from the gwprov checkout. Generated files belong in the ignor
 `dev-local/` directory. Source ROMs, firmware and CD files are read as inputs.
 The commands download released artifacts and execute the published WASM converters
 using Wasmtime's Python bindings; they do not require a Retro-Go source build.
+On macOS, install Python and mtools with Homebrew (`brew install python@3.11
+mtools`) and create the environment with `python3.11 -m venv dev-local/venv`
+instead of `python3` below; Apple's system Python is too old. GWemu must be
+installed separately and available on PATH.
 
 ## Install the Python tools
 

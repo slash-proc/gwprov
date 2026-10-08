@@ -81,6 +81,10 @@ class SymbolTable:
             address += self._section_deltas.get((owner, section), 0)
         return address
 
+    def owner(self, name: str) -> Path:
+        """Return the ELF that supplied a symbol."""
+        return self._symbol_owners[name]
+
     def rebase(self, section: str, actual_base: int, elf: str | Path | None = None) -> int:
         """Translate symbols in one ELF section to its runtime mapped address.
 
@@ -579,7 +583,8 @@ class DebugSession:
         actual_base = self.u32(self.at(pointer_symbol))
         if actual_base == 0:
             raise RuntimeError(f"target symbol {pointer_symbol!r} is still null; has the app initialized?")
-        return self.symbols.rebase(section, actual_base)
+        return self.symbols.rebase(section, actual_base,
+                                   elf=self.symbols.owner(pointer_symbol))
 
     def screenshot(self, path: str | Path | None = None) -> dict:
         """Save a QMP PNG and return path, dimensions, and black-screen stats."""
@@ -592,6 +597,7 @@ class DebugSession:
                  max_frames: int = 32,
                  inspect_u32: tuple[str, ...] | list[str] = (),
                  inspect_deref: tuple[str, ...] | list[str] = (),
+                 inspect_bytes: tuple[str, ...] | list[str] = (),
                  screenshot: dict | None = None) -> dict:
         """Capture the framebuffer and a symbol-resolved call stack together."""
         status = self.qmp("query-status").get("return", {})
@@ -624,6 +630,25 @@ class DebugSession:
             key = f"*{symbol}+{offset:#x}:{length}"
             memory[key] = {"symbol": symbol, "pointer": pointer,
                            "pointer_hex": hex(pointer), "address": address,
+                           "address_hex": hex(address), "size": length,
+                           "bytes_hex": data.hex()}
+        for spec in inspect_bytes:
+            expression, separator, length_text = spec.partition(":")
+            if not separator:
+                raise ValueError(f"invalid --bytes {spec!r}; expected SYMBOL[+OFFSET]:SIZE")
+            symbol, plus, offset_text = expression.rpartition("+")
+            if not plus:
+                symbol, offset_text = expression, "0"
+            try:
+                offset, length = int(offset_text, 0), int(length_text, 0)
+            except ValueError as exc:
+                raise ValueError(f"invalid --bytes {spec!r}; offsets and sizes use decimal or 0x notation") from exc
+            if not symbol or offset < 0 or length <= 0:
+                raise ValueError(f"invalid --bytes {spec!r}; symbol, nonnegative offset, and positive size required")
+            address = self.at(symbol) + offset
+            data = self.read(address, length)
+            key = f"{symbol}+{offset:#x}:{length}"
+            memory[key] = {"symbol": symbol, "address": address,
                            "address_hex": hex(address), "size": length,
                            "bytes_hex": data.hex()}
         frame_symbols = {frame.get("symbol", {}).get("name")

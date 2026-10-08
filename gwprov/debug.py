@@ -38,11 +38,7 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234,
     for prop, path in (("bank1-image", profile.bank1), ("bank2-image", profile.bank2),
                        ("extflash-image", profile.extflash)):
         cmd += ["-global", f"gnw-h7b0-soc.{prop}={path}"]
-    rdp = profile.root / "rdp-state.bin"
-    if not rdp.exists():
-        rdp = profile.root / "rdp.bin"
-    cmd += ["-global", f"gnw-h7b0-soc.rdp-image={rdp}", "-display", "gwemu",
-            "-audiodev", "sdl3,id=snd0" if audio else "none,id=snd0",
+    cmd += ["-display", "gwemu", "-audiodev", "sdl3,id=snd0" if audio else "none,id=snd0",
             "-global", "gnw-h7b0-sai1.audiodev=snd0", "-S",
             "-gdb", f"tcp:127.0.0.1:{gdb_port}"]
     if qmp_socket:

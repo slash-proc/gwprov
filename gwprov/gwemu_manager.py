@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import socket
 import struct
 import tempfile
@@ -55,7 +57,10 @@ def _option(args: list[str], name: str) -> str | None:
 
 def _instance(pid: int, args: list[str]) -> dict[str, Any] | None:
     joined = " ".join(args)
-    if "gnw-h7b0" not in joined or not any("qemu-system" in arg for arg in args):
+    executable = Path(args[0]).name.lower() if args else ""
+    is_emulator = executable == "gwemu" or executable == "gwemu.exe" \
+        or executable.startswith("qemu-system")
+    if "gnw-h7b0" not in joined or not is_emulator:
         return None
     bank1 = next((arg.split("=", 1)[1] for arg in args
                   if "gnw-h7b0-soc.bank1-image=" in arg), None)
@@ -280,10 +285,11 @@ def screenshot_instance(*, pid: int | None = None, profile: str | None = None,
 
 
 def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
-                       output: str | Path | None = None,
-                       max_frames: int = 32,
-                       inspect_u32: list[str] | None = None,
-                       inspect_deref: list[str] | None = None) -> int:
+                      output: str | Path | None = None,
+                      max_frames: int = 32,
+                      inspect_u32: list[str] | None = None,
+                      inspect_deref: list[str] | None = None,
+                      inspect_bytes: list[str] | None = None) -> int:
     """Capture one running profile's screen and symbol-resolved ARM stack."""
     from .debug_shell import DebugSession, GwemuGDBBackend
     from .profiles import DeviceProfile
@@ -304,7 +310,11 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
     firmware = device.root / "debug" / "retro-go-debug.elf"
     if not firmware.is_file():
         raise ValueError(f"profile has no bundled firmware symbols: {firmware}")
-    symbol_paths = [firmware, *(Path(path).expanduser().resolve() for path in symbols or [])]
+    app_symbols = sorted((device.root / "debug" / "apps").rglob("*.elf"))
+    symbol_paths = list(dict.fromkeys([
+        firmware, *app_symbols,
+        *(Path(path).expanduser().resolve() for path in symbols or []),
+    ]))
     for symbol_path in symbol_paths:
         if not symbol_path.is_file():
             raise FileNotFoundError(symbol_path)
@@ -321,7 +331,8 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
             session.symbols.load(symbol_path)
         report = session.diagnose(output, max_frames=max_frames,
                                   inspect_u32=inspect_u32 or [],
-                                  inspect_deref=inspect_deref or [])
+                                  inspect_deref=inspect_deref or [],
+                                  inspect_bytes=inspect_bytes or [])
         report.update({"pid": row["pid"], "profile": root,
                        "symbols": [str(path) for path in symbol_paths]})
         print(json.dumps(report, indent=2))
@@ -340,8 +351,10 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
 def watch_instance(profile: str, *, symbols: list[str] | None = None,
                    progress_symbols: list[str] | None = None,
                    guest_pc_symbols: list[str] | None = None,
+                   rebase_symbols: list[str] | None = None,
                    watch_u32: list[str] | None = None,
                    watch_deref: list[str] | None = None,
+                   watch_bytes: list[str] | None = None,
                    heartbeat_symbol: str | None = None,
                    frame_symbol: str | None = None,
                    guest_pc_symbol: str | None = None,
@@ -367,7 +380,11 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
     firmware = device.root / "debug" / "retro-go-debug.elf"
     if not firmware.is_file():
         raise ValueError(f"profile has no bundled firmware symbols: {firmware}")
-    symbol_paths = [firmware, *(Path(path).expanduser().resolve() for path in symbols)]
+    app_symbols = sorted((device.root / "debug" / "apps").rglob("*.elf"))
+    symbol_paths = list(dict.fromkeys([
+        firmware, *app_symbols,
+        *(Path(path).expanduser().resolve() for path in symbols or []),
+    ]))
     for path in symbol_paths:
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -388,6 +405,13 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
     watched_names = list(dict.fromkeys([*progress_names, *guest_names,
                                         *(watch_u32 or [])]))
     deref_specs = list(watch_deref or [])
+    byte_specs = list(watch_bytes or [])
+    rebase_specs: list[tuple[str, str]] = []
+    for spec in rebase_symbols or []:
+        section, separator, pointer_symbol = spec.partition("=")
+        if not separator or not section or not pointer_symbol:
+            raise ValueError(f"invalid --rebase {spec!r}; expected SECTION=POINTER_SYMBOL")
+        rebase_specs.append((section, pointer_symbol))
     value_history: dict[str, int] = {}
     value_stable_since: dict[str, float] = {}
     last_progress = started
@@ -424,7 +448,16 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                     guest_names.append(item["name"])
         watched_names = list(dict.fromkeys([*progress_names, *guest_names,
                                             *(watch_u32 or [])]))
-        addresses = {name: session.at(name) for name in watched_names}
+        for section, pointer_symbol in rebase_specs:
+            try:
+                session.at(pointer_symbol)
+                owner = session.symbols.owner(pointer_symbol)
+            except KeyError as exc:
+                raise ValueError(f"rebase pointer symbol {pointer_symbol!r} is not loaded") from exc
+            if section not in session.symbols.sections(owner):
+                raise ValueError(
+                    f"ELF section {section!r} is not present in the ELF containing "
+                    f"pointer symbol {pointer_symbol!r}")
         fault_ranges = []
         for item in symbols_found:
             name = item["name"]
@@ -448,11 +481,13 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                 last_progress = now
                 time.sleep(interval)
                 continue
+            for section, pointer_symbol in rebase_specs:
+                try:
+                    session.rebase_from_pointer(section, pointer_symbol)
+                except (KeyError, RuntimeError):
+                    pass
+            addresses = {name: session.at(name) for name in watched_names}
             values = {name: session.u32(address) for name, address in addresses.items()}
-            try:
-                session.rebase_from_pointer(".xip_dkc1", "dkc1_xip_runtime_base")
-            except (KeyError, RuntimeError):
-                pass
             if hasattr(backend, "read_core_registers"):
                 regs = backend.read_core_registers()
             else:
@@ -504,6 +539,7 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                     progress_names and now - last_progress >= stall_after):
                 diagnosis = session.diagnose(image_path, inspect_u32=watched_names,
                                              inspect_deref=deref_specs,
+                                             inspect_bytes=byte_specs,
                                              screenshot=screen_probe)
                 screenshot = diagnosis.get("screenshot", {})
                 if fault_name:
@@ -530,8 +566,12 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                     "symbols": [str(path) for path in symbol_paths],
                     "progress_symbols": progress_names,
                     "guest_pc_symbols": guest_names,
+                    "rebased_sections": [
+                        {"section": section, "pointer_symbol": pointer}
+                        for section, pointer in rebase_specs],
                     "watch_u32": watch_u32 or [],
                     "watch_deref": deref_specs,
+                    "watch_bytes": byte_specs,
                     "last_values": values,
                     "stable_seconds": round(now - (value_stable_since.get(guest_stagnant, cpu_stable_since)
                                                     if guest_stagnant_trigger else cpu_stable_since), 3),
@@ -562,6 +602,9 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
             "symbols": [str(path) for path in symbol_paths],
             "progress_symbols": progress_names,
             "guest_pc_symbols": guest_names,
+            "rebased_sections": [
+                {"section": section, "pointer_symbol": pointer}
+                for section, pointer in rebase_specs],
             "samples": samples,
         }
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -702,10 +745,15 @@ def start_instance(profile: str, *, audio: bool = False,
         raise ValueError(f"profile already has GWemu pid {row['pid']} ({row['status']}); "
                          "use `gwprov gwemu ps` or `gwprov gwemu stop`")
     if qmp_socket is None:
-        qmp_path = root / "runtime" / "gwprov" / "qmp.sock"
+        # Profiles under the macOS GWemu app support directory can exceed
+        # Darwin's AF_UNIX socket path limit. Keep default QMP endpoints short.
+        owner = str(os.getuid()) if hasattr(os, "getuid") else str(os.getpid())
+        profile_id = hashlib.sha256(os.fsencode(root)).hexdigest()[:20]
+        temp_root = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
+        qmp_path = temp_root / f"gwprov-{owner}" / f"{profile_id}.sock"
     else:
         qmp_path = Path(qmp_socket).expanduser().resolve()
-    qmp_path.parent.mkdir(parents=True, exist_ok=True)
+    qmp_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if qmp_path.exists():
         # A sandbox may hide a live process from psutil. Keep the socket as an
         # additional ownership signal instead of unlinking it on an empty scan.
@@ -721,6 +769,7 @@ def start_instance(profile: str, *, audio: bool = False,
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
             gdb_port = probe.getsockname()[1]
-    print(f"Starting visible GWemu for {root}; GDB :{gdb_port}; QMP {qmp_path}", flush=True)
+    display = "headless" if headless else "visible"
+    print(f"Starting {display} GWemu for {root}; GDB :{gdb_port}; QMP {qmp_path}", flush=True)
     return launch_profile(str(root), headless=headless, audio=audio,
                           gdb_port=gdb_port, qmp_socket=str(qmp_path))

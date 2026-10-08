@@ -5,6 +5,7 @@ from __future__ import annotations
 import code
 import errno
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -134,6 +135,49 @@ class SymbolTable:
             [tool, "-d", "-C", f"--disassemble={symbol}", str(owner)],
             check=True, capture_output=True, text=True)
         return result.stdout
+
+    def code_context(self, address: int, radius: int = 4) -> dict:
+        """Return nearby disassembly for a sampled PC when a loaded ELF covers it."""
+        owner = None
+        for path in reversed(self.sources):
+            for section, (base, size) in self._sections[path].items():
+                delta = self._section_deltas.get((path, section), 0)
+                if base + delta <= (address & ~1) < base + delta + size:
+                    owner = path
+                    break
+            if owner:
+                break
+        if owner is None:
+            return {"address": address, "available": False,
+                    "reason": "PC is outside loaded ELF sections"}
+        symbol = self.nearest(address, elf=owner)
+        if not symbol:
+            return {"address": address, "available": False,
+                    "elf": str(owner), "reason": "no preceding symbol"}
+        name = symbol["name"]
+        try:
+            listing = self.disassemble(name, elf=owner)
+        except (KeyError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            return {"address": address, "available": False,
+                    "symbol": symbol, "elf": str(owner), "reason": str(exc)}
+        section = symbol.get("section")
+        delta = self._section_deltas.get((owner, section), 0) if section else 0
+        link_pc = (address & ~1) - delta
+        instructions = []
+        for line in listing.splitlines():
+            match = re.match(r"\s*([0-9a-fA-F]+):\s", line)
+            if match:
+                instructions.append((int(match.group(1), 16), line.rstrip()))
+        if not instructions:
+            return {"address": address, "available": False,
+                    "symbol": symbol, "elf": str(owner),
+                    "reason": "objdump returned no instructions"}
+        index = min(range(len(instructions)),
+                    key=lambda i: abs(instructions[i][0] - link_pc))
+        selected = instructions[max(0, index - radius):index + radius + 1]
+        return {"address": address, "link_address": link_pc,
+                "symbol": symbol, "elf": str(owner),
+                "instructions": [line for _, line in selected]}
 
     def sections(self, elf: str | Path | None = None) -> dict[str, tuple[int, int]]:
         """Return section link-time bases and sizes for a loaded ELF."""
@@ -547,11 +591,14 @@ class DebugSession:
     def diagnose(self, path: str | Path | None = None,
                  max_frames: int = 32,
                  inspect_u32: tuple[str, ...] | list[str] = (),
-                 inspect_deref: tuple[str, ...] | list[str] = ()) -> dict:
+                 inspect_deref: tuple[str, ...] | list[str] = (),
+                 screenshot: dict | None = None) -> dict:
         """Capture the framebuffer and a symbol-resolved call stack together."""
         status = self.qmp("query-status").get("return", {})
-        screenshot = self.screenshot(path)
+        screenshot = screenshot or self.screenshot(path)
         trace = self.traceback(max_frames)
+        registers = trace.get("registers", {})
+        trace["code_context"] = self.symbols.code_context(registers.get("pc", 0))
         memory = {}
         for name in inspect_u32:
             address = self.at(name)

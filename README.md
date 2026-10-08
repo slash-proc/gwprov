@@ -175,18 +175,24 @@ gwprov gwemu watch --profile "$profile" --symbols "$app_elf" \
   --duration 30 --stall-after 3
 ```
 
-The DKC homebrew exports volatile `dkc1_gwrg_host_heartbeat` and
-`dkc1_gwrg_frame_count` progress words. `watch` samples those, the CPU PC, and
-by default the SNES interpreter PC (`g_interp816_cur_pc`) and PPU INIDISP byte
-(`g_ppu`). A stagnant guest PC while the PPU forced-blank bit is set triggers a
-built-in PNG capture. An all-black image is reported as
-`guest-pc-stagnant-blank`; this is evidence of a suspected guest loop, not proof
-that every possible legitimate wait has been excluded. Fault-handler hits and
-host-heartbeat stalls also write a JSON report and symbolized traceback under
-`runtime/gwprov/triage/`. Set `--guest-pc-symbol ''` or
-`--ppu-pointer-symbol ''` to disable either DKC-specific check. `watch` exits 1
-for a detected fault/stall condition, 2 when the observation window ends without
-enough heartbeat evidence, and 0 when progress is observed.
+`watch` works with any core or homebrew ELF. It always samples ARM PC, SP, and
+LR; it also auto-detects common 32-bit progress counters (`heartbeat`,
+`frame_count`, `frame_counter`, and `progress_count`) and guest-PC globals ending
+in `_cur_pc`, `_current_pc`, `_resume_pc`, or `_guest_pc`. Projects can specify
+their own symbols with repeatable `--progress-symbol`, `--guest-pc-symbol`, and
+`--u32` options, and can include pointed-to memory with `--deref SYMBOL:SIZE`.
+Fault-handler symbols are discovered from the loaded firmware and app ELFs.
+
+On a fault-handler hit, stagnant guest PC, stagnant progress counters, or a
+stable ARM PC/SP/LR location, gwprov writes a JSON report and PNG under
+`runtime/gwprov/triage/`. The bundle includes sampled values, a symbolized
+traceback, registers, nearby objdump instructions when the PC belongs to a
+loaded ELF, and an all-black display result. Fault-handler hits are direct
+evidence; loop and stall labels are explicitly heuristic because a project can
+legitimately wait at a stable location. `watch` exits 1 when it captures a
+fault or suspected stall and 0 when it observes progress through the full
+window. If no progress symbols are found, it reports that fact in the JSON
+instead of assuming the process is healthy.
 Use one GDB owner at a time; after the launch command detaches, `watch` owns the
 GDB connection for the observation window.
 
@@ -208,14 +214,16 @@ gwprov debug python --target gwemu --port 1234 --profile "$profile" \
   --symbols build/dkc1_core.elf
 ```
 
-For an app that exports progress counters, `gwprov gwemu watch` polls the
-counter over GDB while GWemu runs. A stalled heartbeat triggers a PNG, symbolized
-traceback, selected globals, and a JSON report under the profile runtime directory.
-For the DKC GWHB port, the app ELF exports `dkc1_gwrg_host_heartbeat` and
-`dkc1_gwrg_frame_count` for this purpose. Run one GDB owner at a time; `watch`
-connects once and reads the two volatile progress words while the target runs.
-It briefly halts only when it captures the stalled CPU's registers and traceback.
-A detected stall exits with status 1.
+Run one GDB owner at a time; `watch` keeps one connection and briefly halts only
+while it samples or captures target state. A DKC-specific invocation can select
+its interpreter PC and useful counters explicitly:
+
+```bash
+gwprov gwemu watch --profile "$profile" --symbols "$app_elf" \
+  --progress-symbol dkc1_gwrg_host_heartbeat \
+  --progress-symbol dkc1_gwrg_frame_count \
+  --guest-pc-symbol g_interp816_cur_pc
+```
 
 The `dbg` object stays connected for the whole REPL session. It provides
 `dbg.halt()`, `dbg.resume()`, `dbg.step()`, `dbg.regs()`, `dbg.where()`,

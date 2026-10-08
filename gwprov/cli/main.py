@@ -172,10 +172,11 @@ def _gwemu_diagnose(args) -> int:
 def _gwemu_watch(args) -> int:
     from gwprov.gwemu_manager import watch_instance
     return watch_instance(args.profile, symbols=args.symbols,
+                          progress_symbols=args.progress_symbol,
+                          guest_pc_symbols=args.guest_pc_symbol,
+                          watch_u32=args.u32, watch_deref=args.deref,
                           heartbeat_symbol=args.heartbeat_symbol,
                           frame_symbol=args.frame_symbol,
-                          guest_pc_symbol=args.guest_pc_symbol,
-                          ppu_pointer_symbol=args.ppu_pointer_symbol,
                           interval=args.interval,
                           stall_after=args.stall_after, duration=args.duration,
                           output=args.output)
@@ -714,14 +715,18 @@ def build_parser() -> argparse.ArgumentParser:
     watch = gwemu_commands.add_parser(
         "watch", help="watch app progress and capture a report when it stalls")
     watch.add_argument("--profile", required=True)
-    watch.add_argument("--symbols", action="append", required=True, metavar="ELF",
-                       help="app ELF symbols (repeatable)")
-    watch.add_argument("--heartbeat-symbol", default="dkc1_gwrg_host_heartbeat")
-    watch.add_argument("--frame-symbol", default="dkc1_gwrg_frame_count")
-    watch.add_argument("--guest-pc-symbol", default="g_interp816_cur_pc",
-                       help="guest emulation PC symbol; empty disables this check")
-    watch.add_argument("--ppu-pointer-symbol", default="g_ppu",
-                       help="PPU pointer symbol used to read INIDISP; empty disables this check")
+    watch.add_argument("--symbols", action="append", default=[], metavar="ELF",
+                       help="app or firmware ELF symbols (repeatable; firmware is loaded from profile)")
+    watch.add_argument("--progress-symbol", action="append", default=[], metavar="SYMBOL",
+                       help="32-bit counter that should change during healthy execution (repeatable)")
+    watch.add_argument("--guest-pc-symbol", action="append", default=[], metavar="SYMBOL",
+                       help="32-bit guest instruction PC to monitor for stagnation (repeatable)")
+    watch.add_argument("--u32", action="append", default=[], metavar="SYMBOL",
+                       help="include an additional 32-bit symbol in every sample and report")
+    watch.add_argument("--deref", action="append", default=[], metavar="SYMBOL[+OFFSET]:SIZE",
+                       help="include bytes through a pointer-valued global in a trigger report")
+    watch.add_argument("--heartbeat-symbol", help=argparse.SUPPRESS)
+    watch.add_argument("--frame-symbol", help=argparse.SUPPRESS)
     watch.add_argument("--interval", type=float, default=0.5)
     watch.add_argument("--stall-after", type=float, default=3.0)
     watch.add_argument("--duration", type=float, default=30.0)

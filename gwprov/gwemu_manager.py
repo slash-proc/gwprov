@@ -337,15 +337,18 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
 
 
 
-def watch_instance(profile: str, *, symbols: list[str],
-                   heartbeat_symbol: str = "dkc1_gwrg_host_heartbeat",
-                   frame_symbol: str = "dkc1_gwrg_frame_count",
-                   guest_pc_symbol: str | None = "g_interp816_cur_pc",
-                   ppu_pointer_symbol: str | None = "g_ppu",
+def watch_instance(profile: str, *, symbols: list[str] | None = None,
+                   progress_symbols: list[str] | None = None,
+                   guest_pc_symbols: list[str] | None = None,
+                   watch_u32: list[str] | None = None,
+                   watch_deref: list[str] | None = None,
+                   heartbeat_symbol: str | None = None,
+                   frame_symbol: str | None = None,
+                   guest_pc_symbol: str | None = None,
                    interval: float = 0.5, stall_after: float = 3.0,
                    duration: float = 30.0,
                    output: str | Path | None = None) -> int:
-    """Watch app progress and write a symbolized report when its heartbeat stalls."""
+    """Watch a target and save a generic, symbolized triage bundle on suspicion."""
     from datetime import datetime, timezone
     from .debug_shell import DebugSession, GwemuGDBBackend
     from .profiles import DeviceProfile
@@ -372,12 +375,26 @@ def watch_instance(profile: str, *, symbols: list[str],
     was_running = bool(before.get("running"))
     backend = GwemuGDBBackend(host="127.0.0.1", port=row["gdbPort"])
     started = time.monotonic()
-    previous_heartbeat = None
-    previous_guest_pc = None
-    guest_pc_stable_since = started
+    # Retain the old named options as aliases, while allowing any project to
+    # describe its own progress and guest-PC probes. Probe discovery is only a
+    # convenience; the report records exactly what was selected.
+    progress_names = list(progress_symbols or [])
+    for name in (heartbeat_symbol, frame_symbol):
+        if name and name not in progress_names:
+            progress_names.append(name)
+    guest_names = list(guest_pc_symbols or [])
+    if guest_pc_symbol and guest_pc_symbol not in guest_names:
+        guest_names.append(guest_pc_symbol)
+    watched_names = list(dict.fromkeys([*progress_names, *guest_names,
+                                        *(watch_u32 or [])]))
+    deref_specs = list(watch_deref or [])
+    value_history: dict[str, int] = {}
+    value_stable_since: dict[str, float] = {}
     last_progress = started
     samples = []
-    frame_start = None
+    previous_cpu_signature = None
+    cpu_stable_since = started
+    last_guest_screen_probe = 0.0
     report_path = (Path(output).expanduser().resolve() if output else
                    device.root / "runtime" / "gwprov" / "triage" /
                    f"watch-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json")
@@ -389,131 +406,162 @@ def watch_instance(profile: str, *, symbols: list[str],
         session = DebugSession(backend, "gwemu", qmp_socket=row["qmpSocket"])
         for path in symbol_paths:
             session.symbols.load(path)
-        heartbeat_address = session.at(heartbeat_symbol)
-        frame_address = session.at(frame_symbol)
-        guest_pc_address = session.at(guest_pc_symbol) if guest_pc_symbol else None
-        ppu_pointer_address = session.at(ppu_pointer_symbol) if ppu_pointer_symbol else None
+        # Discover common instrumentation names across cores and homebrews.
+        # Explicit options always win and projects need not follow this naming.
+        symbols_found = session.nm()
+        if not progress_names:
+            for item in symbols_found:
+                name = item["name"].lower()
+                if item["size"] == 4 and item["type"] == "STT_OBJECT" and any(
+                        token in name for token in
+                        ("heartbeat", "frame_count", "frame_counter", "progress_count")):
+                    progress_names.append(item["name"])
+        if not guest_names:
+            for item in symbols_found:
+                name = item["name"].lower()
+                if item["size"] == 4 and item["type"] == "STT_OBJECT" and (
+                        name.endswith(("_cur_pc", "_current_pc", "_resume_pc", "_guest_pc"))):
+                    guest_names.append(item["name"])
+        watched_names = list(dict.fromkeys([*progress_names, *guest_names,
+                                            *(watch_u32 or [])]))
+        addresses = {name: session.at(name) for name in watched_names}
         fault_ranges = []
-        for name in ("common_fault_handler_c", "HardFault_Handler",
-                     "BusFault_Handler", "UsageFault_Handler", "Error_Handler", "abort"):
-            for symbol in session.nm(name):
-                if symbol["name"] == name and symbol["size"]:
-                    fault_ranges.append((name, symbol["address"] & ~1,
-                                         (symbol["address"] & ~1) + symbol["size"]))
-        saw_advance = False
+        for item in symbols_found:
+            name = item["name"]
+            lowered = name.lower()
+            if item["size"] and any(token in lowered for token in
+                                     ("hardfault", "busfault", "usagefault",
+                                      "memmanagefault", "fault_handler", "error_handler",
+                                      "panic", "assert_fail", "abort")):
+                fault_ranges.append((name, item["address"] & ~1,
+                                     (item["address"] & ~1) + item["size"]))
+        saw_progress = False
         while time.monotonic() - started < duration:
             status = _qmp_execute(row["qmpSocket"], "query-status").get("return", {})
             now = time.monotonic()
             if not status.get("running"):
                 samples.append({"elapsed_seconds": round(now - started, 3),
                                 "state": status.get("status", "paused")})
-                previous_heartbeat = None
+                previous_cpu_signature = None
+                value_history.clear()
+                value_stable_since.clear()
                 last_progress = now
                 time.sleep(interval)
                 continue
-            heartbeat = session.u32(heartbeat_address)
-            frames = session.u32(frame_address)
+            values = {name: session.u32(address) for name, address in addresses.items()}
             try:
                 session.rebase_from_pointer(".xip_dkc1", "dkc1_xip_runtime_base")
             except (KeyError, RuntimeError):
                 pass
-            pc = session.reg("pc") & ~1
-            guest_pc = session.u32(guest_pc_address) if guest_pc_address is not None else None
-            inidisp = None
-            if ppu_pointer_address is not None:
-                ppu = session.u32(ppu_pointer_address)
-                if ppu:
-                    inidisp = session.read(ppu, 1)[0]
-            if guest_pc is not None and guest_pc != previous_guest_pc:
-                guest_pc_stable_since = now
-            if frame_start is None:
-                frame_start = frames
-            if previous_heartbeat is not None and heartbeat != previous_heartbeat:
-                saw_advance = True
-            if previous_heartbeat is None or heartbeat != previous_heartbeat:
+            if hasattr(backend, "read_core_registers"):
+                regs = backend.read_core_registers()
+            else:
+                regs = {name: session.reg(name) for name in ("pc", "sp", "lr")}
+            pc = regs["pc"] & ~1
+            signature = (pc, regs.get("sp"), regs.get("lr"))
+            if signature != previous_cpu_signature:
+                cpu_stable_since = now
+            changed_progress = False
+            for name in watched_names:
+                value = values[name]
+                if name not in value_history:
+                    value_stable_since[name] = now
+                elif value != value_history[name]:
+                    value_stable_since[name] = now
+                    if name in progress_names:
+                        changed_progress = True
+                value_history[name] = value
+            if changed_progress:
+                saw_progress = True
                 last_progress = now
             fault_name = next((name for name, start, end in fault_ranges
                                if start <= pc < end), None)
+            guest_stagnant = next((name for name in guest_names
+                                   if now - value_stable_since.get(name, now) >= stall_after), None)
+            cpu_stagnant = (previous_cpu_signature == signature and
+                            now - cpu_stable_since >= stall_after and
+                            (not progress_names or now - last_progress >= stall_after))
+            guest_stagnant_trigger = False
+            screen_probe = None
+            if guest_stagnant and now - last_guest_screen_probe >= min(stall_after, 2.0):
+                last_guest_screen_probe = now
+                screen_probe = session.screenshot(image_path)
+                guest_stagnant_trigger = (
+                    screen_probe["all_black"] or not progress_names or
+                    now - last_progress >= stall_after)
+                if not guest_stagnant_trigger:
+                    image_path.unlink(missing_ok=True)
+                    screen_probe = None
             samples.append({"elapsed_seconds": round(now - started, 3),
-                            "heartbeat": heartbeat, "frames": frames,
+                            "values": values,
                             "pc": pc, "pc_hex": hex(pc), "fault_handler": fault_name,
-                            "guest_pc": guest_pc,
-                            "guest_pc_hex": hex(guest_pc) if guest_pc is not None else None,
-                            "inidisp": inidisp,
+                            "sp": regs.get("sp"), "lr": regs.get("lr"),
+                            "guest_pc_stagnant": guest_stagnant,
+                            "cpu_location_stagnant": cpu_stagnant,
                             "state": status.get("status", "running")})
-            previous_heartbeat = heartbeat
-            guest_stable = now - guest_pc_stable_since
-            if (guest_pc is not None and guest_pc == previous_guest_pc and
-                    guest_stable >= stall_after and inidisp is not None and inidisp & 0x80):
-                diagnosis = session.diagnose(
-                    image_path, inspect_u32=[heartbeat_symbol, frame_symbol,
-                                             guest_pc_symbol, ppu_pointer_symbol])
-                all_black = diagnosis.get("screenshot", {}).get("all_black")
-                classification = ("guest-pc-stagnant-blank" if all_black is True
-                                  else "guest-pc-stagnant-forced-blank")
-                report = {
-                    "classification": classification,
-                    "reason": "guest emulation PC remained unchanged while the PPU forced-blank bit was set",
-                    "observed_at_utc": datetime.now(timezone.utc).isoformat(),
-                    "profile": root, "pid": row["pid"],
-                    "symbols": [str(path) for path in symbol_paths],
-                    "guest_pc_symbol": guest_pc_symbol,
-                    "guest_pc": guest_pc, "guest_pc_hex": hex(guest_pc),
-                    "guest_pc_stable_seconds": round(guest_stable, 3),
-                    "inidisp": inidisp, "all_black": all_black,
-                    "heartbeat_symbol": heartbeat_symbol,
-                    "frame_symbol": frame_symbol,
-                    "frame_start": frame_start, "frame_end": frames,
-                    "screenshot": str(image_path), "diagnosis": diagnosis,
-                    "samples": samples,
-                }
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                report_path.write_text(json.dumps(report, indent=2) + "\n")
-                print(json.dumps({"classification": classification,
-                                  "guest_pc": hex(guest_pc), "inidisp": hex(inidisp),
-                                  "all_black": all_black,
-                                  "report": str(report_path),
-                                  "screenshot": str(image_path),
-                                  "traceback": diagnosis.get("traceback")}, indent=2))
-                return 1
-            previous_guest_pc = guest_pc
-            if fault_name or now - last_progress >= stall_after:
-                diagnosis = session.diagnose(
-                    image_path, inspect_u32=[heartbeat_symbol, frame_symbol])
-                classification = "fault-handler" if fault_name else "stalled"
-                reason = (f"CPU PC is inside {fault_name}" if fault_name else
-                          f"{heartbeat_symbol} did not advance for {stall_after:g} seconds")
+            previous_cpu_signature = signature
+            if fault_name or guest_stagnant_trigger or cpu_stagnant or (
+                    progress_names and now - last_progress >= stall_after):
+                diagnosis = session.diagnose(image_path, inspect_u32=watched_names,
+                                             inspect_deref=deref_specs,
+                                             screenshot=screen_probe)
+                screenshot = diagnosis.get("screenshot", {})
+                if fault_name:
+                    classification = "fault-handler"
+                    reason = f"CPU PC is inside {fault_name}"
+                elif guest_stagnant_trigger:
+                    classification = "suspected-guest-loop"
+                    reason = f"{guest_stagnant} remained unchanged for {stall_after:g} seconds"
+                elif progress_names and now - last_progress >= stall_after:
+                    classification = "suspected-progress-stall"
+                    reason = f"none of the selected progress symbols changed for {stall_after:g} seconds"
+                else:
+                    classification = "suspected-cpu-loop"
+                    reason = f"ARM PC, SP, and LR stayed unchanged for {stall_after:g} seconds"
+                context = session.where()
+                if screenshot.get("all_black") and classification.startswith("suspected-"):
+                    classification += "-black-display"
                 report = {
                     "classification": classification,
                     "reason": reason,
+                    "confidence": "direct" if fault_name else "heuristic",
                     "observed_at_utc": datetime.now(timezone.utc).isoformat(),
                     "profile": root, "pid": row["pid"],
                     "symbols": [str(path) for path in symbol_paths],
-                    "heartbeat_symbol": heartbeat_symbol,
-                    "frame_symbol": frame_symbol,
-                    "frame_start": frame_start, "frame_end": frames,
+                    "progress_symbols": progress_names,
+                    "guest_pc_symbols": guest_names,
+                    "watch_u32": watch_u32 or [],
+                    "watch_deref": deref_specs,
+                    "last_values": values,
+                    "stable_seconds": round(now - (value_stable_since.get(guest_stagnant, cpu_stable_since)
+                                                    if guest_stagnant_trigger else cpu_stable_since), 3),
+                    "cpu_location": {"pc": pc, "sp": regs.get("sp"), "lr": regs.get("lr"),
+                                     "symbolized": context},
+                    "display": screenshot,
                     "screenshot": str(image_path), "diagnosis": diagnosis,
                     "samples": samples,
                 }
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text(json.dumps(report, indent=2) + "\n")
                 print(json.dumps({"classification": classification,
+                                  "reason": reason,
+                                  "confidence": report["confidence"],
+                                  "values": values,
+                                  "display": screenshot,
                                   "report": str(report_path),
                                   "screenshot": str(image_path),
+                                  "cpu_location": context,
                                   "traceback": diagnosis["traceback"]}, indent=2))
                 return 1
             time.sleep(interval)
-        classification = ("progressing" if saw_advance else
-                          "inconclusive-no-heartbeat-change" if previous_heartbeat is not None else
-                          "paused")
+        classification = "progressing" if saw_progress else "no-progress-symbols-detected"
         report = {
             "classification": classification,
             "observed_at_utc": datetime.now(timezone.utc).isoformat(),
             "profile": root, "pid": row["pid"],
             "symbols": [str(path) for path in symbol_paths],
-            "heartbeat_symbol": heartbeat_symbol, "frame_symbol": frame_symbol,
-            "frame_start": frame_start,
-            "frame_end": samples[-1].get("frames") if samples else None,
+            "progress_symbols": progress_names,
+            "guest_pc_symbols": guest_names,
             "samples": samples,
         }
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -521,7 +569,7 @@ def watch_instance(profile: str, *, symbols: list[str],
         print(json.dumps({"classification": report["classification"],
                           "report": str(report_path),
                           "samples": len(samples)}, indent=2))
-        return 2 if classification == "inconclusive-no-heartbeat-change" else 0
+        return 0 if saw_progress else 2
     finally:
         if getattr(backend, "_socket", None) is not None:
             if was_running and not backend._is_running:

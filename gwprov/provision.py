@@ -53,6 +53,22 @@ def create_profile(directory: str | Path, *, content: str | Path,
     metadata = json.loads((source / '.gwprov-firmware.json').read_text())
     if metadata.get('variant') != 'flash':
         raise ValueError('profile create currently assembles flash content; SD media uses the sd commands')
+    declared_files = metadata.get('files')
+    if not isinstance(declared_files, list) or not declared_files:
+        raise ValueError('firmware metadata has no declared content files; run gwprov retro-go install first')
+    missing_files = []
+    for relative in declared_files:
+        if not isinstance(relative, str):
+            raise ValueError('firmware metadata contains a non-path file entry')
+        parts = Path(relative).parts
+        if not parts or parts[0] not in {'firmware', 'flash'} or '..' in parts:
+            raise ValueError(f'invalid firmware content path: {relative!r}')
+        if not (source / relative).is_file():
+            missing_files.append(relative)
+    if missing_files:
+        preview = ', '.join(missing_files[:4])
+        suffix = ' ...' if len(missing_files) > 4 else ''
+        raise ValueError(f'firmware content is incomplete; missing {preview}{suffix}; rerun gwprov retro-go install')
     projects_path = source / 'flash/.gwprov-projects.json'
     projects = json.loads(projects_path.read_text()) if projects_path.is_file() else {}
     abi = metadata['firmware']['providesAbi']
@@ -104,6 +120,9 @@ def create_profile(directory: str | Path, *, content: str | Path,
                     '--build-dir', str(work/'littlefs-build'), '--size', str(littlefs_size),
                     '--block-size', str(metadata['littlefsBlockSize']), '--no-cores-filter']
         for item in ('cores', 'lang', 'data'):lfs_args.extend(['--include', item])
+        config_file = littlefs_tree / 'CONFIG'
+        if config_file.is_file():
+            lfs_args.extend(['--include-root-file', 'CONFIG'])
         if gen_littlefs_image.main(lfs_args):
             raise ValueError('LittleFS build failed')
         frogfs = (work/'frogfs.bin').read_bytes()
@@ -117,8 +136,17 @@ def create_profile(directory: str | Path, *, content: str | Path,
         if len(firmware) > BANK_SIZE:raise ValueError('firmware is larger than bank 2')
         instance = work/'instance'
         instance.mkdir()
+        symbol_relative = metadata.get('debugSymbols')
+        if symbol_relative:
+            symbols = (source / symbol_relative).resolve()
+            if source not in symbols.parents or not symbols.is_file():
+                raise ValueError(f'firmware debug symbols are missing or escape the content root: {symbol_relative}')
+            debug_dir = instance / 'debug'
+            debug_dir.mkdir()
+            shutil.copyfile(symbols, debug_dir / 'retro-go-debug.elf')
         (instance/'bank1.bin').write_bytes(bootloader.ljust(BANK_SIZE, b'\xff'))
         (instance/'bank2.bin').write_bytes(firmware.ljust(BANK_SIZE,b'\xff'))
+        (instance/'rdp-state.bin').write_bytes(b'\xaa')
         with (instance/'extflash.bin').open('wb') as output:
             for _ in range(chip_mib):output.write(b'\xff'*MIB)
             output.seek(0);output.write(frogfs)
@@ -130,6 +158,7 @@ def create_profile(directory: str | Path, *, content: str | Path,
             '[flash]\nbank1 = "bank1.bin"\nbank2 = "bank2.bin"\nextflash = "extflash.bin"\n'
             '[sd]\nmode = "none"\n')
         report = {'firmware': metadata, 'projects': projects,
+                  'debugSymbols': 'debug/retro-go-debug.elf' if symbol_relative else None,
                   'layout': {'extflashBytes': total, 'frogfsBytes': len(frogfs),
                              'littlefsOffset': total-littlefs_size, 'littlefsBytes': littlefs_size},
                   'boot': 'official bootloader at 0x08000000', 'bootloader': boot_info}

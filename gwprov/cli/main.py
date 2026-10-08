@@ -39,6 +39,24 @@ def _firmware_install(args) -> int:
     return 0
 
 
+def _project_stage_local(args) -> int:
+    from gwprov.dist.local_project import stage_local_project
+    result = stage_local_project(args.manifest, output=args.output)
+    print(f"Staged local {result['repo']}:{result['target']} ({result['variant']})")
+    for path in result['files']:
+        print(f"  {path}")
+    return 0
+
+
+def _profile_stock(args) -> int:
+    from gwprov.stock import create_stock_profile
+    result = create_stock_profile(args.directory, backup_dirs=args.backup_dir,
+                                  locked=args.locked, model=args.model,
+                                  extflash_mib=args.extflash_mib)
+    print(f"Created stock {result['model']} profile: {args.directory}; locked={result['locked']}")
+    return 0
+
+
 def _profile_create(args) -> int:
     from gwprov.provision import create_profile
     report = create_profile(args.directory, content=args.content, name=args.name,
@@ -115,6 +133,81 @@ def _run_gwemu(args) -> int:
         target.stop()
 
 
+def _gwemu_start(args) -> int:
+    from gwprov.gwemu_manager import start_instance
+    return start_instance(args.profile, audio=args.audio, gdb_port=args.gdb_port,
+                          qmp_socket=args.qmp_socket, headless=args.headless)
+
+
+def _gwemu_stop(args) -> int:
+    from gwprov.gwemu_manager import stop_instance
+    return stop_instance(pid=args.pid, profile=args.profile, timeout=args.timeout)
+
+def _gwemu_pause(args) -> int:
+    from gwprov.gwemu_manager import set_instance_running
+    return set_instance_running(args.profile, running=False)
+
+
+def _gwemu_resume(args) -> int:
+    from gwprov.gwemu_manager import set_instance_running
+    return set_instance_running(args.profile, running=True)
+
+
+def _gwemu_ps(args) -> int:
+    from gwprov.gwemu_manager import show_instances
+    return show_instances(output=args.output)
+
+
+def _gwemu_screenshot(args) -> int:
+    from gwprov.gwemu_manager import screenshot_instance
+    return screenshot_instance(pid=args.pid, profile=args.profile, output=args.output)
+
+
+def _gwemu_diagnose(args) -> int:
+    from gwprov.gwemu_manager import diagnose_instance
+    return diagnose_instance(args.profile, symbols=args.symbols,
+                             output=args.output, max_frames=args.max_frames,
+                             inspect_u32=args.u32, inspect_deref=args.deref)
+
+def _gwemu_watch(args) -> int:
+    from gwprov.gwemu_manager import watch_instance
+    return watch_instance(args.profile, symbols=args.symbols,
+                          heartbeat_symbol=args.heartbeat_symbol,
+                          frame_symbol=args.frame_symbol,
+                          guest_pc_symbol=args.guest_pc_symbol,
+                          ppu_pointer_symbol=args.ppu_pointer_symbol,
+                          interval=args.interval,
+                          stall_after=args.stall_after, duration=args.duration,
+                          output=args.output)
+
+
+def _debug_gwemu(args) -> int:
+    from gwprov.debug import debug_profile
+    return debug_profile(args.profile, gdb_port=args.gdb_port,
+                         qmp_socket=args.qmp_socket,
+                         symbols=args.symbols, gdb=args.gdb,
+                         audio=args.audio, break_on_fault=not args.no_break_on_fault,
+                         unpause_homebrew=args.unpause_homebrew,
+                         app_symbols=args.app_symbols,
+                         detach_after_app_entry=args.detach_after_app_entry,
+                         keep_running=args.keep_running)
+
+
+def _debug_python(args) -> int:
+    from gwprov.debug_shell import python_shell
+
+    symbol_paths = list(args.symbols)
+    if args.profile:
+        from gwprov.profiles import DeviceProfile
+        firmware_symbols = DeviceProfile.load(args.profile).root / "debug" / "retro-go-debug.elf"
+        if not firmware_symbols.is_file():
+            raise ValueError(f"profile has no bundled firmware symbols: {firmware_symbols}")
+        symbol_paths.insert(0, str(firmware_symbols))
+    return python_shell(target=args.target, host=args.host, port=args.port,
+                        openocd_port=args.openocd_port, symbols=symbol_paths,
+                        qmp_socket=args.qmp_socket)
+
+
 def _ofw_patch(args) -> int:
     from gwprov.vendor.qemu_gnw import cfw_images
 
@@ -174,6 +267,36 @@ def _input_tap(args) -> int:
     with session() as dev:
         dev.tap(keys, repeat=args.repeat, tap_ms=args.tap_ms, gap_ms=args.gap_ms)
     return 0
+
+
+def _media_inventory(args) -> int:
+    from gwprov.inventory import inspect_profile, frogfs, littlefs, fatfs
+    if args.profile:
+        result = inspect_profile(args.profile, args.shared_sd_root)
+    else:
+        image = Path(args.image).expanduser().resolve()
+        if not args.filesystem:
+            raise ValueError('--image requires --filesystem')
+        if args.filesystem == 'littlefs':
+            if not args.size: raise ValueError('LittleFS inventory requires --size')
+            entry = littlefs(image, args.offset, args.size, args.block_size)
+        else:
+            entry = (frogfs if args.filesystem == 'frogfs' else fatfs)(image, args.offset)
+        result = {'schemaVersion': 1, 'images': {}, 'filesystems': [entry]}
+    text = json.dumps(result, indent=2) + "\n"
+    if args.output:
+        Path(args.output).write_text(text)
+    else:
+        print(text, end="")
+    return 0
+
+
+def _media_compare(args) -> int:
+    from gwprov.inventory import compare
+    result = compare(json.loads(Path(args.expected).read_text()),
+                     json.loads(Path(args.actual).read_text()), args.mode)
+    print(json.dumps(result, indent=2))
+    return 0 if result["equal"] else 1
 
 
 def _profile_show(args) -> int:
@@ -363,7 +486,7 @@ _gwprov_complete() {
   context="${COMP_WORDS[1]-}:${COMP_WORDS[2]-}"
   extra_candidates=""
   case "$cur" in
-    --input-dir=*|--firmware-dir=*|--bios-dir=*|--game-dir=*|--content=*|--profile=*|--output=*|--bootloader-file=*)
+    --input-dir=*|--firmware-dir=*|--bios-dir=*|--game-dir=*|--content=*|--profile=*|--output=*|--bootloader-file=*|--backup-dir=*)
       _gwprov_complete_dirs "$cur"
       return
       ;;
@@ -377,7 +500,7 @@ _gwprov_complete() {
     COMPREPLY=( $(compgen -W "flash sd" -- "$cur") )
     return
   fi
-  if [[ "$prev" == "--input-dir" || "$prev" == "--firmware-dir" || "$prev" == "--bios-dir" || "$prev" == "--game-dir" || "$prev" == "--content" || "$prev" == "--profile" || "$prev" == "--output" || "$prev" == "--bootloader-file" ]]; then
+  if [[ "$prev" == "--input-dir" || "$prev" == "--firmware-dir" || "$prev" == "--bios-dir" || "$prev" == "--game-dir" || "$prev" == "--content" || "$prev" == "--profile" || "$prev" == "--output" || "$prev" == "--bootloader-file" || "$prev" == "--backup-dir" ]]; then
     _gwprov_complete_dirs "$cur"
     return
   fi
@@ -389,10 +512,10 @@ _gwprov_complete() {
       retro-go) candidates="install build config" ;;
       gwemu) candidates="run" ;;
       ofw) candidates="patch" ;;
-      media) candidates="frogfs littlefs" ;;
+      media) candidates="frogfs littlefs inventory compare" ;;
       sd) candidates="create compose" ;;
       input) candidates="tap" ;;
-      profile) candidates="create show" ;;
+      profile) candidates="create stock show" ;;
       completion) candidates="bash" ;;
       *) candidates="" ;;
     esac
@@ -445,6 +568,21 @@ def build_parser() -> argparse.ArgumentParser:
     completion.add_argument("shell", choices=("bash",))
     completion.set_defaults(handler=_completion_bash)
 
+    debug_tools = commands.add_parser("debug", help="interactive target debugging")
+    debug_commands = debug_tools.add_subparsers(dest="debug_command", required=True)
+    python_debug = debug_commands.add_parser(
+        "python", help="attach a persistent Python console to GWemu or hardware")
+    python_debug.add_argument("--target", choices=("gwemu", "hardware"), required=True)
+    python_debug.add_argument("--host", default="127.0.0.1")
+    python_debug.add_argument("--port", type=int, default=1234,
+                              help="GWemu GDB port (default: 1234)")
+    python_debug.add_argument("--openocd-port", type=int, default=6666)
+    python_debug.add_argument("--qmp-socket", help="GWemu QMP socket for screendump support")
+    python_debug.add_argument("--profile", help="load the profile's bundled official Retro-Go ELF symbols")
+    python_debug.add_argument("--symbols", action="append", default=[], metavar="ELF",
+                              help="load an additional firmware or app ELF (repeatable)")
+    python_debug.set_defaults(handler=_debug_python)
+
     project = commands.add_parser("project", help="resolve and stage GWRG-distributed projects")
     project_commands = project.add_subparsers(dest="project_command", required=True)
     project_list = project_commands.add_parser("list", help="list curated cores and homebrew projects")
@@ -483,6 +621,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="stage files from a system game directory")
     install.add_argument("--dry-run", action="store_true", help="resolve, verify and plan without writing")
     install.set_defaults(handler=_project_install)
+    stage_local = project_commands.add_parser("stage-local", help="stage an unpublished local build into content")
+    stage_local.add_argument("manifest", help="local JSON manifest describing sources and destinations")
+    stage_local.add_argument("--output", required=True, help="content root populated by retro-go install")
+    stage_local.set_defaults(handler=_project_stage_local)
 
     retro_go = commands.add_parser("retro-go", help="vendor-supported Retro-Go operations")
     retro_commands = retro_go.add_subparsers(dest="retro_command", required=True)
@@ -519,6 +661,73 @@ def build_parser() -> argparse.ArgumentParser:
 
     gwemu = commands.add_parser("gwemu", help="run a provisioned GWemu profile or image")
     gwemu_commands = gwemu.add_subparsers(dest="gwemu_command", required=True)
+    start = gwemu_commands.add_parser("start", help="start one managed GWemu profile")
+    start.add_argument("--profile", required=True)
+    start.add_argument("--gdb-port", type=int, help="GDB port; default: choose an available port")
+    start.add_argument("--qmp-socket", help="QMP socket; default: profile runtime directory")
+    start.add_argument("--audio", action="store_true")
+    start.add_argument("--headless", action="store_true",
+                       help="run without the window (visible by default)")
+    start.set_defaults(handler=_gwemu_start)
+
+    stop = gwemu_commands.add_parser("stop", help="gracefully stop an instance through QMP")
+    stop_target = stop.add_mutually_exclusive_group(required=True)
+    stop_target.add_argument("--profile", help="profile directory of the instance")
+    stop_target.add_argument("--pid", type=int, help="GWemu process id")
+    stop.add_argument("--timeout", type=float, default=10.0)
+    stop.set_defaults(handler=_gwemu_stop)
+
+    pause = gwemu_commands.add_parser("pause", help="pause a GWemu instance through QMP")
+    pause.add_argument("--profile", required=True)
+    pause.set_defaults(handler=_gwemu_pause)
+
+    resume = gwemu_commands.add_parser("resume", help="resume a paused GWemu instance through QMP")
+    resume.add_argument("--profile", required=True)
+    resume.set_defaults(handler=_gwemu_resume)
+
+    ps = gwemu_commands.add_parser("ps", help="list running GWemu instances and endpoints")
+    ps.add_argument("--output", choices=("text", "json"), default="text")
+    ps.set_defaults(handler=_gwemu_ps)
+
+    screenshot = gwemu_commands.add_parser(
+        "screenshot", help="capture a GWemu PNG and report whether the frame is black")
+    screenshot_target = screenshot.add_mutually_exclusive_group(required=True)
+    screenshot_target.add_argument("--profile", help="profile directory of the instance")
+    screenshot_target.add_argument("--pid", type=int, help="GWemu process id")
+    screenshot.add_argument("--output", help="PNG path; defaults under the profile runtime directory")
+    screenshot.set_defaults(handler=_gwemu_screenshot)
+
+    diagnose = gwemu_commands.add_parser(
+        "diagnose", help="capture a running profile's screen and symbol-resolved call stack")
+    diagnose.add_argument("--profile", required=True,
+                          help="profile directory of the running visible GWemu instance")
+    diagnose.add_argument("--symbols", action="append", default=[], metavar="ELF",
+                          help="additional app ELF symbols (repeatable)")
+    diagnose.add_argument("--output", help="PNG path; defaults under the profile runtime directory")
+    diagnose.add_argument("--max-frames", type=int, default=32)
+    diagnose.add_argument("--u32", action="append", default=[], metavar="SYMBOL",
+                          help="read a symbol-addressed 32-bit target value (repeatable)")
+    diagnose.add_argument("--deref", action="append", default=[], metavar="SYMBOL[+OFFSET]:SIZE",
+                          help="read bytes from a pointer-valued global, e.g. --deref g_ppu:16 (repeatable)")
+    diagnose.set_defaults(handler=_gwemu_diagnose)
+
+    watch = gwemu_commands.add_parser(
+        "watch", help="watch app progress and capture a report when it stalls")
+    watch.add_argument("--profile", required=True)
+    watch.add_argument("--symbols", action="append", required=True, metavar="ELF",
+                       help="app ELF symbols (repeatable)")
+    watch.add_argument("--heartbeat-symbol", default="dkc1_gwrg_host_heartbeat")
+    watch.add_argument("--frame-symbol", default="dkc1_gwrg_frame_count")
+    watch.add_argument("--guest-pc-symbol", default="g_interp816_cur_pc",
+                       help="guest emulation PC symbol; empty disables this check")
+    watch.add_argument("--ppu-pointer-symbol", default="g_ppu",
+                       help="PPU pointer symbol used to read INIDISP; empty disables this check")
+    watch.add_argument("--interval", type=float, default=0.5)
+    watch.add_argument("--stall-after", type=float, default=3.0)
+    watch.add_argument("--duration", type=float, default=30.0)
+    watch.add_argument("--output", help="JSON report path; defaults under profile runtime")
+    watch.set_defaults(handler=_gwemu_watch)
+
     run = gwemu_commands.add_parser("run", help="launch GWemu using the shared target layer")
     run.add_argument("--profile")
     run.add_argument("--gdb-port", type=int, help="optional debug server; guest starts running")
@@ -537,6 +746,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--stdio-gdb", action="store_true")
     run.set_defaults(handler=_run_gwemu)
 
+    debug = gwemu_commands.add_parser("debug", help="run visible GWemu under GDB with bundled firmware symbols")
+    debug.add_argument("--profile", required=True)
+    debug.add_argument("--gdb-port", type=int, default=1234)
+    debug.add_argument("--qmp-socket", help="optional QMP UNIX socket for screenshots and emulator controls")
+    debug.add_argument("--symbols", help="override profile's matching firmware ELF")
+    debug.add_argument("--gdb", help="GDB executable (defaults to arm-none-eabi-gdb or gdb-multiarch)")
+    debug.add_argument("--audio", action="store_true")
+    debug.add_argument("--no-break-on-fault", action="store_true")
+    debug.add_argument("--unpause-homebrew", action="store_true",
+                       help="at reset, clear Retro-Go start_paused at run_gwhb_homebrew entry")
+    debug.add_argument("--app-symbols", help="app ELF used to resolve app_main")
+    debug.add_argument("--detach-after-app-entry", action="store_true",
+                       help="after the launch hook, detach GDB at app_main so another gwprov monitor can attach")
+    debug.add_argument("--keep-running", action="store_true",
+                       help="leave GWemu running after GDB detaches or exits")
+    debug.set_defaults(handler=_debug_gwemu)
+
     ofw = commands.add_parser("ofw", help="offline stock firmware image preparation")
     ofw_commands = ofw.add_subparsers(dest="ofw_command", required=True)
     patch = ofw_commands.add_parser("patch", help="build patched stock banks using gnwmanager's offline patch pipeline")
@@ -548,6 +774,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     media = commands.add_parser("media", help="build Retro-Go filesystem images")
     media_commands = media.add_subparsers(dest="filesystem", required=True)
+    inventory = media_commands.add_parser("inventory", help="read filesystem tables and hashes from a device profile")
+    inventory_source = inventory.add_mutually_exclusive_group(required=True)
+    inventory_source.add_argument("--profile")
+    inventory_source.add_argument("--image")
+    inventory.add_argument("--filesystem", choices=("frogfs", "littlefs", "fatfs"))
+    inventory.add_argument("--offset", type=lambda value: int(value, 0), default=0)
+    inventory.add_argument("--size", type=lambda value: int(value, 0))
+    inventory.add_argument("--block-size", type=lambda value: int(value, 0), default=4096)
+    inventory.add_argument("--shared-sd-root")
+    inventory.add_argument("--output")
+    inventory.set_defaults(handler=_media_inventory)
+    comparison = media_commands.add_parser("compare", help="compare saved filesystem inventories or image hashes")
+    comparison.add_argument("expected")
+    comparison.add_argument("actual")
+    comparison.add_argument("--mode", choices=("contents", "image"), default="contents")
+    comparison.set_defaults(handler=_media_compare)
     for filesystem in ("frogfs", "littlefs"):
         pack = media_commands.add_parser(filesystem, help=f"run the vendored {filesystem} packer")
         pack.add_argument("--retro-go-root", required=True,
@@ -593,6 +835,13 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--bootloader-version", default="v1.0.8", help="release tag or latest")
     create.add_argument("--bootloader-file", help="use a local binary linked at 0x08000000")
     create.set_defaults(handler=_profile_create)
+    stock = profile_commands.add_parser("stock", help="create pristine stock media from hash-valid backups")
+    stock.add_argument("directory")
+    stock.add_argument("--backup-dir", action="append", required=True)
+    stock.add_argument("--locked", action="store_true", help="initialize device RDP state as locked")
+    stock.add_argument("--model", choices=("auto", "mario", "zelda"), default="auto")
+    stock.add_argument("--extflash-mib", type=int, choices=(64, 128, 256), default=64)
+    stock.set_defaults(handler=_profile_stock)
     show = profile_commands.add_parser("show")
     show.add_argument("directory")
     show.add_argument("--shared-sd-root")

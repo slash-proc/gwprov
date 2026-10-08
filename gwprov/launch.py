@@ -18,7 +18,9 @@ def launch_profile(directory: str | Path, *, headless: bool = False, audio: bool
     for prop,path in [('bank1-image',profile.bank1),('bank2-image',profile.bank2),
                       ('extflash-image',profile.extflash)]:
         cmd += ['-global', f'gnw-h7b0-soc.{prop}={path}']
-    cmd += ['-global',f'gnw-h7b0-soc.rdp-image={profile.root / "rdp.bin"}']
+    rdp = profile.root / 'rdp-state.bin'
+    if not rdp.exists():rdp = profile.root / 'rdp.bin'
+    cmd += ['-global',f'gnw-h7b0-soc.rdp-image={rdp}']
     cmd += ['-display', 'none' if headless else 'gwemu', '-audiodev',
             'sdl3,id=snd0' if audio else 'none,id=snd0',
             '-global', 'gnw-h7b0-sai1.audiodev=snd0']

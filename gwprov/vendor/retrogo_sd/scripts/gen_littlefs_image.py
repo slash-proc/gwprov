@@ -118,6 +118,13 @@ def main(argv=None):
         help="Top-level sd_content directory to include. May be repeated. Defaults to cores.",
     )
     parser.add_argument(
+        "--include-root-file",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="Include a file directly at the LittleFS root (for example CONFIG).",
+    )
+    parser.add_argument(
         "--roms-dir",
         default="roms",
         help="Project ROM tree (merged with sd_content/roms) used to pick which cores to pack",
@@ -181,6 +188,18 @@ def main(argv=None):
     if not collect_dirs:
         print(f"No LittleFS input directories found in {sd_content}", file=sys.stderr)
         return 1
+
+    root_files = []
+    for filename in args.include_root_file:
+        name = pathlib.PurePosixPath(filename)
+        if name.name != filename or filename in ("", ".", ".."):
+            print(f"Invalid LittleFS root filename: {filename!r}", file=sys.stderr)
+            return 1
+        src = sd_content / filename
+        if not src.is_file():
+            print(f"LittleFS root file not found: {src}", file=sys.stderr)
+            return 1
+        root_files.append(src)
 
     scripts_dir = str(pathlib.Path(__file__).resolve().parent)
     if scripts_dir not in sys.path:
@@ -291,6 +310,8 @@ def main(argv=None):
                     else frozenset()
                 )
                 copied_files += copy_tree(fs, src, dest, exclude_relpaths=excl)
+        for src in root_files:
+            copied_files += copy_file(fs, src, "/" + src.name) or 1
         if "pico8" in active_systems:
             url = args.pico8_cores_url or pico8_gnw_cores.PICO8_GNW_CORES_ZIP_URL
             omit = frozenset({"pico8.ro"}) if args.omit_pico8_ro_from_gnw_zip else frozenset()

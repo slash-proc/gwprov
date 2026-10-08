@@ -33,6 +33,18 @@ def install_firmware(output: str | Path, *, variant: str = 'flash',
     files: dict[str, bytes] = {}
     with zipfile.ZipFile(io.BytesIO(blob)) as archive:
         files['firmware/intflash.bin'] = checked_member(archive, build['image'])
+        # Release ZIPs carry the matching, unstripped firmware ELF beside the
+        # install image. It is covered by the bundle's published SHA-256 even
+        # though it is not a runtime content entry in manifest.json.
+        symbol_name = 'debug/retro-go-debug.elf'
+        symbol_entries = [entry for entry in archive.infolist()
+                          if entry.filename == symbol_name]
+        if len(symbol_entries) != 1 or symbol_entries[0].file_size > 64 * 1024 * 1024:
+            raise ValueError(f'release bundle has missing, duplicate or oversized debug symbols: {symbol_name}')
+        symbols = archive.read(symbol_entries[0])
+        if not symbols.startswith(b'\x7fELF'):
+            raise ValueError(f'release debug symbols are not an ELF file: {symbol_name}')
+        files['firmware/retro-go-debug.elf'] = symbols
         for spec in build.get('content', []):
             path = _safe_relpath(spec.get('install', spec['path']))
             if variant == 'flash':
@@ -60,6 +72,7 @@ def install_firmware(output: str | Path, *, variant: str = 'flash',
         dest.write_bytes(data)
     metadata = {'repo': release.repo, 'version': release.version['tag'], 'variant': variant,
                 'build': build['id'], 'firmware': release.manifest['firmware'],
+                'debugSymbols': 'firmware/retro-go-debug.elf',
                 'littlefsBlockSize': build.get('littlefsBlockSize', 4096), 'files': list(files)}
     metadata_path.write_text(json.dumps(metadata, indent=2) + '\n')
     return metadata

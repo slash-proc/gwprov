@@ -80,6 +80,38 @@ for `--firmware-dir`. Choose your own eligible game instead of the example ZIP.
 ZIP inputs must contain exactly one non-directory file. Directory scans are
 non-recursive. Actual released converter WASM runs through Wasmtime.
 
+### Stage an unpublished local build
+
+For a project that is not published in the GWRG catalog yet, use
+`gwprov project stage-local` after `gwprov retro-go install`. The JSON manifest
+names each local source and its destination under `frogfs/` or `littlefs/`;
+mapped FrogFS artifacts also declare their relocation base. Paths in `source`
+are relative to the manifest unless absolute. Optional `sha256` values pin a
+source file.
+
+```json
+{
+  "schemaVersion": 1,
+  "repo": "local/example",
+  "tag": "poc",
+  "project": "example",
+  "variant": "flash",
+  "target": {
+    "id": "gnw-retro-go",
+    "requiresAbi": {"version": 2, "minSize": 888},
+    "files": [
+      {"source": "build/example.bin", "path": "frogfs/homebrews/Example.bin"},
+      {"source": "build/example.xip", "path": "frogfs/cores/example.xip",
+       "mapped": {"relocBase": "0xDEC00000"}}
+    ]
+  }
+}
+```
+
+`stage-local` writes the release install ownership marker, checks for path
+collisions, and stages beside the content root. It does not publish the project
+or run converters.
+
 ### Create the profile and launch GWemu
 
 ```bash
@@ -90,7 +122,125 @@ gwprov profile show "$profile"
 
 # Final command: launch the persistent instance with a window.
 gwprov gwemu run --profile "$profile"
+
+# Capture the live display as PNG; the command also checks for an all-black frame.
+gwprov gwemu screenshot --profile "$profile"
+
+# Capture the display and an ELF-symbolized ARM call stack in one report.
+gwprov gwemu diagnose --profile "$profile" --symbols build/dkc1_core.elf
+
+# Add selected 32-bit target globals to the same report.
+gwprov gwemu diagnose --profile "$profile" --symbols build/dkc1_core.elf \
+  --u32 snes_frame_counter --deref g_ppu:16
 ```
+
+`gwprov gwemu diagnose` attaches to the running instance, captures a PNG, checks
+whether every pixel is black, and unwinds the current ARM stack using the
+firmware and app ELF `.debug_frame` data. It prints JSON with the screenshot,
+registers, frames, and any unwind stop reason. The `display_state` field
+distinguishes an all-black frame from a Retro-Go pause overlay identified in
+the call stack. Repeat `--u32 SYMBOL` to read 32-bit globals from the loaded
+ELFs, which is useful for correlating a black frame with runtime state. Repeat
+`--deref SYMBOL[+OFFSET]:SIZE` to read bytes through a pointer-valued global,
+such as a PPU register block. It then restores the instance's prior running or
+paused state.
+
+For a symbolized debug session, use `gwprov gwemu debug --profile "$profile"`.
+The command starts visible GWemu stopped at reset so it can install breakpoints,
+loads the matching `debug/retro-go-debug.elf` from the checksum-verified firmware
+release, then continues execution. This reset halt is a debugger setup step; the
+app does not enter Retro-Go's pause menu unless `start_paused` is left enabled.
+
+Retro-Go `/CONFIG` homebrew autostart passes `start_paused=true` to
+`run_gwhb_homebrew`. The default debug session breaks on that function only with
+`--unpause-homebrew`, clears `r2` at function entry, and then resumes the app.
+The app's normal launch behavior remains paused. The interactive debug mode also
+sets fault breakpoints on the common Retro-Go and ARM fault handlers. On a hit,
+it saves a text report containing the backtrace, registers, stack words, and
+nearby instructions to `runtime/gwprov/fault-triage.txt` and leaves GDB stopped.
+Use `gwprov gwemu pause --profile "$profile"` or `resume` to stop or continue
+execution through QMP while GDB remains connected.
+
+For an automatic launch-to-watch cycle, provide the app ELF so gwprov can resolve
+`app_main`, detach at that entry point, and leave the VM running:
+
+```bash
+app_elf="$PWD/build/dkc1_gwrg/homebrew/dkc1_core.elf"
+gwprov gwemu debug --profile "$profile" --gdb-port 12345 \
+  --qmp-socket "$profile/runtime/gwprov/qmp.sock" \
+  --unpause-homebrew --app-symbols "$app_elf" \
+  --detach-after-app-entry --keep-running
+
+gwprov gwemu watch --profile "$profile" --symbols "$app_elf" \
+  --duration 30 --stall-after 3
+```
+
+The DKC homebrew exports volatile `dkc1_gwrg_host_heartbeat` and
+`dkc1_gwrg_frame_count` progress words. `watch` samples those, the CPU PC, and
+by default the SNES interpreter PC (`g_interp816_cur_pc`) and PPU INIDISP byte
+(`g_ppu`). A stagnant guest PC while the PPU forced-blank bit is set triggers a
+built-in PNG capture. An all-black image is reported as
+`guest-pc-stagnant-blank`; this is evidence of a suspected guest loop, not proof
+that every possible legitimate wait has been excluded. Fault-handler hits and
+host-heartbeat stalls also write a JSON report and symbolized traceback under
+`runtime/gwprov/triage/`. Set `--guest-pc-symbol ''` or
+`--ppu-pointer-symbol ''` to disable either DKC-specific check. `watch` exits 1
+for a detected fault/stall condition, 2 when the observation window ends without
+enough heartbeat evidence, and 0 when progress is observed.
+Use one GDB owner at a time; after the launch command detaches, `watch` owns the
+GDB connection for the observation window.
+
+GDB commands such as `continue`, `stepi`, `info registers`, `x/16wx ADDRESS`,
+`bt`, and `monitor system_reset` control an attached interactive session. Use
+`--symbols ELF` to override the debug session's firmware ELF or
+`--no-break-on-fault` to omit fault breakpoints. `gwprov gwemu ps` exits with an
+error when seccomp/no-new-privileges makes an empty process scan inconclusive.
+Process management needs process-namespace visibility; QMP and GDB need AF_UNIX
+and TCP connect access. Those are not inherently `NET_ADMIN` requirements. A
+denied operation reports the socket and access type instead of appearing to be
+an absent emulator.
+
+For a persistent Python debugger attached to an already-running target:
+
+```bash
+gwprov debug python --target gwemu --port 1234 --profile "$profile" \
+  --qmp-socket "$profile/runtime/gwprov/qmp.sock" \
+  --symbols build/dkc1_core.elf
+```
+
+For an app that exports progress counters, `gwprov gwemu watch` polls the
+counter over GDB while GWemu runs. A stalled heartbeat triggers a PNG, symbolized
+traceback, selected globals, and a JSON report under the profile runtime directory.
+For the DKC GWHB port, the app ELF exports `dkc1_gwrg_host_heartbeat` and
+`dkc1_gwrg_frame_count` for this purpose. Run one GDB owner at a time; `watch`
+connects once and reads the two volatile progress words while the target runs.
+It briefly halts only when it captures the stalled CPU's registers and traceback.
+A detected stall exits with status 1.
+
+The `dbg` object stays connected for the whole REPL session. It provides
+`dbg.halt()`, `dbg.resume()`, `dbg.step()`, `dbg.regs()`, `dbg.where()`,
+`dbg.traceback()`, `dbg.diagnose()`, `dbg.read(addr, n)`, `dbg.u32(addr)`, and
+hardware breakpoints with `dbg.bp(addr)`.
+Thumb function symbols are normalized automatically for breakpoints and nearest
+symbol lookup. Register and symbol-location reads restore the target's prior
+running state.
+With `--qmp-socket`, `dbg.screenshot([path])` saves a PNG beside the QMP socket
+by default and returns its path, dimensions, `all_black`, and nonblack pixel
+count. `dbg.key("START")` sends a mapped Game & Watch button, and `dbg.qmp(command,
+arguments)` sends a structured QMP request. ELF symbols can
+be queried with `dbg.at("symbol_name")` or `dbg.symbols.find("substring")`.
+`dbg.nm("substring")` returns matching symbol rows with address, size, type,
+section, and owning ELF; `dbg.disasm("function_name")` uses objdump on the
+loaded ELF and returns that function's assembly listing.
+`dbg.symbols.sections()` shows link-time ranges. When a mapped sidecar's runtime
+base is known, call `dbg.symbols.rebase(".xip_dkc1", actual_base)`; later
+lookups translate symbols in that section while leaving the ELF unchanged.
+DKC exports `dkc1_xip_runtime_base`, so after its core has initialized, use
+`dbg.rebase_from_pointer(".xip_dkc1", "dkc1_xip_runtime_base")` to read the
+actual base from target memory and rebase in one step.
+Use `--target hardware` to attach through OpenOCD instead; this attaches without
+resetting or flashing the device. The matching firmware ELF is loaded with
+`--profile`, while app ELFs are passed with repeatable `--symbols` options.
 
 The variant comes from `.gwprov-firmware.json`, written by `retro-go install`.
 `profile create` currently supports **flash** assembly; SD content can be staged
@@ -264,3 +414,55 @@ files and converts each to a `.PKD` below `homebrews/openlara/`.
 and prints a compact list. Pass `--output json` for the source metadata. Listed project names work
 with `project versions`, `project info`, and `project install`; both `tgb` and
 `sylverb/tgb` resolve to the listed project. Arbitrary `owner/repo` projects remain supported.
+
+## Pristine stock profiles
+
+Create stock media from your own hash-valid backup pair. Protection is stored as
+device state in `rdp-state.bin`, independently of the firmware images.
+
+```bash
+gwprov profile stock dev-local/profiles/stock-locked \
+  --backup-dir /path/to/ofw-backups --locked
+gwprov profile stock dev-local/profiles/stock-unlocked \
+  --backup-dir /path/to/ofw-backups
+```
+
+Repeat `--backup-dir` for multiple backup sources; use `--model mario|zelda` to
+select a device explicitly. Existing profile directories are never overwritten.
+
+## Filesystem inventories and comparisons
+
+Keep small verification records rather than an image copy for each install:
+
+```sh
+gwprov media inventory --profile dev-local/profiles/retro-go --output before.json
+# Run the web app against the writable profile, then close GWemu.
+gwprov media inventory --profile dev-local/profiles/retro-go --output after.json
+gwprov media compare before.json after.json
+
+# Inspect a partitioned FAT SD image directly (first partition at 1 MiB here).
+gwprov media inventory --image dev-local/sdcard.img --filesystem fatfs \
+  --offset 0x100000 --output sd-files.json
+```
+
+Inventory reads media without writing or formatting it. It includes sorted
+filesystem tables, file sizes/SHA-256, partition hashes, and full-image hashes.
+FrogFS hashes cover stored file bytes (with compression recorded); LittleFS and
+FAT hashes cover file contents. LittleFS inspection uses Retro-Go's reversed
+flash-block order. Explicit LittleFS images need `--size` and optionally
+`--block-size`; FrogFS derives its length from its header. Profile inspection
+reads the firmware layout and bundled SD partition table.
+
+`media compare` defaults to filesystem contents and ignores timestamps, free
+space and allocation order. `--mode image` compares complete images and raw
+partition hashes too. A mismatch exits with status 1 and prints both tables.
+FAT short names are reported in their actual on-disk spelling, often uppercase.
+Pin releases and inputs for repeatable records; no claim about correctness is
+implied by recording an observed result. The `media` installation extra includes
+the FAT and LittleFS readers.
+
+For a CRC-valid `data/INSTALL` v1 marker, content comparison excludes the
+installation timestamp and its dependent CRC. Inventories retain the raw SHA256,
+`installedAt`, and a separate `comparisonSha256`. Every other byte remains part
+of the comparison; invalid markers receive no normalization. Image comparison
+always checks raw image and partition hashes.

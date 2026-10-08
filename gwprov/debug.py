@@ -16,7 +16,8 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234,
                   unpause_homebrew: bool = False,
                   app_symbols: str | None = None,
                   detach_after_app_entry: bool = False,
-                  keep_running: bool = False) -> int:
+                  keep_running: bool = False, timeline: str | None = None,
+                  record_timeline: str | None = None) -> int:
     """Run a provisioned profile in GWemu and hand control to interactive GDB."""
     from .profiles import DeviceProfile
 
@@ -55,6 +56,9 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234,
     env["XDG_DATA_HOME"] = str(profile.root / "runtime")
     env["XDG_CONFIG_HOME"] = str(profile.root / "runtime/config")
 
+    from .timeline_launch import configure_timeline
+    configure_timeline(env, timeline=timeline, record_timeline=record_timeline)
+
     process = subprocess.Popen(cmd, cwd=profile.root, env=env,
                                    start_new_session=True)
     try:
@@ -69,20 +73,29 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234,
         gdb_script.parent.mkdir(parents=True, exist_ok=True)
         lines = ["set pagination off",
                  f"target extended-remote 127.0.0.1:{gdb_port}"]
+        if app_symbols:
+            app_elf = Path(app_symbols).expanduser().resolve()
+            if not app_elf.is_file():
+                raise ValueError(f"app symbols not found: {app_elf}")
+            # Load app symbols even in an attached session so fault PCs in the
+            # homebrew resolve alongside the official firmware symbols.
+            lines.append(f'add-symbol-file "{app_elf}"')
         breakpoint_number = 1
         if break_on_fault:
             fault_report = profile.root / "runtime" / "gwprov" / "fault-triage.txt"
+            # GDB treats the remainder of `set logging file` as the literal
+            # path, including quote marks. Keep the path unquoted and enable
+            # logging before execution so fault commands are captured.
+            lines += [f"set logging file {fault_report}",
+                      "set logging overwrite on", "set logging enabled on"]
             fault_symbols = ("common_fault_handler_c", "HardFault_Handler",
                              "BusFault_Handler", "UsageFault_Handler",
                              "Error_Handler", "abort")
             for symbol in fault_symbols:
                 lines += [f"break {symbol}", f"commands {breakpoint_number}",
                           "silent",
-                          f"set logging file \"{fault_report}\"",
-                          "set logging overwrite on", "set logging enabled on",
                           f'printf "GWPROV_FAULT {symbol}\\n"',
                           "bt", "info registers", "x/16wx $sp", "x/12i $pc-12",
-                          "set logging enabled off",
                           f'printf "gwprov: fault triage saved to {fault_report}\\n"',
                           "end"]
                 breakpoint_number += 1

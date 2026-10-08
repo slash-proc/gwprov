@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import socket
 import struct
 import tempfile
@@ -118,35 +119,9 @@ def _qmp_status(path: str | None) -> str:
 
 
 def _qmp_execute(path: str, command: str, arguments: dict[str, Any] | None = None) -> dict:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(5.0)
-    try:
-        sock.connect(path)
-        stream = sock.makefile("rwb", buffering=0)
-        stream.readline()  # QMP greeting
-
-        def request(payload: dict[str, Any]) -> dict:
-            stream.write(json.dumps(payload).encode() + b"\r\n")
-            while True:
-                reply = json.loads(stream.readline())
-                if "event" not in reply:
-                    if "error" in reply:
-                        raise RuntimeError(f"QMP {payload['execute']} failed: {reply['error']}")
-                    return reply
-
-        request({"execute": "qmp_capabilities"})
-        payload: dict[str, Any] = {"execute": command}
-        if arguments:
-            payload["arguments"] = arguments
-        return request(payload)
-    except PermissionError as exc:
-        raise PermissionError(
-            f"access to GWemu QMP socket {path!r} was denied; run gwprov with "
-            "permission to connect to this Unix socket (NET_ADMIN is not required "
-            "for QMP Unix-socket access)"
-        ) from exc
-    finally:
-        sock.close()
+    from .qmp import QMPConnection
+    with QMPConnection(path) as qmp:
+        return qmp.execute(command, arguments)
 
 
 def _read_ppm(ppm: bytes) -> tuple[int, int, bytes]:
@@ -289,7 +264,10 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
                       max_frames: int = 32,
                       inspect_u32: list[str] | None = None,
                       inspect_deref: list[str] | None = None,
-                      inspect_bytes: list[str] | None = None) -> int:
+                      inspect_bytes: list[str] | None = None,
+                      inspect_values: list[str] | None = None,
+                      inspect_rings: list[str] | None = None,
+                      debug_config: str | None = None) -> int:
     """Capture one running profile's screen and symbol-resolved ARM stack."""
     from .debug_shell import DebugSession, GwemuGDBBackend
     from .profiles import DeviceProfile
@@ -329,10 +307,14 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
         session = DebugSession(backend, "gwemu", qmp_socket=row["qmpSocket"])
         for symbol_path in symbol_paths:
             session.symbols.load(symbol_path)
+        if debug_config:
+            session.configure(debug_config)
         report = session.diagnose(output, max_frames=max_frames,
                                   inspect_u32=inspect_u32 or [],
                                   inspect_deref=inspect_deref or [],
-                                  inspect_bytes=inspect_bytes or [])
+                                  inspect_bytes=inspect_bytes or [],
+                                  inspect_values=inspect_values or [],
+                                  inspect_rings=inspect_rings or [])
         report.update({"pid": row["pid"], "profile": root,
                        "symbols": [str(path) for path in symbol_paths]})
         print(json.dumps(report, indent=2))
@@ -355,12 +337,14 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                    watch_u32: list[str] | None = None,
                    watch_deref: list[str] | None = None,
                    watch_bytes: list[str] | None = None,
+                   watch_values: list[str] | None = None,
+                   watch_rings: list[str] | None = None,
                    heartbeat_symbol: str | None = None,
                    frame_symbol: str | None = None,
                    guest_pc_symbol: str | None = None,
                    interval: float = 0.5, stall_after: float = 3.0,
                    duration: float = 30.0,
-                   output: str | Path | None = None) -> int:
+                   output: str | Path | None = None, debug_config: str | None = None) -> int:
     """Watch a target and save a generic, symbolized triage bundle on suspicion."""
     from datetime import datetime, timezone
     from .debug_shell import DebugSession, GwemuGDBBackend
@@ -430,6 +414,14 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
         session = DebugSession(backend, "gwemu", qmp_socket=row["qmpSocket"])
         for path in symbol_paths:
             session.symbols.load(path)
+        if debug_config:
+            settings = session.symbols.load_config(debug_config)
+            if not progress_names:
+                progress_names = list(settings["progress_symbols"])
+            for spec in settings["rebase_symbols"]:
+                section, pointer = spec.split("=", 1)
+                if (section, pointer) not in rebase_specs:
+                    rebase_specs.append((section, pointer))
         # Discover common instrumentation names across cores and homebrews.
         # Explicit options always win and projects need not follow this naming.
         symbols_found = session.nm()
@@ -454,7 +446,7 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                 owner = session.symbols.owner(pointer_symbol)
             except KeyError as exc:
                 raise ValueError(f"rebase pointer symbol {pointer_symbol!r} is not loaded") from exc
-            if section not in session.symbols.sections(owner):
+            if not any(section in session.symbols.sections(path) for path in session.symbols.sources):
                 raise ValueError(
                     f"ELF section {section!r} is not present in the ELF containing "
                     f"pointer symbol {pointer_symbol!r}")
@@ -540,11 +532,28 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                 diagnosis = session.diagnose(image_path, inspect_u32=watched_names,
                                              inspect_deref=deref_specs,
                                              inspect_bytes=byte_specs,
+                                             inspect_values=watch_values or [],
+                                             inspect_rings=watch_rings or [],
                                              screenshot=screen_probe)
                 screenshot = diagnosis.get("screenshot", {})
+                traceback_frames = diagnosis.get("traceback", {}).get("frames", [])
+                traceback_symbols = {
+                    frame.get("symbol", {}).get("name", "")
+                    for frame in traceback_frames if frame.get("symbol")
+                }
+                fatal_symbols = sorted(name for name in traceback_symbols
+                                       if name.lower() in {
+                                           "abort", "bsod", "hardfault_handler",
+                                           "busfault_handler", "usagefault_handler",
+                                           "memmanage_handler", "error_handler",
+                                           "common_fault_handler_c", "panic",
+                                       })
                 if fault_name:
                     classification = "fault-handler"
                     reason = f"CPU PC is inside {fault_name}"
+                elif fatal_symbols:
+                    classification = "firmware-fatal-path"
+                    reason = "traceback passes through " + ", ".join(fatal_symbols)
                 elif guest_stagnant_trigger:
                     classification = "suspected-guest-loop"
                     reason = f"{guest_stagnant} remained unchanged for {stall_after:g} seconds"
@@ -560,7 +569,7 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                 report = {
                     "classification": classification,
                     "reason": reason,
-                    "confidence": "direct" if fault_name else "heuristic",
+                    "confidence": "direct" if fault_name or fatal_symbols else "heuristic",
                     "observed_at_utc": datetime.now(timezone.utc).isoformat(),
                     "profile": root, "pid": row["pid"],
                     "symbols": [str(path) for path in symbol_paths],
@@ -572,6 +581,7 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                     "watch_u32": watch_u32 or [],
                     "watch_deref": deref_specs,
                     "watch_bytes": byte_specs,
+                    "runtime_error_symbols": fatal_symbols,
                     "last_values": values,
                     "stable_seconds": round(now - (value_stable_since.get(guest_stagnant, cpu_stable_since)
                                                     if guest_stagnant_trigger else cpu_stable_since), 3),
@@ -633,8 +643,221 @@ def instances() -> list[dict[str, Any]]:
     return sorted(result, key=lambda row: row["pid"])
 
 
+def _qmp_read_memory(path: str, address: int, size: int) -> bytes:
+    """Read memory through QMP without taking the GDB endpoint."""
+    if size <= 0:
+        return b""
+    from .qmp import QMPConnection
+    with QMPConnection(path) as qmp:
+        return qmp.read_memory(address, size)
+
+
+def _dwarf_struct_members(elf_path: Path, variable_name: str) -> dict[str, int]:
+    """Return member byte offsets for a global struct, using the ELF's DWARF types."""
+    from elftools.elf.elffile import ELFFile
+
+    def attr_name(die, key):
+        attr = die.attributes.get(key)
+        return attr.value.decode(errors="replace") if attr and isinstance(attr.value, bytes) else None
+
+    def referenced_type(cu, die):
+        attr = die.attributes.get("DW_AT_type")
+        if not attr:
+            return None
+        offset = attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
+        target = cu.get_DIE_from_refaddr(offset)
+        while target and target.tag in {
+            "DW_TAG_typedef", "DW_TAG_const_type", "DW_TAG_volatile_type",
+            "DW_TAG_restrict_type", "DW_TAG_atomic_type",
+        }:
+            attr = target.attributes.get("DW_AT_type")
+            if not attr:
+                return None
+            offset = attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
+            target = cu.get_DIE_from_refaddr(offset)
+        return target
+
+    with elf_path.open("rb") as stream:
+        dwarf = ELFFile(stream).get_dwarf_info()
+        for cu in dwarf.iter_CUs():
+            for die in cu.iter_DIEs():
+                if die.tag != "DW_TAG_variable" or attr_name(die, "DW_AT_name") != variable_name:
+                    continue
+                struct = referenced_type(cu, die)
+                if not struct or struct.tag != "DW_TAG_structure_type":
+                    continue
+                members = {}
+                for member in struct.iter_children():
+                    if member.tag != "DW_TAG_member":
+                        continue
+                    name = attr_name(member, "DW_AT_name")
+                    location = member.attributes.get("DW_AT_data_member_location")
+                    if name and location and isinstance(location.value, int):
+                        members[name] = location.value
+                return members
+    return {}
+
+
+def _dwarf_typedef_members(elf_path: Path, typedef_name: str) -> dict[str, int]:
+    """Return the first complete struct layout for a named typedef in an ELF."""
+    from elftools.elf.elffile import ELFFile
+
+    with elf_path.open("rb") as stream:
+        dwarf = ELFFile(stream).get_dwarf_info()
+        for cu in dwarf.iter_CUs():
+            for die in cu.iter_DIEs():
+                name = die.attributes.get("DW_AT_name")
+                if die.tag != "DW_TAG_typedef" or not name or name.value != typedef_name.encode():
+                    continue
+                attr = die.attributes.get("DW_AT_type")
+                if not attr:
+                    continue
+                offset = attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
+                target = cu.get_DIE_from_refaddr(offset)
+                while target and target.tag in {
+                    "DW_TAG_typedef", "DW_TAG_const_type", "DW_TAG_volatile_type",
+                    "DW_TAG_restrict_type", "DW_TAG_atomic_type",
+                }:
+                    attr = target.attributes.get("DW_AT_type")
+                    if not attr:
+                        break
+                    offset = attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
+                    target = cu.get_DIE_from_refaddr(offset)
+                if not target or target.tag != "DW_TAG_structure_type":
+                    continue
+                members = {}
+                for member in target.iter_children():
+                    if member.tag != "DW_TAG_member":
+                        continue
+                    mname = member.attributes.get("DW_AT_name")
+                    location = member.attributes.get("DW_AT_data_member_location")
+                    if mname and location and isinstance(location.value, int):
+                        members[mname.value.decode(errors="replace")] = location.value
+                if members:
+                    return members
+    return {}
+
+
+def _qmp_registers(path: str) -> dict[str, int]:
+    from .qmp import QMPConnection
+    with QMPConnection(path) as qmp:
+        return qmp.registers()
+
+
+def _application_state(row: dict[str, Any]) -> str:
+    """Poll Retro-Go or app state using QMP and the profile's official ELF symbols."""
+    from .debug_shell import SymbolTable
+
+    qmp = row.get("qmpSocket")
+    if not qmp:
+        raise RuntimeError("GWemu has no QMP socket; application state cannot be polled")
+    root = Path(row["profile"]) if row.get("profile") else None
+    firmware = root / "debug" / "retro-go-debug.elf" if root else None
+    if not firmware or not firmware.is_file():
+        return "Unknown"
+
+    symbol_table = SymbolTable()
+    symbol_table.load(firmware)
+    app_elfs = sorted((root / "debug" / "apps").rglob("*.elf"))
+    for elf in app_elfs:
+        symbol_table.load(elf)
+
+    registers = _qmp_registers(qmp)
+    pc = registers["pc"]
+    frames = []
+    try:
+        trace = symbol_table.unwind(registers, lambda addr, size: _qmp_read_memory(qmp, addr, size), 16)
+        for frame in trace.get("frames", []):
+            symbol = frame.get("symbol")
+            if symbol:
+                frames.append(symbol.get("name", ""))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    current = symbol_table.nearest(pc)
+    current_name = current.get("name", "") if current else ""
+    active_names = set(frames) | {current_name}
+    lowered_names = {name.casefold() for name in active_names}
+
+    fatal_names = sorted(name for name in active_names if name.casefold() in {
+        "bsod", "abort", "hardfault_handler", "busfault_handler",
+        "usagefault_handler", "memmanage_handler", "common_fault_handler_c",
+        "error_handler", "panic",
+    })
+    if fatal_names:
+        return "Fault: " + ", ".join(fatal_names)
+
+    # App projects may export a writable NUL-terminated char array with this
+    # name. It is read directly from the app ELF, so custom state text needs no
+    # per-project code in gwprov and does not depend on relocated pointers.
+    for elf in reversed(app_elfs):
+        state_symbol = next((item for item in symbol_table.nm("gwprov_application_state", elf)
+                             if item["name"] == "gwprov_application_state"), None)
+        if state_symbol and state_symbol["size"] >= 2:
+            section = state_symbol.get("section")
+            sections = symbol_table.sections(elf)
+            if section and section in sections and sections[section][0] <= (pc & ~1) < sum(sections[section]):
+                raw = _qmp_read_memory(qmp, state_symbol["address"], min(state_symbol["size"], 64))
+                custom = raw.split(b"\0", 1)[0].decode("utf-8", errors="replace").strip()
+                if custom and all(char.isprintable() for char in custom):
+                    return custom
+
+    if "run_gwhb_homebrew" in active_names or "run_homebrew" in active_names:
+        return "Starting"
+    if "odroid_overlay_game_menu" in active_names:
+        return "Game menu"
+    if "odroid_overlay_game_settings_menu" in active_names:
+        return "Pause/settings menu"
+    if "odroid_overlay_settings_menu" in active_names:
+        if any("clock" in name or "time" in name for name in lowered_names):
+            return "Time settings menu"
+        return "Settings menu"
+    if "odroid_overlay_dialog" in active_names:
+        if any(name.startswith(("retro_loop", "gui_")) for name in active_names):
+            return "Overlay open in picker"
+        return "Overlay open in game"
+
+    # Retro-Go's GUI is a runtime tab registry. DWARF keeps this compatible
+    # with firmware releases that change the layout of gui and tab_t.
+    gui_address = next((item["address"] for item in symbol_table.nm()
+                        if item["name"] == "gui" and item["elf"] == str(firmware)), None)
+    gui_members = _dwarf_struct_members(firmware, "gui")
+    tab_members = _dwarf_typedef_members(firmware, "tab_t")
+    in_picker = any(name == "retro_loop" or name.startswith("gui_") for name in active_names)
+    if in_picker and gui_address is not None and {"tabs", "selected"}.issubset(gui_members) and "name" in tab_members:
+        gui_head = _qmp_read_memory(qmp, gui_address, max(gui_members.values()) + 4)
+        tabs_ptr = int.from_bytes(gui_head[gui_members["tabs"]:gui_members["tabs"] + 4], "little")
+        selected = int.from_bytes(gui_head[gui_members["selected"]:gui_members["selected"] + 4], "little", signed=True)
+        if tabs_ptr and 0 <= selected < 32:
+            tab_ptr = int.from_bytes(_qmp_read_memory(qmp, tabs_ptr + selected * 4, 4), "little")
+            if tab_ptr:
+                tab_name = _qmp_read_memory(qmp, tab_ptr + tab_members["name"], 64).split(b"\0", 1)[0]
+                label = tab_name.decode("utf-8", errors="replace").strip()
+            else:
+                label = ""
+            if label:
+                canonical = {"favorites": "Favorites", "homebrew": "Homebrew"}
+                label = canonical.get(label.casefold(), label)
+                prefix = "Core: " if label.casefold() not in {"favorites", "homebrew"} else ""
+                return f"Picker: {prefix}{label}"
+
+    function_names = {name for name in active_names if name}
+    if current and current["elf"] != str(firmware):
+        return "Running"
+    if function_names & {"app_main", "main"}:
+        return "Running"
+    if "main" in active_names:
+        return "Starting"
+    return "Initializing"
+
+
 def show_instances(*, output: str = "text") -> int:
     rows = instances()
+    for row in rows:
+        try:
+            row["application"] = _application_state(row)
+        except (OSError, RuntimeError, ValueError) as error:
+            row["application"] = "Unknown"
+            row["applicationDetail"] = str(error)
     if output == "json":
         print(json.dumps(rows, indent=2))
     elif not rows:
@@ -648,10 +871,10 @@ def show_instances(*, output: str = "text") -> int:
             return 2
         print("No GWemu instances running in the current process namespace.")
     else:
-        print("PID     STATE       DISPLAY  GDB   PROFILE")
+        print("PID     STATE       DISPLAY  GDB   APPLICATION           PROFILE")
         for row in rows:
             print(f"{row['pid']:<7} {row['status']:<11} {row['display']:<8} "
-                  f"{row['gdbPort'] or '-':<5} {row['profile'] or '-'}")
+                  f"{row['gdbPort'] or '-':<5} {row['application']:<22} {row['profile'] or '-'}")
     return 0
 
 
@@ -733,7 +956,8 @@ def set_instance_running(profile: str, *, running: bool) -> int:
 
 def start_instance(profile: str, *, audio: bool = False,
                    gdb_port: int | None = None, qmp_socket: str | None = None,
-                   headless: bool = False) -> int:
+                   headless: bool = False, timeline: str | None = None,
+                   record_timeline: str | None = None) -> int:
     from .launch import launch_profile
     from .profiles import DeviceProfile
 
@@ -772,4 +996,5 @@ def start_instance(profile: str, *, audio: bool = False,
     display = "headless" if headless else "visible"
     print(f"Starting {display} GWemu for {root}; GDB :{gdb_port}; QMP {qmp_path}", flush=True)
     return launch_profile(str(root), headless=headless, audio=audio,
-                          gdb_port=gdb_port, qmp_socket=str(qmp_path))
+                          gdb_port=gdb_port, qmp_socket=str(qmp_path),
+                          timeline=timeline, record_timeline=record_timeline)

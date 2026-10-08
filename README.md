@@ -169,6 +169,148 @@ ELFs, which is useful for correlating a black frame with runtime state. Repeat
 such as a PPU register block. It then restores the instance's prior running or
 paused state.
 
+### Live native function profiling
+
+```bash
+gwprov gwemu profile --profile "$profile" --duration 15
+# Explicit project probes and runtime relocation when needed:
+gwprov gwemu profile --profile "$profile" --duration 30 \
+  --progress-symbol frame_counter --rebase .cold_code=runtime_code_base
+```
+
+`gwemu profile` samples the running ARM PC through short QMP polling connections;
+it releases QMP between polls so other monitor clients can connect, and neither takes the GDB socket nor deliberately halts, resets, or changes the
+app. It can run beside the fault debugger. Bundled firmware and app ELFs resolve
+functions automatically. `--symbols ELF` adds symbols; `--rebase
+SECTION=POINTER_SYMBOL` reads the runtime base of NOR-mapped code/data, using the
+same symbol translation as the debugger. No app-specific names are required.
+
+QEMU accepts one active client per QMP socket. The profiler batches each poll
+into one connection and closes it before sleeping, allowing the fault monitor
+and other gwprov commands to poll that same endpoint.
+
+The default interval is 20 ms with jitter to reduce frame/interrupt aliasing.
+The console ranks native functions by **percentage of PC samples**, reports
+emulator CPU usage and observed progress increments per wall second, and gives
+the report path. Auto-discovery looks for 32-bit heartbeat/frame/progress counters;
+repeat `--progress-symbol SYMBOL` to select counters explicitly. Counters that
+reset are flagged rather than reported as enormous throughput. `--interval`
+changes sampling rate; `--top` limits only console rows. JSON retains every
+function, unresolved PC, raw sample, counter observation, source location for
+the leading functions, rebased section, and symbol ELF checksum. Automatic PNGs
+before/after the interval identify the actual scene. `--format json` prints the
+full structured report; Ctrl-C retains a partial profile and leaves the VM alone.
+
+**Interpretation:** these are running-state PC snapshot shares, not exact
+Cortex-M cycle counts or complete caller stacks. QMP samples at emulator
+synchronization points, so MMIO/interrupt boundaries can be overrepresented.
+QMP request duration and unresolved samples are always reported. Longer intervals
+reduce observer overhead; compare profiles from the same workload. A stopped VM
+produces no running samples and a nonzero exit status. Function attribution uses
+actual ELF function ranges, so missing symbols are counted as unresolved.
+
+Raw DWT control/CYCCNT observations are included once per second; gwprov never
+resets or enables the counter. Firmware may reset it on each loop. The currently
+used GWemu build advances CYCCNT from virtual time, which cannot measure exact
+instruction costs; consequently gwprov does not distribute that counter across
+functions. Host TCG/MMIO profiling answers a separate question. GWemu's documented
+`GNW_UI_FRAME_TRACE`, `GNW_IDLE_PROF`, `GNW_BQL_PROF` and `GNW_MMIO_PROF` hooks
+remain useful for emulator-side investigation (MMIO instrumentation can itself
+be expensive).
+
+From an existing interactive Python debugger:
+
+```python
+report = dbg.profile(duration=15, interval=0.02)
+report["functions"][:10]
+report["progress"]
+```
+
+### Local port debug adapter
+
+This interface is for a developer or AI working on a local port. It requires no
+project installation or published release. Give `--debug-config port.debug.json`
+to `gwemu profile`, `diagnose`, `watch`, or `debug python` to reuse the same symbol
+sources, runtime mappings, and progress probes. File paths are relative to the
+descriptor. A build step may generate the JSON; gwprov loads data and does not
+execute project code.
+
+```json
+{
+  "schemaVersion": 1,
+  "elfs": ["build/app.elf"],
+  "relocations": [{"section": ".cold_code", "basePointer": "cold_code_base"}],
+  "progressSymbols": ["frame_count"]
+}
+```
+
+ELFs provide routine names/ranges and, when present, DWARF source/type/unwind
+information. Stripped ELFs retain their section layout; exported dynamic symbols
+are used if present, otherwise their PCs stay unnamed. A closed component can instead supply a compact name/address/size
+map, without source code or a full debug ELF:
+
+```json
+{
+  "schemaVersion": 1,
+  "symbols": [
+    {"name": "render_frame", "kind": "function", "address": "0x24001000", "size": 512},
+    {"name": "frame_count", "kind": "object", "address": "0x24010000", "size": 4}
+  ],
+  "progressSymbols": ["frame_count"]
+}
+```
+
+Function ranges must be exact; gaps are unresolved rather than attributed to
+the preceding name. Numeric fields accept integers or hexadecimal strings. Repeated static function
+names retain every address range; named variable probes must be unambiguous.
+`symbols` and `elfs` may be combined. Routine maps name routines but cannot
+provide DWARF source, types, or unwinding. With no app symbol information,
+profiling still records/ranks raw PCs; it does not invent routine names.
+
+For relocatable map records, add `sections` with `name`, linked `address`, and
+`size`, and give each symbol its `section`. Declare `relocations` as above;
+`basePointer` is a named 32-bit target variable containing that section's live
+base. The profiler refreshes mappings as the app initializes. `progressSymbols`
+names 32-bit objects; explicit CLI progress selections override the descriptor.
+No code or globals with project-specific names are built into gwprov.
+
+In Python, `symbols.load_config(path)` loads the common symbol adapter and
+returns its probes/mappings. `dbg.configure(path)` also reads initialized target
+base pointers; call it after app initialization. `dbg.profile()`, `dbg.at()`,
+`dbg.traceback()`, and `dbg.diagnose()` then use the same symbol table. ELF-only
+operations explain missing DWARF/disassembly when only a compact map was supplied.
+
+### Record and replay controller routes
+
+`gwemu start`, `run`, and `debug` accept `--record-timeline FILE.tl` or
+`--timeline FILE.tl`. Recording uses GWemu's existing `GNW_TIMELINE_RECORD`
+GPIO recorder; playback uses `GNW_TIMELINE`. Timestamps are guest seconds from
+machine boot, so debugger pauses do not add delay to the route.
+
+```bash
+# Start a visible recorder and perform the route using the window's controls.
+gwprov gwemu start --profile "$profile" --record-timeline "$PWD/build/route.tl"
+# Close the window cleanly, or use gwprov gwemu stop from another terminal.
+# Replay from the same initial firmware/media state.
+gwprov gwemu start --profile "$profile" --timeline "$PWD/build/route.tl"
+```
+
+Recording requires a visible window and a new output filename. GWemu opens the
+file on the first GUI input and flushes each down/release event; a missing file
+before the first input is expected. On clean shutdown it appends a `quit` event.
+Remove that final event from a **copy** if replay should stay open for fault
+triage. Keep the original recording as evidence. Replay ends at that event
+otherwise. This controls inputs; it does not reset writable NOR/SD images or
+save states. Preserve the initial profile/media before recording when exact
+reproduction matters, and replay from a copy of that same baseline.
+
+For unattended homebrew routes, use `gwemu debug --unpause-homebrew
+--app-symbols APP.elf --detach-after-app-entry --keep-running` with either
+timeline option and a QMP socket. This clears Retro-Go's autostart pause through
+the existing launch hook before entering the app, then frees the debugger for
+`gwemu watch`. Use the same launch options for recording and replay.
+This needs no wall-clock input player or changes to GWemu.
+
 For a symbolized debug session, use `gwprov gwemu debug --profile "$profile"`.
 The command starts visible GWemu stopped at reset so it can install breakpoints,
 loads the matching `debug/retro-go-debug.elf` from the checksum-verified firmware
@@ -180,8 +322,10 @@ Retro-Go `/CONFIG` homebrew autostart passes `start_paused=true` to
 `--unpause-homebrew`, clears `r2` at function entry, and then resumes the app.
 The app's normal launch behavior remains paused. The interactive debug mode also
 sets fault breakpoints on the common Retro-Go and ARM fault handlers. On a hit,
-it saves a text report containing the backtrace, registers, stack words, and
-nearby instructions to `runtime/gwprov/fault-triage.txt` and leaves GDB stopped.
+it captures the GDB transcript, including backtrace, registers, stack words,
+and nearby instructions, in `runtime/gwprov/fault-triage.txt` and leaves GDB
+stopped. Pass `--app-symbols APP.elf` to load app symbols into GDB even when not
+using `--detach-after-app-entry`.
 Use `gwprov gwemu pause --profile "$profile"` or `resume` to stop or continue
 execution through QMP while GDB remains connected.
 
@@ -238,6 +382,15 @@ and TCP connect access. Those are not inherently `NET_ADMIN` requirements. A
 denied operation reports the socket and access type instead of appearing to be
 an absent emulator.
 
+`gwprov gwemu ps` also polls an `Application` column independently of GWemu's
+process `STATE`. It uses the profile's Retro-Go ELF and app ELFs to interpret the
+live ARM stack and Retro-Go picker tab, reading registers and memory through
+QMP. This leaves the GDB endpoint available to an interactive debugger. When an
+app exports a writable NUL-terminated `char gwprov_application_state[64]`, its
+text becomes the application state while that app is executing; projects can
+publish values such as `Loading level` or `Boss phase 2` without gwprov-specific
+code. Missing symbols produce `Unknown`.
+
 For a persistent Python debugger attached to an already-running target:
 
 ```bash
@@ -263,6 +416,47 @@ target-side pointer that contains its runtime base. The CLI has no project-name
 special cases; supply one entry for each relocated section that should be
 symbolized.
 
+When captured at a Cortex-M fault handler entry, `dbg.traceback()` now decodes
+EXC_RETURN and the stacked CPU registers, then continues the call chain from
+the actual faulting instruction. Reports include SCB fault registers, decoded
+CFSR flags, the valid fault address, source location, and nearby instructions.
+If the firmware exports `_stack_redzone` and `_Stack_Redzone_Size`, the report
+also states whether the fault address hits that guard. `dbg.fault_context()`
+returns this information separately. It supports basic and extended FP frames;
+a capture taken after the handler has changed SP/LR may be too late to recover
+the frame, and is reported explicitly as unavailable.
+
+For scripted fault capture, `GwemuGDBBackend.open(halt=True)` attaches without
+resuming a paused VM. Load symbols and arm breakpoints before `dbg.resume()`.
+The default `open()` keeps the existing behavior of resuming on attach.
+
+Typed memory reads use the owning ELF's DWARF information, so the host need not
+know the target compiler's structure padding or enum width. `dbg.read_value("g_cpu")`
+returns a Python dictionary; fixed arrays become lists, scalars become numbers,
+and pointers remain addresses. `dbg.symbols.type_layout("g_cpu")` describes the
+field offsets, sizes, and scalar encoding. Structs, fixed arrays, integer,
+boolean, floating point, pointer, and enum globals are supported; missing debug
+types, bit fields, and unsupported types produce explicit errors.
+
+`dbg.read_ring("trace_ring", "trace_head")` samples an array and its monotonic
+next-write counter under one halt, restores the previous running state, and
+returns entries in chronological order with capacity and overwrite counts.
+The head must count every write, not merely store a wrapped index. Both methods
+limit a single read to 64 KiB by default (`max_bytes` overrides it).
+`gwprov gwemu diagnose` and `watch` accept repeatable `--value SYMBOL` and
+`--ring ARRAY:HEAD`; `watch` extracts these records when it captures a trigger
+report. App variables are selected by the caller; these options contain no
+project-specific layouts or names. Unsupported types are recorded with a reason
+in the report so they do not conceal the native fault information.
+
+`dbg.run_until("function", timeout=30)` installs a temporary breakpoint,
+resumes, and waits through QMP. It returns a dictionary with `hit`, `stopped`,
+and registers when stopped. `dbg.wait_stopped(timeout=30)` waits for an already
+armed breakpoint. A timeout is explicit and leaves execution running. A debug
+stop leaves execution halted for inspection; resume with `dbg.resume()`.
+Use a breakpoint address that is not already owned by another routine.
+These wait helpers currently require GWemu and a QMP endpoint.
+
 The `dbg` object stays connected for the whole REPL session. It provides
 `dbg.halt()`, `dbg.resume()`, `dbg.step()`, `dbg.regs()`, `dbg.where()`,
 `dbg.traceback()`, `dbg.diagnose()`, `dbg.read(addr, n)`, `dbg.u32(addr)`, and
@@ -277,7 +471,10 @@ arguments)` sends a structured QMP request. ELF symbols can
 be queried with `dbg.at("symbol_name")` or `dbg.symbols.find("substring")`.
 `dbg.nm("substring")` returns matching symbol rows with address, size, type,
 section, and owning ELF; `dbg.disasm("function_name")` uses objdump on the
-loaded ELF and returns that function's assembly listing.
+loaded ELF and returns that function's assembly listing. `dbg.addr2line(address)`
+uses `arm-none-eabi-addr2line` (or `addr2line`) to resolve runtime addresses to
+source lines, including section rebases. `diagnose` includes source locations
+and nearby disassembly when the PC belongs to a loaded ELF.
 `dbg.symbols.sections()` shows link-time ranges. When a mapped sidecar's runtime
 base is known, call `dbg.symbols.rebase(".xip_dkc1", actual_base)`; later
 lookups translate symbols in that section while leaving the ELF unchanged.

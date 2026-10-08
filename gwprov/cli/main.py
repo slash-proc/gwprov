@@ -101,7 +101,8 @@ def _run_gwemu(args) -> int:
         if args.stdio_gdb:
             raise ValueError("profile launch runs freely; use --gdb-port for an optional debug connection")
         return launch_profile(args.profile, headless=args.headless, audio=args.audio,
-                              timeline=args.timeline, gdb_port=args.gdb_port,
+                              timeline=args.timeline, record_timeline=args.record_timeline,
+                              gdb_port=args.gdb_port,
                               qmp_socket=args.qmp_socket)
     from gwprov.common.target import GwemuTarget, Image
     from gwprov.profiles import DeviceProfile
@@ -123,6 +124,7 @@ def _run_gwemu(args) -> int:
         audio=args.audio,
         icount=args.icount,
         timeline=args.timeline,
+        record=args.record_timeline,
         keep_temp=args.keep_temp,
         stdio_gdb=args.stdio_gdb,
     )
@@ -141,7 +143,8 @@ def _run_gwemu(args) -> int:
 def _gwemu_start(args) -> int:
     from gwprov.gwemu_manager import start_instance
     return start_instance(args.profile, audio=args.audio, gdb_port=args.gdb_port,
-                          qmp_socket=args.qmp_socket, headless=args.headless)
+                          qmp_socket=args.qmp_socket, headless=args.headless,
+                          timeline=args.timeline, record_timeline=args.record_timeline)
 
 
 def _gwemu_stop(args) -> int:
@@ -168,12 +171,21 @@ def _gwemu_screenshot(args) -> int:
     return screenshot_instance(pid=args.pid, profile=args.profile, output=args.output)
 
 
+def _gwemu_profile(args) -> int:
+    from gwprov.profiling import profile_instance
+    return profile_instance(args.profile, duration=args.duration, interval=args.interval,
+                            symbols=args.symbols, progress_symbols=args.progress_symbol,
+                            rebase_symbols=args.rebase, output=args.output,
+                            output_format=args.format, top=args.top, debug_config=args.debug_config)
+
+
 def _gwemu_diagnose(args) -> int:
     from gwprov.gwemu_manager import diagnose_instance
     return diagnose_instance(args.profile, symbols=args.symbols,
                              output=args.output, max_frames=args.max_frames,
                              inspect_u32=args.u32, inspect_deref=args.deref,
-                             inspect_bytes=args.bytes)
+                             inspect_bytes=args.bytes,
+                             inspect_values=args.value, inspect_rings=args.ring, debug_config=args.debug_config)
 
 def _gwemu_watch(args) -> int:
     from gwprov.gwemu_manager import watch_instance
@@ -183,11 +195,12 @@ def _gwemu_watch(args) -> int:
                           rebase_symbols=args.rebase,
                           watch_u32=args.u32, watch_deref=args.deref,
                           watch_bytes=args.bytes,
+                          watch_values=args.value, watch_rings=args.ring,
                           heartbeat_symbol=args.heartbeat_symbol,
                           frame_symbol=args.frame_symbol,
                           interval=args.interval,
                           stall_after=args.stall_after, duration=args.duration,
-                          output=args.output)
+                          output=args.output, debug_config=args.debug_config)
 
 
 def _debug_gwemu(args) -> int:
@@ -199,7 +212,8 @@ def _debug_gwemu(args) -> int:
                          unpause_homebrew=args.unpause_homebrew,
                          app_symbols=args.app_symbols,
                          detach_after_app_entry=args.detach_after_app_entry,
-                         keep_running=args.keep_running)
+                         keep_running=args.keep_running, timeline=args.timeline,
+                         record_timeline=args.record_timeline)
 
 
 def _debug_python(args) -> int:
@@ -216,7 +230,7 @@ def _debug_python(args) -> int:
         symbol_paths[1:1] = [str(path) for path in app_symbols]
     return python_shell(target=args.target, host=args.host, port=args.port,
                         openocd_port=args.openocd_port, symbols=symbol_paths,
-                        qmp_socket=args.qmp_socket)
+                        qmp_socket=args.qmp_socket, debug_config=args.debug_config)
 
 
 def _ofw_patch(args) -> int:
@@ -521,7 +535,7 @@ _gwprov_complete() {
     case "${COMP_WORDS[1]}" in
       project) candidates="list versions info install stage-local" ;;
       retro-go) candidates="install build config" ;;
-      gwemu) candidates="start stop pause resume ps screenshot diagnose watch run debug" ;;
+      gwemu) candidates="start stop pause resume ps screenshot profile diagnose watch run debug" ;;
       ofw) candidates="patch" ;;
       media) candidates="frogfs littlefs inventory compare" ;;
       sd) candidates="create compose" ;;
@@ -548,16 +562,17 @@ _gwprov_complete() {
       project:info) candidates="--version --output" ;;
       project:install) candidates="--version --target --variant --output --input --input-dir --firmware --firmware-dir --bios --bios-dir --game --game-dir --dry-run" ;;
       project:stage-local) candidates="--output" ;;
-      gwemu:start) candidates="--profile --gdb-port --qmp-socket --audio --headless" ;;
+      gwemu:start) candidates="--profile --gdb-port --qmp-socket --audio --headless --timeline --record-timeline" ;;
       gwemu:stop) candidates="--profile --pid --timeout" ;;
       gwemu:pause|gwemu:resume) candidates="--profile" ;;
       gwemu:ps) candidates="--output" ;;
       gwemu:screenshot) candidates="--profile --pid --output" ;;
-      gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes" ;;
-      gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --interval --stall-after --duration --output" ;;
-      gwemu:run) candidates="--profile --gdb-port --qmp-socket --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
-      gwemu:debug) candidates="--profile --gdb-port --qmp-socket --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running" ;;
-      debug:python) candidates="--target --host --port --openocd-port --qmp-socket --profile --symbols" ;;
+      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --rebase --debug-config --output --format --top" ;;
+      gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes --debug-config" ;;
+      gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --interval --stall-after --duration --output --debug-config" ;;
+      gwemu:run) candidates="--profile --gdb-port --qmp-socket --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --record-timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
+      gwemu:debug) candidates="--profile --gdb-port --qmp-socket --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running --timeline --record-timeline" ;;
+      debug:python) candidates="--target --host --port --openocd-port --qmp-socket --profile --symbols --debug-config" ;;
       media:inventory) candidates="--profile --image --filesystem --offset --size --block-size --shared-sd-root --output" ;;
       media:compare) candidates="--mode" ;;
       profile:stock) candidates="--backup-dir --locked --model --extflash-mib" ;;
@@ -606,7 +621,7 @@ _gwprov() {
     case ${words[2]} in
       project) candidates="list versions info install stage-local" ;;
       retro-go) candidates="install build config" ;;
-      gwemu) candidates="start stop pause resume ps screenshot diagnose watch run debug" ;;
+      gwemu) candidates="start stop pause resume ps screenshot profile diagnose watch run debug" ;;
       ofw) candidates="patch" ;;
       media) candidates="frogfs littlefs inventory compare" ;;
       sd) candidates="create compose" ;;
@@ -629,16 +644,17 @@ _gwprov() {
       project:info) candidates="--version --output" ;;
       project:install) candidates="--version --target --variant --output --input --input-dir --firmware --firmware-dir --bios --bios-dir --game --game-dir --dry-run" ;;
       project:stage-local) candidates="--output" ;;
-      gwemu:start) candidates="--profile --gdb-port --qmp-socket --audio --headless" ;;
+      gwemu:start) candidates="--profile --gdb-port --qmp-socket --audio --headless --timeline --record-timeline" ;;
       gwemu:stop) candidates="--profile --pid --timeout" ;;
       gwemu:pause|gwemu:resume) candidates="--profile" ;;
       gwemu:ps) candidates="--output" ;;
       gwemu:screenshot) candidates="--profile --pid --output" ;;
-      gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes" ;;
-      gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --interval --stall-after --duration --output" ;;
-      gwemu:run) candidates="--profile --gdb-port --qmp-socket --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
-      gwemu:debug) candidates="--profile --gdb-port --qmp-socket --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running" ;;
-      debug:python) candidates="--target --host --port --openocd-port --qmp-socket --profile --symbols" ;;
+      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --rebase --debug-config --output --format --top" ;;
+      gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes --debug-config" ;;
+      gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --interval --stall-after --duration --output --debug-config" ;;
+      gwemu:run) candidates="--profile --gdb-port --qmp-socket --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --record-timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
+      gwemu:debug) candidates="--profile --gdb-port --qmp-socket --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running --timeline --record-timeline" ;;
+      debug:python) candidates="--target --host --port --openocd-port --qmp-socket --profile --symbols --debug-config" ;;
       media:inventory) candidates="--profile --image --filesystem --offset --size --block-size --shared-sd-root --output" ;;
       media:compare) candidates="--mode" ;;
       profile:stock) candidates="--backup-dir --locked --model --extflash-mib" ;;
@@ -692,6 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
                               help="GWemu GDB port (default: 1234)")
     python_debug.add_argument("--openocd-port", type=int, default=6666)
     python_debug.add_argument("--qmp-socket", help="GWemu QMP socket for screendump support")
+    python_debug.add_argument("--debug-config", help="local ELF/map, relocation and counter descriptor")
     python_debug.add_argument("--profile", help="load the profile's bundled official Retro-Go ELF symbols")
     python_debug.add_argument("--symbols", action="append", default=[], metavar="ELF",
                               help="load an additional firmware or app ELF (repeatable)")
@@ -782,6 +799,10 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--audio", action="store_true")
     start.add_argument("--headless", action="store_true",
                        help="run without the window (visible by default)")
+    start_inputs = start.add_mutually_exclusive_group()
+    start_inputs.add_argument("--timeline", help="replay inputs on GWemu guest time")
+    start_inputs.add_argument("--record-timeline", metavar="FILE.tl",
+                              help="record GUI inputs on guest time; requires a new file")
     start.set_defaults(handler=_gwemu_start)
 
     stop = gwemu_commands.add_parser("stop", help="gracefully stop an instance through QMP")
@@ -811,12 +832,32 @@ def build_parser() -> argparse.ArgumentParser:
     screenshot.add_argument("--output", help="PNG path; defaults under the profile runtime directory")
     screenshot.set_defaults(handler=_gwemu_screenshot)
 
+    profiler = gwemu_commands.add_parser(
+        "profile", help="sample native hot functions through QMP while the app runs")
+    profiler.add_argument("--profile", required=True)
+    profiler.add_argument("--symbols", action="append", default=[], metavar="ELF",
+                          help="additional symbols; bundled firmware/app ELFs load automatically")
+    profiler.add_argument("--debug-config", help="local ELF/map, relocation and counter descriptor")
+    profiler.add_argument("--duration", type=float, default=15.0)
+    profiler.add_argument("--interval", type=float, default=0.02,
+                          help="sample interval in wall seconds, with jitter (default: 0.02)")
+    profiler.add_argument("--progress-symbol", action="append", metavar="SYMBOL",
+                          help="32-bit progress counter; default: discover common counter names")
+    profiler.add_argument("--rebase", action="append", default=[], metavar="SECTION=POINTER_SYMBOL",
+                          help="map a linked section to its current runtime address")
+    profiler.add_argument("--output", help="JSON report path; defaults under profile runtime")
+    profiler.add_argument("--format", choices=("text", "json"), default="text")
+    profiler.add_argument("--top", type=int, default=20,
+                          help="number of rows printed; JSON always keeps all functions/samples")
+    profiler.set_defaults(handler=_gwemu_profile)
+
     diagnose = gwemu_commands.add_parser(
         "diagnose", help="capture a running profile's screen and symbol-resolved call stack")
     diagnose.add_argument("--profile", required=True,
                           help="profile directory of the running visible GWemu instance")
     diagnose.add_argument("--symbols", action="append", default=[], metavar="ELF",
                           help="additional app ELF symbols (repeatable)")
+    diagnose.add_argument("--debug-config", help="shared local port debug descriptor")
     diagnose.add_argument("--output", help="PNG path; defaults under the profile runtime directory")
     diagnose.add_argument("--max-frames", type=int, default=32)
     diagnose.add_argument("--u32", action="append", default=[], metavar="SYMBOL",
@@ -825,6 +866,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="read bytes from a pointer-valued global, e.g. --deref g_ppu:16 (repeatable)")
     diagnose.add_argument("--bytes", action="append", default=[], metavar="SYMBOL[+OFFSET]:SIZE",
                           help="read bytes directly from a symbol, e.g. --bytes g_cpu:56 (repeatable)")
+    diagnose.add_argument("--value", action="append", default=[], metavar="SYMBOL",
+                          help="decode a C global using its ELF DWARF type (repeatable)")
+    diagnose.add_argument("--ring", action="append", default=[], metavar="ARRAY:HEAD",
+                          help="decode a C trace array with its monotonic write counter (repeatable)")
     diagnose.set_defaults(handler=_gwemu_diagnose)
 
     watch = gwemu_commands.add_parser(
@@ -832,6 +877,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--profile", required=True)
     watch.add_argument("--symbols", action="append", default=[], metavar="ELF",
                        help="app or firmware ELF symbols (repeatable; firmware is loaded from profile)")
+    watch.add_argument("--debug-config", help="shared local port debug descriptor")
     watch.add_argument("--progress-symbol", action="append", default=[], metavar="SYMBOL",
                        help="32-bit counter that should change during healthy execution (repeatable)")
     watch.add_argument("--guest-pc-symbol", action="append", default=[], metavar="SYMBOL",
@@ -844,6 +890,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="include bytes through a pointer-valued global in a trigger report")
     watch.add_argument("--bytes", action="append", default=[], metavar="SYMBOL[+OFFSET]:SIZE",
                        help="include bytes directly from a global in a trigger report")
+    watch.add_argument("--value", action="append", default=[], metavar="SYMBOL",
+                          help="decode a C global using its ELF DWARF type (repeatable)")
+    watch.add_argument("--ring", action="append", default=[], metavar="ARRAY:HEAD",
+                          help="decode a C trace array with its monotonic write counter (repeatable)")
     watch.add_argument("--heartbeat-symbol", help=argparse.SUPPRESS)
     watch.add_argument("--frame-symbol", help=argparse.SUPPRESS)
     watch.add_argument("--interval", type=float, default=0.5)
@@ -862,7 +912,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--extflash", default="")
     run.add_argument("--sdcard", default="")
     run.add_argument("--bank", type=int, choices=(1, 2), default=1)
-    run.add_argument("--timeline")
+    run_inputs = run.add_mutually_exclusive_group()
+    run_inputs.add_argument("--timeline", help="replay inputs on GWemu guest time")
+    run_inputs.add_argument("--record-timeline", metavar="FILE.tl",
+                            help="record GUI inputs on guest time; requires a new file")
     run.add_argument("--icount", type=int)
     run.add_argument("--headless", action="store_true")
     run.add_argument("--audio", action="store_true")
@@ -885,6 +938,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="after the launch hook, detach GDB at app_main so another gwprov monitor can attach")
     debug.add_argument("--keep-running", action="store_true",
                        help="leave GWemu running after GDB detaches or exits")
+    debug_inputs = debug.add_mutually_exclusive_group()
+    debug_inputs.add_argument("--timeline", help="replay inputs on GWemu guest time")
+    debug_inputs.add_argument("--record-timeline", metavar="FILE.tl",
+                              help="record GUI inputs on guest time; requires a new file")
     debug.set_defaults(handler=_debug_gwemu)
 
     ofw = commands.add_parser("ofw", help="offline stock firmware image preparation")

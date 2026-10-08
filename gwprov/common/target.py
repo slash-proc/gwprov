@@ -350,24 +350,9 @@ class GwemuTarget(Target):
             self.timeline = os.path.abspath(env_timeline)
 
         env = dict(os.environ)
-        if self.timeline:
-            tl = os.path.abspath(self.timeline)
-            if not os.path.exists(tl):
-                raise RuntimeError(f"timeline not found: {tl}")
-            env["GNW_TIMELINE"] = tl
-        if self.record:
-            # GNW_TIMELINE_RECORD captures an interactive session to a .tl file.
-            # gwemu writes it on exit, so the run must END CLEANLY -- a killed
-            # process leaves nothing. Needs the SDL window: there is no way to
-            # record headlessly, because the whole point is capturing real
-            # button presses. docs/gwemu.md notes the .tl grammar has never been
-            # confirmed by reading the source, so a recorded file is also the
-            # reference for the syntax.
-            rec = os.path.abspath(self.record)
-            os.makedirs(os.path.dirname(rec) or ".", exist_ok=True)
-            env["GNW_TIMELINE_RECORD"] = rec
-            print(f"recording timeline to {rec} -- quit gwemu cleanly to save it")
-
+        from ..timeline_launch import configure_timeline
+        configure_timeline(env, timeline=self.timeline, record_timeline=self.record,
+                           headless=not self.display)
         self.proc = subprocess.Popen(
             cmd, cwd=self.tmpdir, env=env,
             stdin=subprocess.PIPE if self.stdio_gdb else None,

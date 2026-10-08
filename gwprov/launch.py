@@ -15,7 +15,7 @@ def _sd_image_format(path: Path) -> str:
 
 
 def launch_profile(directory: str | Path, *, headless: bool = False, audio: bool = False,
-                   timeline: str | None = None, gdb_port: int | None = None,
+                   timeline: str | None = None, record_timeline: str | None = None, gdb_port: int | None = None,
                    qmp_socket: str | None = None) -> int:
     profile = DeviceProfile.load(directory)
     for path in (profile.bank1, profile.bank2, profile.extflash):
@@ -41,7 +41,9 @@ def launch_profile(directory: str | Path, *, headless: bool = False, audio: bool
     env = dict(os.environ)
     env['XDG_DATA_HOME'] = str(profile.root/'runtime')
     env['XDG_CONFIG_HOME'] = str(profile.root/'runtime/config')
-    if timeline:env['GNW_TIMELINE'] = str(Path(timeline).expanduser().resolve())
+    from .timeline_launch import configure_timeline
+    configure_timeline(env, timeline=timeline, record_timeline=record_timeline,
+                       headless=headless)
     with (profile.root/'gwemu.log').open('w') as log:
         process = subprocess.Popen(cmd,cwd=profile.root,env=env,stderr=log)
         try:return process.wait()

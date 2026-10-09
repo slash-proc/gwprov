@@ -694,6 +694,11 @@ custom game states. GWProv hardware, deployment, profiling, and remote sessions
 hold process-shared leases for their duration; they release automatically on exit.
 Install `gwprov[device]` for selected-probe sessions and enumeration.
 
+The text view groups GWemu and hardware entries and wraps long values instead of
+forcing them into fixed-width columns. `gwprov gwemu ps` uses the same compact
+layout. Use `--output json` when consuming inventory from scripts; JSON output
+remains structured and separate from the human-readable view.
+
 The `Application` column is separate from VM/CPU `STATE`. Retro-Go symbols can
 identify initialization, homebrew startup, picker tabs (Favorites, Homebrew, and
 each registered core), the game menu, pause/settings and time menus, and dialogs

@@ -150,10 +150,6 @@ def show_devices(*, output: str = "text", profile: str | None = None) -> int:
         print("No GWemu instances or PyOCD probes detected.")
         print("Probe enumeration requires PyOCD with working USB access; use `pyocd list -p` to diagnose probe access.")
         return 0
-    print("ID                         KIND       SYSTEM       APPLICATION       NAME")
-    for row in rows:
-        print(f"{row['id']:<26} {row['kind']:<10} {row['status']:<12} "
-              f"{row['application']:<17} {row['name']}")
-        if row.get("detail"):
-            print(f"  {row['detail']}")
+    from .cli.text import render_process_list
+    print(render_process_list(rows, title="GWProv devices"))
     return 2 if any(row["status"] == "unknown" for row in rows) else 0

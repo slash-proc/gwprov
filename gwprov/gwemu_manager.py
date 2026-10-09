@@ -905,12 +905,8 @@ def show_instances(*, output: str = "text") -> int:
             return 2
         print("No GWemu instances running in the current process namespace.")
     else:
-        print("PID     STATE       DISPLAY  GDB   APPLICATION           PROFILE")
-        for row in rows:
-            print(f"{row['pid']:<7} {row['status']:<11} {row['display']:<8} "
-                  f"{row['gdbPort'] or '-':<5} {row['application']:<22} {row['profile'] or '-'}")
-            if row["running"] is None:
-                print(f"  Cannot verify execution: {row.get('stateDetail', 'QMP state unknown')}")
+        from .cli.text import render_process_list
+        print(render_process_list(rows, title="GWemu instances"))
     return 2 if any(row["running"] is None for row in rows) else 0
 
 

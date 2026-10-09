@@ -57,3 +57,38 @@ def test_busy_target_is_reported_without_opening_or_polling(monkeypatch):
     assert rows[0]["application"] == "Unknown"
     assert rows[0]["busyOwner"] == owner
     assert "Target traffic skipped" in rows[0]["detail"]
+
+
+def test_process_list_text_is_grouped_and_wraps_long_values():
+    rows = [
+        {"kind": "gwemu", "pid": 42, "status": "running", "running": True,
+         "display": True, "gdbPort": 3333, "application": "In game",
+         "profile": "/home/user/profiles/a-very-long-profile-name"},
+        {"kind": "hardware", "status": "busy", "application": "Unknown",
+         "name": "STM32H7B0", "probeId": "a-very-long-probe-identifier-value",
+         "vendor": "ST", "detail": "Target traffic skipped during hardware profiling."},
+    ]
+
+    from gwprov.cli.text import render_process_list
+    rendered = render_process_list(rows, title="GWProv devices", width=60)
+
+    assert "GWProv devices (2)" in rendered
+    assert "GWemu\n  RUNNING  a-very-long-profile-name" in rendered
+    assert "PID 42 · Display on · GDB :3333" in rendered
+    assert "Hardware\n  BUSY  STM32H7B0" in rendered
+    assert "Target traffic skipped during hardware" in rendered
+    assert all(len(line) <= 60 for line in rendered.splitlines())
+
+
+def test_gwemu_ps_shows_halted_state_in_compact_text(monkeypatch, capsys):
+    row = {"pid": 77, "status": "halted", "running": False, "display": True,
+           "gdbPort": 3333, "application": "Game menu", "profile": "/profiles/dkc"}
+    monkeypatch.setattr(gwemu_manager, "instances", lambda: [row.copy()])
+    monkeypatch.setattr(gwemu_manager, "_application_state", lambda instance: "Game menu")
+
+    assert gwemu_manager.show_instances() == 0
+    output = capsys.readouterr().out
+    assert "GWemu instances (1)" in output
+    assert "HALTED  dkc" in output
+    assert "PID 77 · Display on · GDB :3333" in output
+    assert "Application: Game menu" in output

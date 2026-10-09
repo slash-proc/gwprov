@@ -178,16 +178,14 @@ gwprov gwemu profile --profile "$profile" --duration 30 \
   --progress-symbol frame_counter --rebase .cold_code=runtime_code_base
 ```
 
-`gwemu profile` samples the running ARM PC through short QMP polling connections;
-it releases QMP between polls so other monitor clients can connect, and neither takes the GDB socket nor deliberately halts, resets, or changes the
-app. It can run beside the fault debugger. Bundled firmware and app ELFs resolve
+`gwemu profile` samples the running ARM PC through the daemon's QMP channel,
+without taking the GDB socket or deliberately halting, resetting, or changing
+the app. The daemon serializes monitor requests from the profiler, `ps`,
+screenshots, and control commands. It can run beside the fault debugger.
+Bundled firmware and app ELFs resolve
 functions automatically. `--symbols ELF` adds symbols; `--rebase
 SECTION=POINTER_SYMBOL` reads the runtime base of NOR-mapped code/data, using the
 same symbol translation as the debugger. No app-specific names are required.
-
-QEMU accepts one active client per QMP socket. The profiler batches each poll
-into one connection and closes it before sleeping, allowing the fault monitor
-and other gwprov commands to poll that same endpoint.
 
 The default interval is 20 ms with jitter to reduce frame/interrupt aliasing.
 The console ranks native functions by **percentage of PC samples**, reports
@@ -323,9 +321,9 @@ reproduction matters, and replay from a copy of that same baseline.
 
 For unattended homebrew routes, use `gwemu debug --unpause-homebrew
 --app-symbols APP.elf --detach-after-app-entry --keep-running` with either
-timeline option. QMP is enabled by default, so `gwemu ps`, screenshots, state
-polling, and controls remain available after GDB detaches. Pass `--qmp-socket
-PATH` to choose another endpoint, or `--no-qmp` to disable it. This clears
+timeline option. GWProv owns QEMU's QMP-over-stdio connection in its per-user
+daemon, so `gwemu ps`, screenshots, state polling, and controls remain available
+after GDB detaches without exposing a QMP listener. This clears
 Retro-Go's autostart pause through the existing launch hook before entering the
 app, then frees the debugger for `gwemu watch`. Use the same launch options for
 recording and replay.
@@ -340,14 +338,13 @@ rebase symbols to the address where the section is mapped at runtime.
 For a symbolized debug session, use `gwprov gwemu debug --profile "$profile"`.
 The command starts GWemu stopped at reset so it can install breakpoints,
 loads the matching `debug/retro-go-debug.elf` from the checksum-verified firmware
-release, then continues execution. QMP is enabled by default at a per-profile
-socket under `~/.cache/gwprov/qmp/`; it keeps `gwprov ps`, screenshots, state
-polling, and controls available after GDB detaches. Use `--qmp-socket PATH` for
-a custom endpoint or `--no-qmp` to disable it. This reset halt is a debugger
+release, then continues execution. GWProv owns QMP over stdio in its per-user
+daemon; it keeps `gwprov ps`, screenshots, state polling, and controls available
+after GDB detaches without creating a QMP socket or TCP listener. This reset halt is a debugger
 setup step; the app does not enter Retro-Go's pause menu unless `start_paused`
 is left enabled.
 Pass `--headless` to use QEMU's `-display none` for scripted or parallel
-debugging; the GDB and QMP endpoints work the same way.
+debugging; GDB stays on loopback while QMP remains private to the daemon.
 
 Retro-Go `/CONFIG` homebrew autostart passes `start_paused=true` to
 `run_gwhb_homebrew`. The default debug session breaks on that function only with
@@ -367,7 +364,6 @@ For an automatic launch-to-watch cycle, provide the app ELF so gwprov can resolv
 ```bash
 app_elf="$PWD/build/dkc1_gwrg/homebrew/dkc1_core.elf"
 gwprov gwemu debug --profile "$profile" --gdb-port 12345 \
-  --qmp-socket "$profile/runtime/gwprov/qmp.sock" \
   --unpause-homebrew --app-symbols "$app_elf" \
   --detach-after-app-entry --keep-running
 
@@ -409,10 +405,11 @@ GDB commands such as `continue`, `stepi`, `info registers`, `x/16wx ADDRESS`,
 `--symbols ELF` to override the debug session's firmware ELF or
 `--no-break-on-fault` to omit fault breakpoints. `gwprov gwemu ps` exits with an
 error when seccomp/no-new-privileges makes an empty process scan inconclusive.
-Process management needs process-namespace visibility; QMP and GDB need AF_UNIX
-and TCP connect access. Those are not inherently `NET_ADMIN` requirements. A
-denied operation reports the socket and access type instead of appearing to be
-an absent emulator.
+The daemon owns GWemu's QMP stdio stream. CLI processes discover it through a
+per-user local endpoint: a mode-restricted Unix socket on Linux/macOS and a
+named pipe with an explicit current-user ACL on Windows. The service verifies
+the peer UID or SID and uses a versioned JSON protocol. QMP is not exposed on a
+network listener. GDB remains a loopback TCP endpoint when requested.
 
 `gwprov gwemu ps` reports CPU execution as `running` or `halted` in `STATE`,
 using QMP's boolean `running` field. A debugger stop is `halted`; having a GDB
@@ -427,7 +424,7 @@ before reporting success; an immediate breakpoint stop is a failure to resume.
 `gwprov gwemu ps` also polls an `Application` column independently of GWemu's
 process `STATE`. It uses the profile's Retro-Go ELF and app ELFs to interpret the
 live ARM stack and Retro-Go picker tab, reading registers and memory through
-QMP. This leaves the GDB endpoint available to an interactive debugger. When an
+the daemon. This leaves the GDB endpoint available to an interactive debugger. When an
 app exports a writable NUL-terminated `char gwprov_application_state[64]`, its
 text becomes the application state while that app is executing; projects can
 publish values such as `Loading level` or `Boss phase 2` without gwprov-specific
@@ -437,7 +434,6 @@ For a persistent Python debugger attached to an already-running target:
 
 ```bash
 gwprov debug python --target gwemu --port 1234 --profile "$profile" \
-  --qmp-socket "$profile/runtime/gwprov/qmp.sock" \
   --symbols build/dkc1_core.elf
 ```
 
@@ -506,9 +502,9 @@ hardware breakpoints with `dbg.bp(addr)`.
 Thumb function symbols are normalized automatically for breakpoints and nearest
 symbol lookup. Register and symbol-location reads restore the target's prior
 running state.
-With `--qmp-socket`, `dbg.screenshot([path])` saves a PNG beside the QMP socket
-by default and returns its path, dimensions, `all_black`, and nonblack pixel
-count. `dbg.key("START")` sends a mapped Game & Watch button, and `dbg.qmp(command,
+With a managed GWemu profile, `dbg.screenshot([path])` saves a PNG under the
+GWProv runtime directory by default and returns its path, dimensions,
+`all_black`, and nonblack pixel count. `dbg.key("START")` sends a mapped Game & Watch button, and `dbg.qmp(command,
 arguments)` sends a structured QMP request. ELF symbols can
 be queried with `dbg.at("symbol_name")` or `dbg.symbols.find("substring")`.
 `dbg.nm("substring")` returns matching symbol rows with address, size, type,
@@ -620,13 +616,14 @@ gwprov gwemu run --profile dev-local/profiles/retro-go-demo
 gwprov gwemu run --profile dev-local/profiles/retro-go-demo --headless
 
 gwprov gwemu run --profile dev-local/profiles/retro-go-demo \
-  --gdb-port 3333 \
-  --qmp-socket dev-local/profiles/retro-go-demo/qmp.sock
+  --gdb-port 3333
 ```
 
-The launcher uses `gwemu` from PATH, starts the guest running, and does not attach a
-probe or pause it. GWemu stderr goes to the instance's `gwemu.log`. For file formats,
-input constraints and verification details, see [the provisioning guide](docs/PROVISIONING.md).
+Profile launches are owned by the per-user GWProv daemon and start the guest
+running. The daemon keeps QMP on GWemu's stdin/stdout and exposes only GWProv's
+local control operations. It exits shortly after its last VM and active hardware
+lease ends. GWemu stderr goes to the instance's `gwemu.log`. See
+[the daemon design](docs/DAEMON.md) and [the provisioning guide](docs/PROVISIONING.md).
 
 ### Portable reports
 
@@ -643,7 +640,7 @@ JSON remains the machine-readable evidence source.
 Hardware profiling emits JSON directly or renders an HTML/PDF companion:
 
 ```sh
-gwprov profile hardware --probe-id PROBE_ID --profile DEVICE_PROFILE \
+gwprov perf hardware --probe-id PROBE_ID --profile DEVICE_PROFILE \
   --duration 30 --format html --output dev-local/reports/hardware-profile.html
 ```
 
@@ -694,10 +691,11 @@ custom game states. GWProv hardware, deployment, profiling, and remote sessions
 hold process-shared leases for their duration; they release automatically on exit.
 Install `gwprov[device]` for selected-probe sessions and enumeration.
 
-The text view groups GWemu and hardware entries and wraps long values instead of
-forcing them into fixed-width columns. `gwprov gwemu ps` uses the same compact
-layout. Use `--output json` when consuming inventory from scripts; JSON output
-remains structured and separate from the human-readable view.
+The text view uses a color-aware, terminal-sized table and pages only when the
+rendered output exceeds the interactive screen. Use `--no-pager` to always
+write directly to the terminal. `gwprov gwemu ps` supports the same options.
+Use `--output json` when consuming inventory from scripts; JSON output remains
+structured and separate from the human-readable view.
 
 The `Application` column is separate from VM/CPU `STATE`. Retro-Go symbols can
 identify initialization, homebrew startup, picker tabs (Favorites, Homebrew, and
@@ -737,14 +735,28 @@ uses the server's reset-and-halt followed by resume.
 
 ## CLI
 
-`gwprov tree` prints the command hierarchy and each subcommand's short help text. Use `-h` on
-any listed command to see its full usage.
+`gwprov --help` gives a styled overview and common starting points. `gwprov tree`
+shows the full command map with short descriptions; use `gwprov COMMAND --help`
+to see options for a command. `gwprov tree --format names` provides plain
+top-level command names for shell integrations.
 
 ```sh
 gwprov --help
+gwprov show
+gwprov show devices
+gwprov devices
+gwprov adapters list
+gwprov adapters add pi-probe ws://10.2.3.122:8765/gdb
+gwprov set active DEVICE_ID
+gwprov set profile PROFILE
+gwprov apply
+gwprov sdcard add /Volumes/RETROGO
+gwprov sdcard list
+gwprov sdcard create dev-local/sdcard.img --size-mb 128
+gwprov sdcard compose dev-local/sdcard.img --content-dir dev-local/content/retro-go-demo
 gwprov tree
-gwprov project list
-gwprov project list --output json
+gwprov projects list
+gwprov projects list --output json
 gwprov project versions tgb
 gwprov project install tgb --variant sd --output dev-local/provisioned
 gwprov profile show PATH/TO/GWEMU/PROFILE
@@ -760,6 +772,9 @@ gwprov gwemu run --profile PATH/TO/GWEMU/PROFILE
 gwprov gwemu run --bank1 bank1.bin --bank2 bank2.bin --extflash extflash.bin --sdcard sdcard.img
 gwprov input tap B
 gwprov input tap LEFT+GAME
+gwprov fs create frogfs 2 dev-local
+gwprov fs create lfs 2 dev-local
+gwprov fs create sdcard 128 dev-local
 gwprov retro-go config --output build/CONFIG --rom gb Tetris.gb
 gwprov retro-go build --path references/game-and-watch-retro-go-sd --dry-run
 gwprov media frogfs --retro-go-root references/game-and-watch-retro-go-sd [packer options]
@@ -768,9 +783,20 @@ gwprov ofw patch mario --source-tree ../qemu-gnw --backup-dir backup --output-di
 
 Enable Bash completion in the current shell with `eval "$(gwprov completion bash)"`. In zsh,
 run `autoload -Uz compinit && compinit` followed by `eval "$(gwprov completion zsh)"`.
-Both modes complete the command tree, new GWemu commands, common options, and directory
-arguments. Bash loads curated project names on the first project-argument completion and
-reuses them in that shell.
+Both modes complete the command tree, managed profiles, devices, SD cards, common options,
+and directory arguments. Device IDs are enumerated without opening a target debug session
+or polling GWemu. Bash loads curated project names on the first project-argument completion and
+reuses them in that shell. Device controls use the selected device from
+`gwprov set active DEVICE_ID` unless the command accepts an explicit target.
+
+Profiles and SD cards can be assigned to the active device with `gwprov set profile NAME`
+and `gwprov set sdcard NAME`. `gwprov apply` launches the assigned profile on GWemu or
+deploys it to hardware. Register an already-mounted card folder or drive with
+`gwprov sdcard add PATH [NAME]`; the default name is its folder name on Unix-like systems
+or drive letter on Windows. Registering a card does not format or modify it. When a profile
+with an SD image is applied to hardware with a card assigned, its files are overlaid onto
+the mounted folder and files absent from the profile are retained.
+The `sdcard` command also creates and populates raw SD images; `sd` remains a short alias.
 
 The target-neutral APIs are under `gwprov.common`: `Image` and `Target` select media and destination, `sdcard.compose()` describes SD contents, and target-specific SD managers write to an image, a mounted card, or the device. A `.tl` timeline can be replayed by GWemu or injected into compatible firmware through the probe.
 
@@ -831,14 +857,43 @@ Create stock media from your own hash-valid backup pair. Protection is stored as
 device state in `rdp-state.bin`, independently of the firmware images.
 
 ```bash
-gwprov profile stock dev-local/profiles/stock-locked \
+gwprov profile create dev-local/profiles/stock-locked --stock \
   --backup-dir /path/to/ofw-backups --locked
-gwprov profile stock dev-local/profiles/stock-unlocked \
+gwprov profile create dev-local/profiles/stock-unlocked --stock \
   --backup-dir /path/to/ofw-backups
 ```
 
-Repeat `--backup-dir` for multiple backup sources; use `--model mario|zelda` to
-select a device explicitly. Existing profile directories are never overwritten.
+`--stock` selects pristine stock profile creation within the normal profile
+creation command. Repeat `--backup-dir` for multiple backup sources; use
+`--model mario|zelda` to select a device explicitly. Existing profile
+directories are never overwritten.
+
+## Named device profiles
+
+GWProv profiles are directory-based device images: each one contains a
+`profile.toml` manifest and the flash, extflash, SD, and related state files it
+uses. A bare profile name resolves under the managed profile store, so it can
+be used with `profile show`, `gwemu`, deployment, and other profile-aware
+commands. Explicit paths remain supported.
+
+The default store follows the host OS: `$LOCALAPPDATA/gwprov/profiles` on
+Windows, `~/Library/Application Support/gwprov/profiles` on macOS, and
+`$XDG_DATA_HOME/gwprov/profiles` on Linux (or `~/.local/share/gwprov/profiles`
+when `XDG_DATA_HOME` is unset). Set `GWPROV_PROFILE_DIR` to use a different
+store; it takes precedence over those defaults. `profile create --output-dir`
+overrides the store for one creation. An explicitly set `XDG_DATA_HOME` is
+also honored on any OS.
+
+```sh
+gwprov profile create dkc1 --content dev-local/content/dkc1
+gwprov profile list
+gwprov gwemu run --profile dkc1
+gwprov profile create dkc1-test --content dev-local/content/dkc1 \
+  --output-dir build/test-profiles
+```
+
+For repeated use of a custom store, set `GWPROV_PROFILE_DIR` to that directory;
+then names such as `dkc1-test` resolve there from any profile-aware command.
 
 ## Filesystem inventories and comparisons
 

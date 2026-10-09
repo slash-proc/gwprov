@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import errno
 import json
-import hashlib
-import os
 import socket
 import struct
 import tempfile
@@ -95,6 +93,8 @@ def _instance(pid: int, args: list[str]) -> dict[str, Any] | None:
         "display": "visible" if _option(args, "-display") == "gwemu" else "headless",
         "gdbPort": gdb_port,
         "qmpSocket": qmp,
+        "qmpHandle": qmp,
+        "qmpTransport": "unix" if qmp else "unavailable",
         "created": created,
     }
 
@@ -104,6 +104,16 @@ def _qmp_execution(path: str | None) -> dict:
     if not path:
         return {"status": "unavailable", "running": None,
                 "detail": "QMP endpoint is missing; execution state cannot be verified"}
+    if path.startswith("gwprov://"):
+        from .qmp import QMPConnection
+        try:
+            with QMPConnection(path, timeout=0.5) as qmp:
+                state = qmp.execute("query-status")["return"]
+            if not isinstance(state.get("running"), bool):
+                raise RuntimeError("query-status omitted the boolean running field")
+            return state
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {"status": "unavailable", "running": None, "detail": str(exc)}
     try:
         endpoint_exists = Path(path).exists()
     except PermissionError:
@@ -209,7 +219,11 @@ def _rgb_to_png(width: int, height: int, pixels: bytes) -> bytes:
 
 def screenshot_qmp(qmp_socket: str, output: str | Path | None = None) -> dict[str, Any]:
     """Capture GWemu as PNG and report exact black-screen pixel statistics."""
-    qmp_path = Path(qmp_socket).expanduser().resolve()
+    if qmp_socket.startswith("gwprov://"):
+        from .daemon_ipc import runtime_directory
+        qmp_path = runtime_directory() / f"gwemu-{qmp_socket.removeprefix('gwprov://')}"
+    else:
+        qmp_path = Path(qmp_socket).expanduser().resolve()
     if output is None:
         directory = qmp_path.parent / "screenshots"
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -253,7 +267,8 @@ def screenshot_instance(*, pid: int | None = None, profile: str | None = None,
         raise ValueError("select exactly one instance with --pid or --profile")
     rows = instances()
     if profile:
-        root = str(Path(profile).expanduser().resolve())
+        from .profiles import resolve_profile_path
+        root = str(resolve_profile_path(profile))
         rows = [row for row in rows if row["profile"] == root]
     else:
         rows = [row for row in rows if row["pid"] == pid]
@@ -263,7 +278,7 @@ def screenshot_instance(*, pid: int | None = None, profile: str | None = None,
         raise ValueError("profile matches multiple GWemu instances; select one by --pid")
     qmp_path = rows[0]["qmpSocket"]
     if not qmp_path:
-        raise ValueError("instance has no QMP socket; it cannot be screenshotted by gwprov")
+        raise ValueError("instance has no QMP control channel; it cannot be screenshotted by gwprov")
     result = screenshot_qmp(qmp_path, output)
     print(f"Saved PNG screenshot: {result['path']}")
     print(f"Frame {result['width']}x{result['height']}; all black: "
@@ -296,7 +311,7 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
     if not row["gdbPort"]:
         raise ValueError("GWemu instance has no GDB endpoint")
     if not row["qmpSocket"]:
-        raise ValueError("GWemu instance has no QMP socket for framebuffer capture")
+        raise ValueError("GWemu instance has no QMP control channel for framebuffer capture")
 
     firmware = device.root / "debug" / "retro-go-debug.elf"
     if not firmware.is_file():
@@ -645,11 +660,13 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
             backend.close()
 
 def instances() -> list[dict[str, Any]]:
-    result = []
+    from .daemon import managed_instances
+    result = managed_instances()
+    managed_pids = {row["pid"] for row in result}
     for proc in psutil.process_iter(["pid", "cmdline"]):
         pid = proc.info.get("pid")
         args = proc.info.get("cmdline") or []
-        if pid:
+        if pid and pid not in managed_pids:
             found = _instance(pid, args)
             if found:
                 result.append(found)
@@ -859,7 +876,7 @@ def _application_state(row: dict[str, Any]) -> str:
 
     qmp = row.get("qmpSocket")
     if not qmp:
-        raise RuntimeError("GWemu has no QMP socket; application state cannot be polled")
+        raise RuntimeError("GWemu has no QMP control channel; application state cannot be polled")
     root = Path(row["profile"]) if row.get("profile") else None
     firmware = root / "debug" / "retro-go-debug.elf" if root else None
     if not firmware or not firmware.is_file():
@@ -879,7 +896,7 @@ def _application_state(row: dict[str, Any]) -> str:
 
 
 
-def show_instances(*, output: str = "text") -> int:
+def show_instances(*, output: str = "text", no_pager: bool = False) -> int:
     rows = instances()
     if not rows:
         restriction = _process_scan_restriction()
@@ -899,14 +916,14 @@ def show_instances(*, output: str = "text") -> int:
         if restriction:
             print("Cannot confirm whether GWemu is running: this process scan is "
                   f"restricted ({restriction}). gwprov requires visibility of the "
-                  "GWemu PID namespace. Socket operations separately require allowed "
-                  "AF_UNIX (QMP) and TCP (GDB) connect calls. This is not inherently "
+                  "GWemu PID namespace. Daemon IPC uses the per-user local endpoint; "
+                  "GDB may require loopback TCP connect access. This is not inherently "
                   "a NET_ADMIN requirement; an empty scan is inconclusive.")
             return 2
         print("No GWemu instances running in the current process namespace.")
     else:
-        from .cli.text import render_process_list
-        print(render_process_list(rows, title="GWemu instances"))
+        from .cli.text import print_process_list
+        print_process_list(rows, title="GWemu instances", no_pager=no_pager)
     return 2 if any(row["running"] is None for row in rows) else 0
 
 
@@ -916,7 +933,8 @@ def stop_instance(*, pid: int | None = None, profile: str | None = None,
         raise ValueError("select exactly one instance with --pid or --profile")
     rows = instances()
     if profile:
-        root = str(Path(profile).expanduser().resolve())
+        from .profiles import resolve_profile_path
+        root = str(resolve_profile_path(profile))
         rows = [row for row in rows if row["profile"] == root]
     else:
         rows = [row for row in rows if row["pid"] == pid]
@@ -928,7 +946,12 @@ def stop_instance(*, pid: int | None = None, profile: str | None = None,
     qmp_path = row["qmpSocket"]
     process = psutil.Process(row["pid"])
     qmp_missing = not qmp_path
-    if qmp_path:
+    if qmp_path and qmp_path.startswith("gwprov://"):
+        try:
+            _qmp_execute(qmp_path, "quit")
+        except (OSError, RuntimeError):
+            qmp_missing = True
+    elif qmp_path:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(2.0)
         try:
@@ -965,21 +988,28 @@ def stop_instance(*, pid: int | None = None, profile: str | None = None,
 
 
 
-def set_instance_running(profile: str, *, running: bool) -> int:
+def set_instance_running(profile: str | None = None, *, pid: int | None = None,
+                         running: bool) -> int:
     """Pause or resume one visible instance through its QMP endpoint."""
-    from .profiles import DeviceProfile
-
-    root = str(DeviceProfile.load(profile).root)
-    matches = [row for row in instances() if row["profile"] == root]
+    if (profile is None) == (pid is None):
+        raise ValueError("select exactly one GWemu instance with profile or pid")
+    if profile:
+        from .profiles import DeviceProfile
+        root = str(DeviceProfile.load(profile).root)
+        matches = [row for row in instances() if row["profile"] == root]
+        selector = root
+    else:
+        matches = [row for row in instances() if row["pid"] == pid]
+        selector = f"pid {pid}"
     if len(matches) != 1:
         if _process_scan_restriction() and not matches:
             raise RuntimeError(
                 "cannot verify the GWemu process in this restricted process view; "
                 "grant PID namespace visibility before sending QMP commands")
-        raise ValueError(f"expected one GWemu instance for {root}, found {len(matches)}")
+        raise ValueError(f"expected one GWemu instance for {selector}, found {len(matches)}")
     row = matches[0]
     if not row["qmpSocket"]:
-        raise ValueError("GWemu instance has no QMP socket")
+        raise ValueError("GWemu instance has no QMP control channel")
     status = _qmp_execute(row["qmpSocket"], "query-status").get("return", {})
     if bool(status.get("running")) == running:
         print(f"GWemu pid {row['pid']} already "
@@ -1003,7 +1033,6 @@ def start_instance(profile: str, *, audio: bool = False,
                    gdb_port: int | None = None, qmp_socket: str | None = None,
                    headless: bool = False, timeline: str | None = None,
                    record_timeline: str | None = None) -> int:
-    from .launch import launch_profile
     from .profiles import DeviceProfile
 
     device = DeviceProfile.load(profile)
@@ -1013,33 +1042,17 @@ def start_instance(profile: str, *, audio: bool = False,
         row = matches[0]
         raise ValueError(f"profile already has GWemu pid {row['pid']} ({row['status']}); "
                          "use `gwprov gwemu ps` or `gwprov gwemu stop`")
-    if qmp_socket is None:
-        # Profiles under the macOS GWemu app support directory can exceed
-        # Darwin's AF_UNIX socket path limit. Keep default QMP endpoints short.
-        owner = str(os.getuid()) if hasattr(os, "getuid") else str(os.getpid())
-        profile_id = hashlib.sha256(os.fsencode(root)).hexdigest()[:20]
-        temp_root = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
-        qmp_path = temp_root / f"gwprov-{owner}" / f"{profile_id}.sock"
-    else:
-        qmp_path = Path(qmp_socket).expanduser().resolve()
-    qmp_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if qmp_path.exists():
-        # A sandbox may hide a live process from psutil. Keep the socket as an
-        # additional ownership signal instead of unlinking it on an empty scan.
-        status = _qmp_status(str(qmp_path))
-        if status == "unavailable":
-            raise RuntimeError(
-                f"QMP socket already exists but cannot be queried: {qmp_path}; "
-                "confirm its owner before removing it")
-        raise RuntimeError(
-            f"QMP socket is owned by an existing GWemu instance ({status}): {qmp_path}; "
-            "stop that instance before starting another")
+    if qmp_socket:
+        raise ValueError("managed GWemu uses QMP over the private GWProv daemon channel; "
+                         "--qmp-socket is not available for `gwprov gwemu start`")
     if gdb_port is None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
             gdb_port = probe.getsockname()[1]
+    from .daemon import start_instance as daemon_start
+    row = daemon_start(str(root), audio=audio, gdb_port=gdb_port, headless=headless,
+                      timeline=timeline, record_timeline=record_timeline)
     display = "headless" if headless else "visible"
-    print(f"Starting {display} GWemu for {root}; GDB :{gdb_port}; QMP {qmp_path}", flush=True)
-    return launch_profile(str(root), headless=headless, audio=audio,
-                          gdb_port=gdb_port, qmp_socket=str(qmp_path),
-                          timeline=timeline, record_timeline=record_timeline)
+    print(f"Started {display} GWemu for {root} (pid {row['pid']}); "
+          f"GDB :{gdb_port}; QMP managed by GWProv daemon.", flush=True)
+    return 0

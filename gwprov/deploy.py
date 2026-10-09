@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from pathlib import PurePosixPath
+import shutil
 from typing import Iterable
 
 CHUNK_SIZE = 256 * 1024
@@ -157,6 +159,61 @@ def _push_sd_image(gnw, image: Path) -> int:
                 raise
             if offset == offsets[-1]:
                 raise
+    raise ValueError(f"cannot open a FAT partition in SD image {image}")
+
+
+def overlay_sd_directory(image: str | Path, destination: str | Path) -> int:
+    """Copy files from a profile FAT image into an already-mounted card folder."""
+    from pyfatfs.PyFatFS import PyFatFS
+
+    image = Path(image)
+    root = Path(destination).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"registered SD-card mount is unavailable: {root}")
+    with image.open("rb") as stream:
+        header = stream.read(512)
+    if header.startswith(b"QFI\xfb"):
+        raise ValueError(f"SD source is QCOW2, not a raw card image: {image}")
+    offsets = []
+    if header[510:512] == b"\x55\xaa":
+        for index in range(4):
+            entry = header[446 + index * 16:462 + index * 16]
+            if entry[4] in (1, 4, 6, 11, 12, 14):
+                offsets.append(int.from_bytes(entry[8:12], "little") * 512)
+    if not offsets:
+        offsets = [0]
+    for offset in offsets:
+        opened = False
+        try:
+            with PyFatFS(str(image), offset=offset, read_only=True) as filesystem:
+                opened = True
+                copied = 0
+                for path, info in filesystem.walk.info(namespaces=["details"]):
+                    if info.is_dir:
+                        continue
+                    relative = PurePosixPath(path.lstrip("/"))
+                    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+                        raise ValueError(f"unsafe path in SD image: {path}")
+                    target = root.joinpath(*relative.parts)
+                    parent = target.parent
+                    parent.mkdir(parents=True, exist_ok=True)
+                    if root not in parent.resolve().parents and parent.resolve() != root:
+                        raise ValueError(f"SD-card path escapes mounted folder: {path}")
+                    if target.is_symlink():
+                        raise ValueError(f"refusing to overwrite SD-card symlink: {target}")
+                    with filesystem.openbin(path, "r") as source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output, 1024 * 1024)
+                    copied += 1
+                if copied == 0:
+                    raise ValueError(f"SD image contains no files: {image}")
+                return copied
+        except ValueError:
+            raise
+        except Exception as error:
+            if opened:
+                raise ValueError(f"cannot finish SD overlay from {image}: {error}") from error
+            if offset == offsets[-1]:
+                raise ValueError(f"cannot overlay SD FAT image {image}: {error}") from error
     raise ValueError(f"cannot open a FAT partition in SD image {image}")
 
 

@@ -1,13 +1,17 @@
-"""Read and resolve the TOML device profiles used by GWemu."""
+"""Resolve managed device profiles and their packaged image files."""
 
 from __future__ import annotations
+
+import json
+import os
+import sys
 
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from typing import TYPE_CHECKING
@@ -16,9 +20,97 @@ if TYPE_CHECKING:
     from .common.target import Image
 
 
+PROFILE_DIR_ENV = "GWPROV_PROFILE_DIR"
+
+
+def profile_directory(override: str | Path | None = None) -> Path:
+    """Return the managed profile root, honoring an explicit or environment override."""
+    configured = override if override is not None else os.environ.get(PROFILE_DIR_ENV)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        base = Path(xdg_data_home).expanduser()
+    elif os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data).expanduser() if local_app_data else Path.home() / "AppData/Local"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library/Application Support"
+    else:
+        base = Path.home() / ".local/share"
+    return (base / "gwprov/profiles").resolve()
+
+
+def _is_path_reference(value: str) -> bool:
+    return bool(Path(value).is_absolute() or PureWindowsPath(value).drive
+                or "/" in value or "\\" in value or value.startswith("~"))
+
+
+def resolve_profile_path(profile: str | Path, *, profile_dir: str | Path | None = None) -> Path:
+    """Resolve explicit paths directly and bare profile names under the managed root."""
+    value = os.fspath(profile)
+    path = Path(value).expanduser()
+    if _is_path_reference(value):
+        return path.resolve()
+    if value in {"", ".", ".."}:
+        raise ValueError("profile name must be a non-empty directory name")
+    return (profile_directory(profile_dir) / value).resolve()
+
+
+def profile_destination(name_or_path: str | Path, *, output_dir: str | Path | None = None) -> Path:
+    """Resolve a create destination; --output-dir requires a single profile name."""
+    value = os.fspath(name_or_path)
+    if output_dir is not None:
+        if _is_path_reference(value) or value in {"", ".", ".."}:
+            raise ValueError("--output-dir requires a profile name without a directory path")
+        return (profile_directory(output_dir) / value).resolve()
+    return resolve_profile_path(name_or_path)
+
+
+def list_profiles(*, profile_dir: str | Path | None = None) -> list[dict[str, str]]:
+    """List valid named profiles in the managed profile directory."""
+    root = profile_directory(profile_dir)
+    if not root.is_dir():
+        return []
+    rows = []
+    for directory in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+        if not directory.is_dir() or not (directory / "profile.toml").is_file():
+            continue
+        try:
+            profile = DeviceProfile.load(directory)
+            required_files = [profile.bank1, profile.bank2, profile.extflash]
+            if profile.resolved_sd:
+                required_files.append(profile.resolved_sd)
+            missing = [str(path) for path in required_files if not path.is_file()]
+            status = "incomplete" if missing else "ready"
+            error = "Missing image files: " + ", ".join(missing) if missing else ""
+            display_name = profile.display_name
+        except (OSError, RuntimeError, ValueError) as exc:
+            status = "invalid"
+            error = str(exc)
+            display_name = directory.name
+        details = {}
+        metadata = directory / "provision.json"
+        if metadata.is_file():
+            try:
+                details = json.loads(metadata.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                details = {}
+        rows.append({
+            "name": directory.name,
+            "display_name": display_name,
+            "path": str(directory.resolve()),
+            "status": status,
+            "error": error,
+            "model": str(details.get("model", "")),
+            "firmware": str(details.get("firmware", "")),
+        })
+    return rows
+
+
 @dataclass(frozen=True)
 class DeviceProfile:
-    """A GWemu profile's firmware and storage files, resolved from profile.toml."""
+    """A device profile's firmware and storage files, resolved from profile.toml."""
 
     root: Path
     display_name: str
@@ -33,7 +125,7 @@ class DeviceProfile:
 
     @classmethod
     def load(cls, directory: str | Path, *, shared_sd_root: str | Path | None = None):
-        root = Path(directory).expanduser().resolve()
+        root = resolve_profile_path(directory)
         manifest = root / "profile.toml"
         data = tomllib.loads(manifest.read_text(encoding="utf-8"))
         flash = data.get("flash", {})

@@ -19,7 +19,11 @@ def record_control_request(path: str | None, transport: str, command: str) -> No
     """
     if not path:
         return
-    destination = Path(path).expanduser().resolve().parent / "control.jsonl"
+    if path.startswith("gwprov://"):
+        from .daemon_ipc import runtime_directory
+        destination = runtime_directory() / f"control-{path.removeprefix('gwprov://')}.jsonl"
+    else:
+        destination = Path(path).expanduser().resolve().parent / "control.jsonl"
     callers = [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
                for frame in traceback.extract_stack(limit=8)[:-1]]
     payload = json.dumps({"time_ns": time.time_ns(), "pid": os.getpid(),
@@ -57,6 +61,11 @@ class QMPConnection:
         self.request_id = 0
 
     def __enter__(self):
+        if self.path.startswith("gwprov://"):
+            # The daemon performs QMP's one-time capability negotiation when
+            # it starts the child. This connection is a client RPC handle.
+            self.stream = True
+            return self
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
         try:
@@ -84,6 +93,18 @@ class QMPConnection:
         if command in {"stop", "cont", "system_reset", "quit"}:
             record_control_request(self.path, "qmp", command)
         self.request_id += 1
+        if self.path.startswith("gwprov://"):
+            if command == "qmp_capabilities":
+                return {"return": {}, "id": self.request_id}
+            from .daemon_ipc import request
+            response = request({"op": "qmp", "vm": self.path.removeprefix("gwprov://"),
+                                "command": command, "arguments": arguments},
+                               timeout=self.timeout)
+            if "event" in response:
+                return response
+            # daemon_ipc envelopes the child reply with protocol metadata.
+            return {key: value for key, value in response.items()
+                    if key not in {"ok", "protocol"}}
         payload = {"execute": command, "id": self.request_id}
         if arguments:
             payload["arguments"] = arguments
@@ -130,6 +151,9 @@ class QMPConnection:
         return int.from_bytes(self.read_memory(address, 4), "little")
 
     def close(self):
+        if self.path.startswith("gwprov://"):
+            self.stream = None
+            return
         if self.stream is not None:
             self.stream.close()
             self.stream = None

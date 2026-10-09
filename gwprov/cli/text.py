@@ -1,79 +1,137 @@
-"""Small, predictable renderers for human-facing CLI output."""
+"""Rich-based renderers for human-facing command output."""
 from __future__ import annotations
 
 from pathlib import Path
-import textwrap
 from typing import Any
 
-
-def _wrap_field(label: str, value: Any, *, width: int, indent: str = "    ") -> list[str]:
-    available = max(20, width - len(indent) - len(label) - 2)
-    lines = textwrap.wrap(str(value), width=available, break_long_words=True,
-                          break_on_hyphens=False) or [""]
-    return [f"{indent}{label}: {lines[0]}"] + [f"{indent}{' ' * len(label)}  {line}"
-                                                  for line in lines[1:]]
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 
-def _terminal_width() -> int:
-    try:
-        import shutil
-        return max(60, shutil.get_terminal_size((100, 24)).columns)
-    except OSError:
-        return 100
+_STATE_STYLES = {
+    "running": "bold green",
+    "halted": "bold yellow",
+    "busy": "bold cyan",
+    "unknown": "bold red",
+}
 
 
-def _profile_name(value: Any) -> str:
-    if not value:
-        return ""
-    return Path(str(value)).expanduser().name or str(value)
+def _display_name(row: dict[str, Any]) -> str:
+    name = str(row.get("name") or "Unnamed device")
+    if row.get("kind") == "gwemu" or row.get("pid") is not None:
+        profile = row.get("profile")
+        if profile:
+            return Path(str(profile)).expanduser().name or str(profile)
+    return name
+
+
+def _connection(row: dict[str, Any]) -> str:
+    if row.get("pid") is not None:
+        parts = [f"PID {row['pid']}"]
+        if "display" in row:
+            parts.append(f"Display {'on' if row['display'] else 'off'}")
+        if row.get("gdbPort"):
+            parts.append(f"GDB :{row['gdbPort']}")
+        if row.get("qmpSocket"):
+            parts.append("daemon QMP" if str(row["qmpSocket"]).startswith("gwprov://") else "QMP")
+        return " · ".join(parts)
+    parts = [str(value) for value in (row.get("vendor"), row.get("backend")) if value]
+    if row.get("probeId"):
+        parts.append(str(row["probeId"]))
+    return " · ".join(parts) or "—"
+
+
+def _status(value: Any) -> Text:
+    state = str(value or "unknown").lower()
+    style = _STATE_STYLES.get(state, "bold magenta")
+    return Text(f"● {state.upper()}", style=style, no_wrap=True)
+
+
+def process_table(rows: list[dict[str, Any]], *, title: str, width: int) -> Table:
+    """Build a responsive, color-aware device/process inventory table."""
+    table = Table(
+        title=f"[bold bright_cyan]{title}[/] [dim]· {len(rows)}",
+        title_justify="left",
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold bright_white",
+        row_styles=("", ""),
+        padding=(0, 1),
+        expand=True,
+        show_edge=True,
+    )
+    compact = width < 100
+    table.add_column("STATE", min_width=11, no_wrap=True)
+    if compact:
+        table.add_column("DEVICE", min_width=13, overflow="fold")
+        table.add_column("APPLICATION · CONNECTION", min_width=18, overflow="fold")
+    else:
+        table.add_column("TYPE", min_width=9, max_width=12, style="bright_blue", no_wrap=True)
+        table.add_column("DEVICE", min_width=14, overflow="fold")
+        table.add_column("APPLICATION", min_width=14, overflow="fold")
+        table.add_column("CONNECTION / DETAILS", min_width=18, overflow="fold")
+
+    for row in rows:
+        kind = "GWemu" if row.get("kind") == "gwemu" or row.get("pid") is not None else "Hardware"
+        application_text = Text(str(row.get("application") or "—"))
+        if application_text.plain.casefold() == "unknown":
+            application_text.stylize("dim")
+
+        info = row.get("stateDetail") or row.get("applicationDetail") or row.get("detail")
+        if info and str(info).startswith("Pass --profile with matching firmware"):
+            info = None
+        connection_text = Text(_connection(row))
+        if info:
+            if connection_text.plain != "—":
+                connection_text.append("\n")
+                connection_text.append(str(info), style="dim")
+            else:
+                connection_text = Text(str(info))
+
+        if compact:
+            device_text = Text(_display_name(row))
+            device_text.append(f"\n{kind}", style="bright_blue")
+            details_text = Text("Application: ")
+            details_text.append(application_text)
+            if connection_text.plain != "—":
+                details_text.append("\n")
+                details_text.append(connection_text)
+            table.add_row(_status(row.get("status")), device_text, details_text)
+        else:
+            table.add_row(_status(row.get("status")), Text(kind, style="bright_blue"),
+                          Text(_display_name(row)), application_text, connection_text)
+
+    return table
+
+
+def print_process_list(rows: list[dict[str, Any]], *, title: str = "Devices",
+                       no_pager: bool = False, console: Console | None = None) -> None:
+    """Print an inventory, paging long interactive output unless disabled."""
+    console = console or Console()
+    table = process_table(rows, title=title, width=console.width)
+    if not rows:
+        console.print(f"[dim]No {title.lower()} found.[/]")
+        return
+
+    # Page only when the rendered table would scroll off an interactive screen.
+    # Piped output is always immediate, and --no-pager always bypasses paging.
+    line_count = len(console.render_lines(table, console.options))
+    should_page = console.is_terminal and not no_pager and line_count > console.height
+    if should_page:
+        with console.pager(styles=True):
+            console.print(table)
+    else:
+        console.print(table)
 
 
 def render_process_list(rows: list[dict[str, Any]], *, title: str = "Devices",
-                        width: int | None = None) -> str:
-    """Render inventory rows as compact, terminal-width-aware entries."""
-    if not rows:
-        return f"{title}\nNo devices found."
+                        width: int = 100) -> str:
+    """Return plain text for tests and logs using the same Rich layout."""
+    from io import StringIO
 
-    width = width or _terminal_width()
-    lines = [f"{title} ({len(rows)})"]
-    sections: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        section = "GWemu" if row.get("kind") == "gwemu" or row.get("pid") is not None else "Hardware"
-        sections.setdefault(section, []).append(row)
-
-    for section, items in sections.items():
-        lines.extend(("", section))
-        for row in items:
-            status = str(row.get("status", "unknown")).upper()
-            name = str(row.get("name") or row.get("pid") or "Unnamed device")
-            if section == "GWemu":
-                name = _profile_name(row.get("profile") or name)
-            lines.append(f"  {status}  {name}")
-
-            if row.get("pid") is not None:
-                details = [f"PID {row['pid']}"]
-                if "display" in row:
-                    details.append(f"Display {'on' if row['display'] else 'off'}")
-                if row.get("gdbPort"):
-                    details.append(f"GDB :{row['gdbPort']}")
-                lines.extend(_wrap_field("Process", " · ".join(details), width=width))
-            elif row.get("probeId"):
-                probe = row.get("vendor") or row.get("backend")
-                lines.extend(_wrap_field("Probe", f"{probe} · {row['probeId']}", width=width))
-
-            application = row.get("application")
-            if application:
-                lines.extend(_wrap_field("Application", application, width=width))
-            detail = row.get("stateDetail") or row.get("applicationDetail") or row.get("detail")
-            # The unified inventory's ordinary no-symbol hint is actionable but
-            # redundant on every healthy row; keep it as one footer below.
-            if detail and not (section == "Hardware" and
-                               str(detail).startswith("Pass --profile with matching firmware")):
-                lines.extend(_wrap_field("Info", detail, width=width))
-    if any(row.get("kind") == "hardware" and row.get("status") in {"running", "halted"}
-           and row.get("application") == "Unknown" for row in rows):
-        lines.append("")
-        lines.extend(textwrap.wrap(
-            "Use --profile to resolve application state from firmware and app symbols.",
-            width=width, break_long_words=True, break_on_hyphens=False))
-    return "\n".join(lines)
+    output = StringIO()
+    console = Console(file=output, width=width, color_system=None, force_terminal=False)
+    print_process_list(rows, title=title, no_pager=True, console=console)
+    return output.getvalue()

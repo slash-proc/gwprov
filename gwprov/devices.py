@@ -23,6 +23,9 @@ def device_rows(profile: str | None = None) -> list[dict]:
         symbol_paths.extend(app_elfs)
 
     rows = []
+    from .active_device import get_active
+    from .active_device import get_active_origin
+    active_device = get_active()
     vms = instances()
     restriction = _process_scan_restriction()
     if not vms and restriction:
@@ -37,10 +40,12 @@ def device_rows(profile: str | None = None) -> list[dict]:
         except (OSError, RuntimeError, ValueError) as error:
             application = "Unknown"
             app_detail = str(error)
-        rows.append({"id": f"gwemu:{vm['pid']}", "kind": "gwemu", "backend": "qmp",
+        rows.append({"id": f"gwemu:{vm['pid']}", "kind": "gwemu",
+                     "backend": "GWProv daemon" if str(vm.get("qmpSocket", "")).startswith("gwprov://") else "QMP",
                      "name": vm.get("profile") or f"GWemu pid {vm['pid']}",
                      "status": vm["status"], "application": application,
-                     "pid": vm["pid"], "detail": vm.get("stateDetail") or app_detail})
+                     "pid": vm["pid"], "display": vm.get("display"),
+                     "detail": vm.get("stateDetail") or app_detail})
     try:
         probes = enumerate_local_probes()
         probe_error = None
@@ -134,14 +139,59 @@ def device_rows(profile: str | None = None) -> list[dict]:
         if busy_owner:
             row["busyOwner"] = busy_owner
         rows.append(row)
+    from .adapters import list_remote
+    remotes = list_remote()
+    remote_by_url = {row["url"]: row for row in remotes}
+    if active_device and active_device.startswith("remote:"):
+        uri = active_device.removeprefix("remote:")
+        remote_by_url.setdefault(uri, {"name": uri.split("/", 3)[2],
+                                       "url": uri, "origin": get_active_origin()})
+    for remote in remote_by_url.values():
+        uri = remote["url"]
+        remote_id = f"remote:{uri}"
+        owner = lease_owner(f"remote:{uri}")
+        if owner:
+            rows.append({"id": remote_id, "kind": "hardware", "backend": "gnwmanager WebSocket",
+                         "name": remote["name"], "status": "busy", "application": "Unknown",
+                         "detail": f"Target traffic skipped: {owner.get('operation', 'another session')} owns it",
+                         "adapterName": remote["name"], "remoteOrigin": remote["origin"]})
+        else:
+            backend = None
+            try:
+                from .backends import WebSocketBackend
+                backend = WebSocketBackend(uri, origin=remote["origin"],
+                                           operation="gwprov device inventory", lease_wait=0)
+                backend.open()
+                dhcsr = backend.read_uint32(0xE000EDF0)
+                status = "halted" if dhcsr & (1 << 17) else "running"
+                detail = "Remote device; pass a matching profile to resolve its Application state."
+            except Exception as error:
+                status = "unknown"
+                detail = f"Remote device state could not be read: {error}"
+            finally:
+                if backend is not None:
+                    try: backend.close()
+                    except Exception: pass
+            rows.append({"id": remote_id, "kind": "hardware", "backend": "gnwmanager WebSocket",
+                         "name": remote["name"], "status": status, "application": "Unknown",
+                         "detail": detail, "adapterName": remote["name"], "remoteOrigin": remote["origin"]})
     if probe_error:
         rows.append({"id": "probe:*", "kind": "hardware", "backend": "pyocd",
                      "name": "Probe inventory", "status": "unknown", "application": "Unknown",
                      "detail": probe_error})
+    from .device_assignments import assignments
+    assigned = assignments()
+    for row in rows:
+        values = assigned.get(row["id"], {})
+        if values.get("profile"):
+            row["assignedProfile"] = values["profile"]
+        if values.get("sdcard"):
+            row["sdCard"] = values["sdcard"]
     return sorted(rows, key=lambda row: (row["kind"], row["name"].casefold(), row["id"]))
 
 
-def show_devices(*, output: str = "text", profile: str | None = None) -> int:
+def show_devices(*, output: str = "text", profile: str | None = None,
+                 no_pager: bool = False) -> int:
     rows = device_rows(profile=profile)
     if output == "json":
         print(json.dumps(rows, indent=2))
@@ -150,6 +200,32 @@ def show_devices(*, output: str = "text", profile: str | None = None) -> int:
         print("No GWemu instances or PyOCD probes detected.")
         print("Probe enumeration requires PyOCD with working USB access; use `pyocd list -p` to diagnose probe access.")
         return 0
-    from .cli.text import render_process_list
-    print(render_process_list(rows, title="GWProv devices"))
+    from .cli.text import print_process_list
+    print_process_list(rows, title="GWProv devices", no_pager=no_pager)
     return 2 if any(row["status"] == "unknown" for row in rows) else 0
+
+
+def device_identifiers() -> list[str]:
+    """Return completion-safe device selectors without QMP or target traffic."""
+    import psutil
+    from pathlib import Path
+    from .adapters import list_remote
+
+    identifiers = set()
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        args = process.info.get("cmdline") or []
+        executable = Path(args[0]).name.lower() if args else ""
+        if ((executable in {"gwemu", "gwemu.exe"} or executable.startswith("qemu-system"))
+                and "gnw-h7b0" in " ".join(args)):
+            pid = process.info.get("pid")
+            if pid:
+                identifiers.add(f"gwemu:{pid}")
+    try:
+        from .backends import enumerate_local_probes
+        identifiers.update(f"probe:{row['id']}" for row in enumerate_local_probes())
+    except (RuntimeError, OSError):
+        pass
+    for row in list_remote():
+        identifiers.add(f"remote:{row['url']}")
+        identifiers.add(row["name"])
+    return sorted(identifiers, key=str.casefold)

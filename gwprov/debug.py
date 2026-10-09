@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
 import shutil
 import subprocess
 import time
@@ -23,6 +21,8 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234, headless: bool = Fa
     from .profiles import DeviceProfile
 
     profile = DeviceProfile.load(profile_dir)
+    if not qmp_enabled:
+        raise ValueError("daemon-managed GWemu requires its private QMP stream; --no-qmp is unsupported")
     for path in (profile.bank1, profile.bank2, profile.extflash):
         if not path.is_file():
             raise ValueError(f"profile image is missing: {path}")
@@ -36,48 +36,9 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234, headless: bool = Fa
     if not gdb_bin:
         raise ValueError("install arm-none-eabi-gdb or gdb-multiarch to use gwprov gwemu debug")
 
-    cmd = ["gwemu", "-machine", "gnw-h7b0"]
-    for prop, path in (("bank1-image", profile.bank1), ("bank2-image", profile.bank2),
-                       ("extflash-image", profile.extflash)):
-        cmd += ["-global", f"gnw-h7b0-soc.{prop}={path}"]
-    cmd += ["-display", "none" if headless else "gwemu",
-            "-audiodev", "sdl3,id=snd0" if audio else "none,id=snd0",
-            "-global", "gnw-h7b0-sai1.audiodev=snd0", "-S",
-            "-gdb", f"tcp:127.0.0.1:{gdb_port}"]
-    qmp_path = None
-    if qmp_enabled:
-        if qmp_socket is None:
-            owner = str(os.getuid()) if hasattr(os, "getuid") else str(os.getpid())
-            profile_id = hashlib.sha256(os.fsencode(profile.root)).hexdigest()[:20]
-            qmp_path = (Path.home() / ".cache" / "gwprov" / "qmp"
-                        / f"{owner}-{profile_id}.sock")
-        else:
-            qmp_path = Path(qmp_socket).expanduser().resolve()
-        if len(os.fsencode(qmp_path)) >= 104:
-            raise ValueError(
-                f"QMP socket path exceeds the portable Unix socket limit: {qmp_path}; "
-                "pass a shorter --qmp-socket path or use --no-qmp")
-        if qmp_path.exists():
-            raise RuntimeError(
-                f"QMP socket already exists: {qmp_path}; check for an existing GWemu "
-                "instance before removing it")
-        qmp_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
-    elif qmp_socket is not None:
-        raise ValueError("--qmp-socket cannot be used with QMP disabled")
-    if profile.resolved_sd:
-        cmd += ["-drive", f"if=sd,format=raw,file={profile.resolved_sd}"]
-    config = profile.root / "gwemu.toml"
-    if not config.exists():
-        config.write_text("[general]\nshow_welcome = false\n")
-    if not headless:
-        cmd += ["-config_path", str(config)]
-    env = dict(os.environ)
-    env["XDG_DATA_HOME"] = str(profile.root / "runtime")
-    env["XDG_CONFIG_HOME"] = str(profile.root / "runtime/config")
-
-    from .timeline_launch import configure_timeline
-    configure_timeline(env, timeline=timeline, record_timeline=record_timeline)
+    if qmp_socket:
+        raise ValueError("managed GWemu uses QMP over the private GWProv daemon channel; "
+                         "--qmp-socket is not available")
 
     # Validate every option needed to build the GDB script before launching
     # GWemu. It starts halted with -S; raising after Popen leaves an orphaned
@@ -94,15 +55,21 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234, headless: bool = Fa
         app_table.load(app_elf)
         app_entry = app_table["app_main"] & ~1
 
-    process = subprocess.Popen(cmd, cwd=profile.root, env=env,
-                                   start_new_session=True)
+    from .daemon import start_instance
+    from .gwemu_manager import stop_instance
+    instance = start_instance(str(profile.root), headless=headless, audio=audio,
+                              gdb_port=gdb_port, timeline=timeline,
+                              record_timeline=record_timeline, start_halted=True)
+    qmp_path = instance["qmpSocket"]
+    import psutil
+    process = psutil.Process(instance["pid"])
     try:
         # Let GWemu start before GDB connects. Avoid a probe connection here:
         # QEMU's GDB stub treats every connection as the debugger and can leave
         # the target stopped when a readiness-check socket disconnects.
         time.sleep(1.0)
-        if process.poll() is not None:
-            raise RuntimeError(f"GWemu exited with status {process.returncode}")
+        if not process.is_running():
+            raise RuntimeError(f"GWemu pid {process.pid} exited during startup")
 
         gdb_script = profile.root / "runtime" / "gwprov" / "debug.gdb"
         gdb_script.parent.mkdir(parents=True, exist_ok=True)
@@ -178,15 +145,10 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234, headless: bool = Fa
               "info registers, x/16wx ADDRESS, monitor system_reset, and bt.",
               flush=True)
         if qmp_path:
-            print(f"QMP controls: {qmp_path}", flush=True)
+            print("QMP controls: private GWProv daemon channel", flush=True)
         return subprocess.run(gdb_cmd, check=False).returncode
     except KeyboardInterrupt:
         return 130
     finally:
-        if process.poll() is None and not keep_running:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+        if process.is_running() and not keep_running:
+            stop_instance(pid=process.pid)

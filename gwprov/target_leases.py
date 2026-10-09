@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -100,6 +101,7 @@ class TargetLease:
         self.wait = max(0.0, wait)
         self.path = _path_for(key)
         self.fd: int | None = None
+        self.daemon_token: str | None = None
 
     def acquire(self) -> "TargetLease":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,6 +121,10 @@ class TargetLease:
                 try:
                     os.write(fd, payload)
                     os.fsync(fd)
+                    token = secrets.token_hex(16)
+                    from .daemon import register_lease
+                    register_lease(token, owner)
+                    self.daemon_token = token
                 except Exception:
                     self.release()
                     raise
@@ -135,6 +141,10 @@ class TargetLease:
 
     def release(self) -> None:
         fd, self.fd = self.fd, None
+        token, self.daemon_token = self.daemon_token, None
+        if token:
+            from .daemon import release_lease
+            release_lease(token)
         if fd is not None:
             try:
                 _unlock(fd)

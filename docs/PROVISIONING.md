@@ -90,6 +90,106 @@ gwprov profile create dev-local/profiles/retro-go-demo \
 gwprov gwemu run --profile dev-local/profiles/retro-go-demo
 ```
 
+## Inspect and edit device filesystems
+
+`gwprov show` gives a concise resource overview. Use `gwprov show devices` for
+the short device list and `gwprov ps` for detailed runtime state. Set a device
+focus with the ID shown by `show devices`; single-device controls use it when
+no explicit target is supplied:
+
+```bash
+gwprov show
+gwprov show devices
+gwprov set active gwemu:12345
+gwprov gwemu screenshot
+```
+
+Assigning a profile is separate from selecting the active device. `gwprov apply`
+uses the active device's saved assignment: for GWemu it starts the assigned
+profile and replaces the active VM when its profile differs; for hardware it
+deploys the profile's flash regions. A registered SD card can be associated with
+hardware so the profile's FAT files are overlaid onto that mounted folder as
+part of apply.
+
+```sh
+gwprov set active probe:PROBE_ID
+gwprov set profile dkc1
+gwprov sdcard add /Volumes/RETROGO       # name defaults to RETROGO
+gwprov set sdcard RETROGO
+gwprov apply
+```
+
+Register mounted folders or drive roots with `gwprov sdcard add PATH [NAME]`.
+Names default to the folder name on Unix-like systems and the drive letter on
+Windows. Registration records the path only; it does not format the card.
+Inspect cards with `gwprov sdcard list` or `gwprov show sdcard`. Clear an
+assignment with `gwprov set profile none` or `gwprov set sdcard none` before
+removing a resource. The same `sdcard` command creates and populates raw card
+images with `gwprov sdcard create` and `gwprov sdcard compose`; `sd` remains a
+short alias for the full command group.
+
+`adapters` and `devices` are also top-level commands. `adapters` lists detected
+local programmers and registered remote servers. Register one remote
+`gnwmanager serve` endpoint per adapter; each server represents one device:
+
+```bash
+gwprov adapters add pi-probe ws://10.2.3.122:8765/gdb
+gwprov adapters list
+gwprov devices
+gwprov set active pi-probe
+gwprov input tap B
+gwprov adapters remove pi-probe
+```
+
+Pass `--origin ORIGIN` to `adapters add` when the server requires an Origin
+header. The per-user adapter registry uses the platform config directory;
+`GWPROV_CONFIG_DIR` overrides it. `show adapters` and `show devices` remain
+available as concise dashboard views.
+
+Filesystem commands accept a managed profile or an explicit image. FrogFS
+changes rebuild the filesystem and update a profile's declared FrogFS size;
+direct images are rebuilt within their existing image or explicitly sized region.
+LittleFS and SD changes are applied in place. `create` formats an empty
+filesystem and requires `--force` when replacing existing data:
+
+```bash
+gwprov filesystem ls --profile retro-go-demo --target flash/ext
+gwprov filesystem add assets/title.png --source ./title.png \
+  --profile retro-go-demo --target flash/ext
+gwprov filesystem remove assets/old.png --profile retro-go-demo --target flash/ext
+gwprov filesystem create --profile retro-go-demo --target flash/ext \
+  --filesystem frogfs --force
+gwprov filesystem ls --profile retro-go-demo --target sdcard
+```
+
+Create standalone filesystem images with the concise size-in-MiB form. The
+optional output directory defaults to the current directory, and filenames
+default to `frogfs.bin`, `lfs.bin`, and `sdcard.bin`. Use `--force` to replace
+an existing output:
+
+```bash
+gwprov fs create frogfs 2 dev-local
+gwprov fs create lfs 2 dev-local littlefs-test.bin
+gwprov fs create sdcard 128 dev-local
+```
+
+For scripts or custom image layouts, the explicit image form is also available.
+FrogFS and LittleFS use a byte size; LittleFS also takes `--offset` and
+`--block-size`. SD creation uses `--size-mib`:
+
+```bash
+gwprov filesystem create --image dev-local/frogfs.bin \
+  --filesystem frogfs --size 0x200000
+gwprov filesystem create --image dev-local/littlefs.bin \
+  --filesystem littlefs --size 0x200000 --block-size 4096
+gwprov filesystem create --image dev-local/card.img \
+  --filesystem sd --size-mib 128
+```
+
+For direct filesystem images, preserve any other data in the containing image
+when choosing offsets and sizes. The `media`, `sdcard` (also available as `sd`), and `profile` commands
+handle packing, card composition, and profile lifecycle tasks.
+
 `profile create` checks project ABI requirements, builds both filesystems, relocates
 mapped artifacts such as `gba.xip`, patches the released firmware's GWLB layout
 with a fresh CRC, and assembles an extflash blob sized automatically to the smallest 64, 128 or 256 MiB
@@ -114,15 +214,26 @@ checksum verification. The cache is
 The bootloader starts valid bank-2 firmware when no updater or diagnostic action
 is selected. This is a
 standalone Retro-Go instance; a stock dual-boot image requires the separate stock
-patch/bootloader provisioning flow.
+patch/bootloader provisioning flow. To create a pristine stock device profile,
+use `gwprov profile create PATH --stock --backup-dir BACKUPS`.
 
-The final launch uses the GWemu executable from PATH directly. It starts the guest
-running, uses the profile's actual images, and retains its mutated media and RDP
-sidecar across clean exits. It does not attach a probe or issue debug halts or resets.
-A config file under the profile disables the first-run wizard; GWemu settings and
-runtime data stay under that instance. Add `--headless` to omit the window, or
-`--gdb-port PORT` / `--qmp-socket PATH` to expose optional testing controls. No
-startup pause is added for those controls. GWemu stderr is saved in `gwemu.log`.
+Profiles are named directory-based device images. Bare names resolve under the
+OS data directory: `%LOCALAPPDATA%\gwprov\profiles` on Windows,
+`~/Library/Application Support/gwprov/profiles` on macOS, or
+`$XDG_DATA_HOME/gwprov/profiles` on Linux (defaulting to
+`~/.local/share/gwprov/profiles`). `GWPROV_PROFILE_DIR` overrides the default;
+an explicitly set `XDG_DATA_HOME` is honored on any OS. `profile create
+--output-dir` overrides the store for that creation. Explicit profile paths
+remain supported.
+
+Profile launches use the GWemu executable from PATH through the per-user GWProv
+daemon. They start the guest running, use the profile's actual images, and
+retain mutated media and RDP sidecar across clean exits. They do not attach a
+probe or issue debug halts or resets. A config file under the profile disables
+the first-run wizard; GWemu settings and runtime data stay under that instance.
+Add `--headless` to omit the window or `--gdb-port PORT` for an optional
+loopback debugger. The daemon keeps QMP private over stdio for state polling and
+controls. GWemu stderr is saved in `gwemu.log`; see [the daemon design](DAEMON.md).
 
 ## Full Doom inputs
 

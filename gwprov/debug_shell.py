@@ -1075,6 +1075,10 @@ class DebugSession:
         """Run one structured QMP command against the attached GWemu."""
         if not self.qmp_socket:
             raise RuntimeError("pass --qmp-socket to enable GWemu QMP controls")
+        if self.qmp_socket.startswith("gwprov://"):
+            from .qmp import QMPConnection
+            with QMPConnection(self.qmp_socket) as qmp:
+                return qmp.execute(execute, arguments)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(5.0)
         try:

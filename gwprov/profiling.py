@@ -345,7 +345,7 @@ def profile_instance(profile, *, duration=15.0, interval=0.02, symbols=None,
                            + (f"; {restriction}" if restriction else ""))
     row = matches[0]
     if not row.get("qmpSocket"):
-        raise RuntimeError("GWemu needs a QMP socket for live profiling")
+        raise RuntimeError("GWemu needs a QMP control channel for live profiling")
     table = SymbolTable()
     firmware = device.root / "debug/retro-go-debug.elf"
     paths = [firmware] if firmware.is_file() else []

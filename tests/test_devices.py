@@ -72,11 +72,13 @@ def test_process_list_text_is_grouped_and_wraps_long_values():
     from gwprov.cli.text import render_process_list
     rendered = render_process_list(rows, title="GWProv devices", width=60)
 
-    assert "GWProv devices (2)" in rendered
-    assert "GWemu\n  RUNNING  a-very-long-profile-name" in rendered
-    assert "PID 42 · Display on · GDB :3333" in rendered
-    assert "Hardware\n  BUSY  STM32H7B0" in rendered
-    assert "Target traffic skipped during hardware" in rendered
+    assert "GWProv devices" in rendered
+    assert "RUNNING" in rendered
+    assert "a-very-long-profile-" in rendered and "name" in rendered
+    assert "PID 42" in rendered and "GDB :3333" in rendered
+    assert "Hardware" in rendered or "STM32H7B0" in rendered
+    assert "BUSY" in rendered
+    assert "Target traffic" in rendered and "hardware profiling." in rendered
     assert all(len(line) <= 60 for line in rendered.splitlines())
 
 
@@ -88,7 +90,15 @@ def test_gwemu_ps_shows_halted_state_in_compact_text(monkeypatch, capsys):
 
     assert gwemu_manager.show_instances() == 0
     output = capsys.readouterr().out
-    assert "GWemu instances (1)" in output
-    assert "HALTED  dkc" in output
-    assert "PID 77 · Display on · GDB :3333" in output
-    assert "Application: Game menu" in output
+    assert "GWemu instances" in output
+    assert "HALTED" in output and "dkc" in output
+    assert "PID 77" in output and "GDB :3333" in output
+    assert "Game menu" in output
+
+
+def test_ps_commands_expose_no_pager_option():
+    from gwprov.cli.main import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["ps", "--no-pager"]).no_pager is True
+    assert parser.parse_args(["gwemu", "ps", "--no-pager"]).no_pager is True

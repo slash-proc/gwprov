@@ -12,7 +12,9 @@ license = "GPL-2.0-only"
 dependencies = ["gnwmanager", "pyelftools>=0.29", "tomli>=2; python_version < '3.11'"]
 
 [project.optional-dependencies]
-device = ["gnwmanager"]
+device = ["gnwmanager", "pyocd>=0.35.1", "PyFatFS>=1.1"]
+remote = ["websockets>=14,<16"]
+reports = ["reportlab>=4,<5"]
 media = ["littlefs-python>=0.9", "PyYAML>=6", "pyfatfs>=1.1", "setuptools<81"]
 dist = ["wasmtime>=20"]
 dev = ["pytest>=8", "ruff>=0.9"]

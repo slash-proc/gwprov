@@ -15,7 +15,8 @@ from .qmp import QMPConnection
 
 
 def sample_profile(qmp_socket, symbols, *, duration=15.0, interval=0.02,
-                   progress_symbols=None, rebase_symbols=None, process=None) -> dict:
+                   progress_symbols=None, rebase_symbols=None, process=None, stop_event=None,
+                   stall_threshold=1.0) -> dict:
     """Return raw snapshots and a function histogram. No target writes or halts.
 
     Percentages count running-state PC snapshots, NOT measured Cortex-M cycles.
@@ -26,6 +27,8 @@ def sample_profile(qmp_socket, symbols, *, duration=15.0, interval=0.02,
         raise ValueError("profile duration must be finite and positive")
     if not math.isfinite(interval) or interval < 0.005:
         raise ValueError("profile interval must be finite and at least 0.005 seconds")
+    if not math.isfinite(stall_threshold) or stall_threshold < 0:
+        raise ValueError("stall threshold must be finite and nonnegative")
     selected = list(dict.fromkeys(progress_symbols or []))
     if progress_symbols is None:
         selected = [row["name"] for row in symbols.nm() if
@@ -71,7 +74,7 @@ def sample_profile(qmp_socket, symbols, *, duration=15.0, interval=0.02,
     next_counters = started
     rng = random.Random()
     try:
-        while time.monotonic() - started < duration:
+        while time.monotonic() - started < duration and not (stop_event and stop_event.is_set()):
             sample_started = time.monotonic()
             with QMPConnection(qmp_socket) as qmp:
                 status = qmp.execute("query-status")["return"]
@@ -80,6 +83,11 @@ def sample_profile(qmp_socket, symbols, *, duration=15.0, interval=0.02,
                 now = time.monotonic()
                 if status.get("running"):
                     if now >= next_counters:
+                        for key, base in symbols.rebase_from_runtime_pointers(qmp.read_memory).items():
+                            if resolved_rebases.get(key) != base:
+                                resolved_rebases[key] = base
+                                functions, starts = make_index()
+                                addresses = {name: symbols[name] for name in selected}
                         for section, pointer in rebases:
                             base = qmp.u32(symbols[pointer])
                             if base and resolved_rebases.get(section) != base:
@@ -137,9 +145,115 @@ def sample_profile(qmp_socket, symbols, *, duration=15.0, interval=0.02,
                        "percent": 100.0 * count / len(samples), "representative_pc": pc,
                        "sampled_pcs": [{"pc": address, "samples": hits}
                                        for address, hits in pcs[key].most_common()]})
-    for row in ranked[:20]:
-        if row["function"]:
-            row["source"] = symbols.source_location(row["representative_pc"])
+    named = [row for row in ranked[:20] if row["function"]]
+    sources = symbols.source_locations([row["representative_pc"] for row in named])
+    for row, source in zip(named, sources):
+        row["source"] = source
+
+    # Consecutive PC snapshots in one symbol are an estimate of routine
+    # residency, not proof that the CPU remained in the routine continuously.
+    # QMP latency and intervening unsampled execution limit the precision.
+    max_sample_gap = max(interval * 3.0, 0.1)
+    residency = []
+    ordered_samples = sorted(samples, key=lambda sample: sample["elapsed"])
+    run = []
+    run_key = None
+    for sample in ordered_samples:
+        key = sample_key(sample)
+        if run and (key != run_key or sample["elapsed"] - run[-1]["elapsed"] > max_sample_gap):
+            if len(run) > 1:
+                residency.append((run[-1]["elapsed"] - run[0]["elapsed"], run))
+            run = []
+        if not run:
+            run_key = key
+        run.append(sample)
+    if len(run) > 1:
+        residency.append((run[-1]["elapsed"] - run[0]["elapsed"], run))
+    def residency_record(span, run):
+        return {
+            "function": run[0]["function"], "symbol_source": run[0]["symbol_source"],
+            "pc": run[0]["pc"], "start_elapsed": run[0]["elapsed"],
+            "end_elapsed": run[-1]["elapsed"], "observed_span_seconds": span,
+            "sample_count": len(run), "max_sample_gap_seconds": max(
+                (b["elapsed"] - a["elapsed"] for a, b in zip(run, run[1:])), default=0.0)}
+
+    routine_residency = [residency_record(span, run) for span, run in
+                         sorted(residency, key=lambda item: (item[0], len(item[1])), reverse=True)[:20]]
+    # Summarize both the longest observed same-function interval and the sum
+    # of all such intervals per function. This helps attribute apparent freezes
+    # while keeping the sampling limitation explicit: time between snapshots
+    # is observed residency, not proof of uninterrupted execution.
+    residency_by_function = {}
+    for span, run in residency:
+        first = run[0]
+        key = sample_key(first)
+        summary = residency_by_function.setdefault(key, {
+            "function": first["function"], "symbol_source": first["symbol_source"],
+            "label": first["function"] or f"0x{first['pc']:08x}",
+            "max_observed_span_seconds": 0.0, "total_observed_span_seconds": 0.0,
+            "observed_runs": 0, "samples_in_runs": 0,
+        })
+        summary["max_observed_span_seconds"] = max(summary["max_observed_span_seconds"], span)
+        summary["total_observed_span_seconds"] += span
+        summary["observed_runs"] += 1
+        summary["samples_in_runs"] += len(run)
+    routine_residency_by_function = sorted(
+        residency_by_function.values(),
+        key=lambda item: (item["max_observed_span_seconds"], item["total_observed_span_seconds"]),
+        reverse=True)
+    for item in routine_residency_by_function:
+        item["max_observed_span_percent_of_profile"] = (
+            item["max_observed_span_seconds"] / elapsed * 100 if elapsed > 0 else 0.0)
+        item["total_observed_span_percent_of_profile"] = (
+            item["total_observed_span_seconds"] / elapsed * 100 if elapsed > 0 else 0.0)
+    # A routine-stall candidate is a long same-function run in sampled PCs.
+    # This estimates how long execution stayed in that function; it cannot
+    # establish that interrupts or unobserved calls did not run between polls.
+    routine_stalls = [residency_record(span, run) for span, run in
+                      sorted((item for item in residency if item[0] >= stall_threshold),
+                             key=lambda item: (item[0], len(item[1])), reverse=True)]
+
+    # Counters are intentionally sampled once per second to keep QMP overhead
+    # bounded. A zero-delta interval is therefore a coarse stall indication.
+    stalls = []
+    if counters and selected:
+        for name in selected:
+            segments = []
+            active = []
+            for previous, current in zip(counters, counters[1:]):
+                gap = current["elapsed"] - previous["elapsed"]
+                delta = (current["values"][name] - previous["values"][name]) & 0xffffffff
+                if gap <= 0 or gap > 2.5:
+                    if active:
+                        segments.append(active)
+                        active = []
+                elif delta == 0:
+                    if not active:
+                        active = [previous]
+                    active.append(current)
+                elif active:
+                    segments.append(active)
+                    active = []
+            if active:
+                segments.append(active)
+            for segment in segments:
+                span = segment[-1]["elapsed"] - segment[0]["elapsed"]
+                if span < stall_threshold:
+                    continue
+                nearby = [sample for sample in ordered_samples
+                          if segment[0]["elapsed"] <= sample["elapsed"] <= segment[-1]["elapsed"]]
+                routines = Counter(sample["function"] or f"0x{sample['pc']:08x}" for sample in nearby)
+                stalls.append({"counter": name, "start_elapsed": segment[0]["elapsed"],
+                               "end_elapsed": segment[-1]["elapsed"], "duration_seconds": span,
+                               "counter_resolution_seconds": max(
+                                   (b["elapsed"] - a["elapsed"] for a, b in zip(segment, segment[1:])),
+                                   default=None),
+                               "sample_count": len(nearby),
+                               "dominant_routines": [{"function": function, "samples": count,
+                                                      "percent": count * 100 / len(nearby)}
+                                                     for function, count in routines.most_common(5)]
+                               if nearby else []})
+    stalls.sort(key=lambda item: item["duration_seconds"], reverse=True)
     progress = {}
     for name in selected:
         if len(counters) < 2:
@@ -163,7 +277,28 @@ def sample_profile(qmp_socket, symbols, *, duration=15.0, interval=0.02,
         "Function percentages are PC sample shares, not exact cycle counts.",
         "QMP synchronizes with QEMU; samples can overrepresent MMIO and interrupt boundaries.",
         "DWT observations are raw counter values; firmware may reset them and GWemu timing depends on its build.",
+        "Routine residency and progress stalls are sampled estimates; counter stalls have roughly one-second resolution and do not prove a routine blocked the system.",
     ]
+    dwt_ctrl_values = sorted({item["dwt_ctrl"] for item in counters})
+    dwt_enable_states = {bool(value & 1) for value in dwt_ctrl_values}
+    if not counters:
+        dwt_status = "unobserved"
+    elif dwt_enable_states == {True}:
+        dwt_status = "enabled"
+    elif dwt_enable_states == {False}:
+        dwt_status = "disabled"
+    else:
+        dwt_status = "mixed"
+    dwt_values = [item["dwt_cyccnt"] for item in counters]
+    dwt_cycle_counter = {
+        "status": dwt_status,
+        "ctrl_values": dwt_ctrl_values,
+        "counter_changed_between_observations": (
+            any(a != b for a, b in zip(dwt_values, dwt_values[1:]))
+            if len(dwt_values) > 1 else None),
+    }
+    if dwt_status == "disabled":
+        warnings.append("DWT CYCCNT is disabled (DWT_CTRL.CYCCNTENA=0); raw CYCCNT values are not elapsed cycle measurements.")
     if any(state != "running" for state in states):
         warnings.append("Paused/stopped states were observed; hotspot samples cover running snapshots only.")
     if io_seconds / elapsed > 0.1:
@@ -171,7 +306,7 @@ def sample_profile(qmp_socket, symbols, *, duration=15.0, interval=0.02,
     unresolved = sum(sample["function"] is None for sample in samples)
     if unresolved:
         warnings.append(f"{unresolved} samples are outside loaded function ranges; check symbols/rebasing.")
-    return {"schema_version": 1, "method": "qmp-native-pc-sampling",
+    return {"schema_version": 2, "method": "qmp-native-pc-sampling",
             "started_at": started_at, "duration_seconds": elapsed,
             "requested_interval_seconds": interval, "interrupted": interrupted,
             "sample_count": len(samples), "unresolved_samples": unresolved,
@@ -181,13 +316,20 @@ def sample_profile(qmp_socket, symbols, *, duration=15.0, interval=0.02,
             "emulator_cpu_seconds": cpu_seconds,
             "emulator_cpu_percent": cpu_seconds / elapsed * 100 if cpu_seconds is not None else None,
             "states": dict(states), "rebased_sections": resolved_rebases,
-            "progress": progress, "functions": ranked, "raw_samples": samples,
+            "stopped_early": bool(stop_event and stop_event.is_set()),
+            "dwt_cycle_counter": dwt_cycle_counter,
+            "progress": progress, "routine_residency": routine_residency,
+            "routine_residency_by_function": routine_residency_by_function,
+            "routine_stalls": routine_stalls,
+            "progress_stalls": stalls, "stall_threshold_seconds": stall_threshold,
+            "functions": ranked, "raw_samples": samples,
             "counter_observations": counters, "warnings": warnings}
 
 
 def profile_instance(profile, *, duration=15.0, interval=0.02, symbols=None,
                      progress_symbols=None, rebase_symbols=None, output=None,
-                     output_format="text", top=20, debug_config=None) -> int:
+                     output_format="text", top=20, debug_config=None,
+                     stall_threshold=1.0) -> int:
     from .debug_shell import SymbolTable
     from .gwemu_manager import instances, screenshot_qmp, _process_scan_restriction
     from .profiles import DeviceProfile
@@ -227,7 +369,8 @@ def profile_instance(profile, *, duration=15.0, interval=0.02, symbols=None,
     screenshot_before = screenshot_qmp(row["qmpSocket"], destination.with_name(destination.stem + "-before.png"))
     report = sample_profile(row["qmpSocket"], table, duration=duration, interval=interval,
                             progress_symbols=progress_symbols, rebase_symbols=rebase_symbols,
-                            process=psutil.Process(row["pid"]))
+                            process=psutil.Process(row["pid"]),
+                            stall_threshold=stall_threshold)
     report.update({"pid": row["pid"], "profile": str(device.root), "debug_configuration": settings,
                    "symbols": [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                for path in dict.fromkeys(paths)],
@@ -242,9 +385,34 @@ def profile_instance(profile, *, duration=15.0, interval=0.02, symbols=None,
             print(f"GWemu CPU: {report['emulator_cpu_percent']:.1f}%; "
                   f"QMP request wall time: {report['qmp_request_wall_percent']:.1f}%")
         print("VM states:", dict(report["states"]))
+        dwt = report["dwt_cycle_counter"]
+        ctrl = ", ".join(f"0x{value:08x}" for value in dwt["ctrl_values"]) or "unobserved"
+        print(f"DWT CYCCNT: {dwt['status']} (DWT_CTRL {ctrl})")
         print("  SAMPLE %   HITS  FUNCTION")
         for item in report["functions"][:top]:
             print(f"  {item['percent']:8.2f} {item['samples']:6d}  {item['label']}")
+        print("Longest per-routine observed residency (estimated from same-function samples):")
+        for item in report["routine_residency_by_function"][:10]:
+            print(f"  max {item['max_observed_span_seconds']:7.3f}s; "
+                  f"total {item['total_observed_span_seconds']:7.3f}s across "
+                  f"{item['observed_runs']} runs ({item['total_observed_span_percent_of_profile']:.1f}% of profile)  "
+                  f"{item['label']}")
+        if report["routine_stalls"]:
+            print(f"Routine-stall candidates (same function across samples for >= {stall_threshold:.2f}s):")
+            for item in report["routine_stalls"][:10]:
+                label = item["function"] or f"0x{item['pc']:08x}"
+                print(f"  {item['observed_span_seconds']:7.3f}s {item['sample_count']:5d} samples  "
+                      f"max gap {item['max_sample_gap_seconds']:.3f}s  {label}")
+        else:
+            print(f"No routine-stall candidates >= {stall_threshold:.2f}s observed.")
+        if report["progress_stalls"]:
+            print("Progress counter stalls (coarse; routine samples are correlated by time):")
+            for item in report["progress_stalls"][:10]:
+                dominant = ", ".join(f"{row['function']} {row['percent']:.0f}%"
+                                     for row in item["dominant_routines"][:3]) or "no PC samples"
+                print(f"  {item['duration_seconds']:7.3f}s {item['counter']}: {dominant}")
+        else:
+            print(f"No progress counter stalls >= {stall_threshold:.2f}s observed.")
         for name, value in report["progress"].items():
             rate = value.get("per_wall_second")
             if rate is not None:

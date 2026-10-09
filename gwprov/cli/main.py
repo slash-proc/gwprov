@@ -176,7 +176,8 @@ def _gwemu_profile(args) -> int:
     return profile_instance(args.profile, duration=args.duration, interval=args.interval,
                             symbols=args.symbols, progress_symbols=args.progress_symbol,
                             rebase_symbols=args.rebase, output=args.output,
-                            output_format=args.format, top=args.top, debug_config=args.debug_config)
+                            output_format=args.format, top=args.top, debug_config=args.debug_config,
+                            stall_threshold=args.stall_threshold)
 
 
 def _gwemu_diagnose(args) -> int:
@@ -206,7 +207,8 @@ def _gwemu_watch(args) -> int:
 def _debug_gwemu(args) -> int:
     from gwprov.debug import debug_profile
     return debug_profile(args.profile, gdb_port=args.gdb_port,
-                         qmp_socket=args.qmp_socket,
+                         headless=args.headless,
+                         qmp_socket=args.qmp_socket, qmp_enabled=not args.no_qmp,
                          symbols=args.symbols, gdb=args.gdb,
                          audio=args.audio, break_on_fault=not args.no_break_on_fault,
                          unpause_homebrew=args.unpause_homebrew,
@@ -214,6 +216,52 @@ def _debug_gwemu(args) -> int:
                          detach_after_app_entry=args.detach_after_app_entry,
                          keep_running=args.keep_running, timeline=args.timeline,
                          record_timeline=args.record_timeline)
+
+
+def _ps(args) -> int:
+    from gwprov.devices import show_devices
+    return show_devices(output=args.output, profile=args.profile)
+
+
+def _deploy_plan(args) -> int:
+    from gwprov.deploy import deployment_plan
+    plan = deployment_plan(args.profile, args.region)
+    if args.output == "json":
+        print(json.dumps(plan, indent=2))
+    else:
+        print(f"Deployment plan: {plan['profile']}")
+        for row in plan["regions"]:
+            destination = f"bank {row['bank']}+0x{row['offset']:x}" if "bank" in row else f"offset 0x{row['offset']:x}"
+            print(f"  {row['region']:<10} {row['bytes']:>10} bytes  {destination}  sha256={row['sha256']}")
+        print("Boot after deployment: bank 1 reset vector")
+        print("SD deployment overlays files and retains existing files.")
+    return 0
+
+
+def _deploy_apply(args) -> int:
+    from gwprov.deploy import apply_deployment
+    result = apply_deployment(args.profile, probe_id=args.probe_id, programmer=args.programmer,
+                              remote_url=args.remote_url, remote_origin=args.remote_origin,
+                              regions=args.region)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _profile_hardware(args) -> int:
+    from gwprov.hw_profile import profile_hardware
+    return profile_hardware(probe_id=args.probe_id, programmer=args.programmer,
+                            remote_url=args.remote_url,
+                            remote_origin=args.remote_origin, profile=args.profile,
+                            symbols=args.symbols, duration=args.duration,
+                            interval=args.interval, output=args.output,
+                            output_format=args.format, top=args.top)
+
+
+def _report_render(args) -> int:
+    from gwprov.reports import render_report
+    output = render_report(args.input, args.output, format=args.format)
+    print(f"Rendered {args.format.upper()} report: {output}")
+    return 0
 
 
 def _debug_python(args) -> int:
@@ -229,7 +277,10 @@ def _debug_python(args) -> int:
         app_symbols = sorted((firmware_symbols.parent / "apps").rglob("*.elf"))
         symbol_paths[1:1] = [str(path) for path in app_symbols]
     return python_shell(target=args.target, host=args.host, port=args.port,
-                        openocd_port=args.openocd_port, symbols=symbol_paths,
+                        openocd_port=args.openocd_port, probe_ids=args.probe_id,
+                        programmers=args.programmer, remote_urls=args.remote_url,
+                        remote_origins=args.remote_origin,
+                        symbols=symbol_paths,
                         qmp_socket=args.qmp_socket, debug_config=args.debug_config)
 
 
@@ -303,7 +354,8 @@ def _media_inventory(args) -> int:
         if not args.filesystem:
             raise ValueError('--image requires --filesystem')
         if args.filesystem == 'littlefs':
-            if not args.size: raise ValueError('LittleFS inventory requires --size')
+            if not args.size:
+                raise ValueError('LittleFS inventory requires --size')
             entry = littlefs(image, args.offset, args.size, args.block_size)
         else:
             entry = (frogfs if args.filesystem == 'frogfs' else fatfs)(image, args.offset)
@@ -567,12 +619,12 @@ _gwprov_complete() {
       gwemu:pause|gwemu:resume) candidates="--profile" ;;
       gwemu:ps) candidates="--output" ;;
       gwemu:screenshot) candidates="--profile --pid --output" ;;
-      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --rebase --debug-config --output --format --top" ;;
+      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --stall-threshold --rebase --debug-config --output --format --top" ;;
       gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes --debug-config" ;;
       gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --interval --stall-after --duration --output --debug-config" ;;
       gwemu:run) candidates="--profile --gdb-port --qmp-socket --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --record-timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
-      gwemu:debug) candidates="--profile --gdb-port --qmp-socket --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running --timeline --record-timeline" ;;
-      debug:python) candidates="--target --host --port --openocd-port --qmp-socket --profile --symbols --debug-config" ;;
+      gwemu:debug) candidates="--profile --gdb-port --headless --qmp-socket --no-qmp --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running --timeline --record-timeline" ;;
+      debug:python) candidates="--target --host --port --openocd-port --probe-id --programmer --remote-url --remote-origin --qmp-socket --profile --symbols --debug-config" ;;
       media:inventory) candidates="--profile --image --filesystem --offset --size --block-size --shared-sd-root --output" ;;
       media:compare) candidates="--mode" ;;
       profile:stock) candidates="--backup-dir --locked --model --extflash-mib" ;;
@@ -649,12 +701,12 @@ _gwprov() {
       gwemu:pause|gwemu:resume) candidates="--profile" ;;
       gwemu:ps) candidates="--output" ;;
       gwemu:screenshot) candidates="--profile --pid --output" ;;
-      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --rebase --debug-config --output --format --top" ;;
+      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --stall-threshold --rebase --debug-config --output --format --top" ;;
       gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes --debug-config" ;;
       gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --interval --stall-after --duration --output --debug-config" ;;
       gwemu:run) candidates="--profile --gdb-port --qmp-socket --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --record-timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
-      gwemu:debug) candidates="--profile --gdb-port --qmp-socket --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running --timeline --record-timeline" ;;
-      debug:python) candidates="--target --host --port --openocd-port --qmp-socket --profile --symbols --debug-config" ;;
+      gwemu:debug) candidates="--profile --gdb-port --headless --qmp-socket --no-qmp --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running --timeline --record-timeline" ;;
+      debug:python) candidates="--target --host --port --openocd-port --probe-id --programmer --remote-url --remote-origin --qmp-socket --profile --symbols --debug-config" ;;
       media:inventory) candidates="--profile --image --filesystem --offset --size --block-size --shared-sd-root --output" ;;
       media:compare) candidates="--mode" ;;
       profile:stock) candidates="--backup-dir --locked --model --extflash-mib" ;;
@@ -692,6 +744,28 @@ def _command_tree(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gwprov", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    ps = commands.add_parser("ps", help="list GWemu instances and local hardware probes")
+    ps.add_argument("--output", choices=("text", "json"), default="text")
+    ps.add_argument("--profile", help="load firmware/app symbols for physical Application state")
+    ps.set_defaults(handler=_ps)
+    deploy = commands.add_parser("deploy", help="plan and provision a physical Game & Watch")
+    deploy_commands = deploy.add_subparsers(dest="deploy_command", required=True)
+    deploy_plan = deploy_commands.add_parser("plan", help="show exact bank and filesystem writes")
+    deploy_plan.add_argument("--profile", required=True)
+    deploy_plan.add_argument("--region", action="append", choices=("bank1", "bank2", "frogfs", "littlefs", "extflash", "sd"))
+    deploy_plan.add_argument("--output", choices=("text", "json"), default="text")
+    deploy_plan.set_defaults(handler=_deploy_plan)
+    deploy_apply = deploy_commands.add_parser("apply", help="write selected profile regions to hardware")
+    deploy_apply.add_argument("--profile", required=True)
+    deploy_target = deploy_apply.add_mutually_exclusive_group()
+    deploy_target.add_argument("--probe-id", help="select a local PyOCD probe by unique ID")
+    deploy_target.add_argument("--programmer", choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"),
+                              help="select one local OpenOCD adapter explicitly")
+    deploy_target.add_argument("--remote-url", help="use one gnwmanager serve URL")
+    deploy_apply.add_argument("--remote-origin", help="Origin required by the selected remote server")
+    deploy_apply.add_argument("--region", action="append", choices=("bank1", "bank2", "frogfs", "littlefs", "extflash", "sd"),
+                              help="region to deploy; repeatable, defaults to all profile regions")
+    deploy_apply.set_defaults(handler=_deploy_apply)
     tree = commands.add_parser("tree", help="list all commands and their short descriptions")
     tree.set_defaults(handler=_command_tree)
     completion = commands.add_parser("completion", help="print shell completion setup")
@@ -707,6 +781,15 @@ def build_parser() -> argparse.ArgumentParser:
     python_debug.add_argument("--port", type=int, default=1234,
                               help="GWemu GDB port (default: 1234)")
     python_debug.add_argument("--openocd-port", type=int, default=6666)
+    python_debug.add_argument("--probe-id", action="append", default=[],
+                              help="select a local PyOCD probe by unique ID (repeatable)")
+    python_debug.add_argument("--programmer", action="append", default=[],
+                              choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"),
+                              help="start an explicit OpenOCD adapter session (repeatable by type)")
+    python_debug.add_argument("--remote-url", action="append", default=[],
+                              help="connect to one gnwmanager serve URL; repeat for independent servers")
+    python_debug.add_argument("--remote-origin", action="append", default=[],
+                              help="Origin header for the corresponding remote URL (repeatable)")
     python_debug.add_argument("--qmp-socket", help="GWemu QMP socket for screendump support")
     python_debug.add_argument("--debug-config", help="local ELF/map, relocation and counter descriptor")
     python_debug.add_argument("--profile", help="load the profile's bundled official Retro-Go ELF symbols")
@@ -843,6 +926,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="sample interval in wall seconds, with jitter (default: 0.02)")
     profiler.add_argument("--progress-symbol", action="append", metavar="SYMBOL",
                           help="32-bit progress counter; default: discover common counter names")
+    profiler.add_argument("--stall-threshold", type=float, default=1.0,
+                          help="minimum duration in seconds for reporting a flat progress counter (default: 1.0)")
     profiler.add_argument("--rebase", action="append", default=[], metavar="SECTION=POINTER_SYMBOL",
                           help="map a linked section to its current runtime address")
     profiler.add_argument("--output", help="JSON report path; defaults under profile runtime")
@@ -854,7 +939,7 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose = gwemu_commands.add_parser(
         "diagnose", help="capture a running profile's screen and symbol-resolved call stack")
     diagnose.add_argument("--profile", required=True,
-                          help="profile directory of the running visible GWemu instance")
+                          help="profile directory of the running GWemu instance")
     diagnose.add_argument("--symbols", action="append", default=[], metavar="ELF",
                           help="additional app ELF symbols (repeatable)")
     diagnose.add_argument("--debug-config", help="shared local port debug descriptor")
@@ -923,10 +1008,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--stdio-gdb", action="store_true")
     run.set_defaults(handler=_run_gwemu)
 
-    debug = gwemu_commands.add_parser("debug", help="run visible GWemu under GDB with bundled firmware symbols")
+    debug = gwemu_commands.add_parser("debug", help="run GWemu under GDB with bundled firmware symbols")
     debug.add_argument("--profile", required=True)
     debug.add_argument("--gdb-port", type=int, default=1234)
-    debug.add_argument("--qmp-socket", help="optional QMP UNIX socket for screenshots and emulator controls")
+    debug.add_argument("--headless", action="store_true",
+                        help="run without a display window")
+    qmp_options = debug.add_mutually_exclusive_group()
+    qmp_options.add_argument("--qmp-socket", help="custom QMP UNIX socket path (enabled by default)")
+    qmp_options.add_argument("--no-qmp", action="store_true",
+                             help="disable the default QMP endpoint")
     debug.add_argument("--symbols", help="override profile's matching firmware ELF")
     debug.add_argument("--gdb", help="GDB executable (defaults to arm-none-eabi-gdb or gdb-multiarch)")
     debug.add_argument("--audio", action="store_true")
@@ -1003,6 +1093,14 @@ def build_parser() -> argparse.ArgumentParser:
     tap.add_argument("--gap-ms", type=int, default=120)
     tap.set_defaults(handler=_input_tap)
 
+    reports = commands.add_parser("report", help="render structured reports for human review")
+    report_commands = reports.add_subparsers(dest="report_command", required=True)
+    render = report_commands.add_parser("render", help="render JSON as portable HTML or PDF")
+    render.add_argument("--input", required=True)
+    render.add_argument("--output", required=True)
+    render.add_argument("--format", choices=("html", "pdf"), required=True)
+    render.set_defaults(handler=_report_render)
+
     profile = commands.add_parser("profile", help="create and inspect provisioned GWemu instances")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True)
     create = profile_commands.add_parser("create", help="pack flash or SD content into a bootable GWemu instance")
@@ -1020,6 +1118,23 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--bootloader-version", default="v1.0.8", help="release tag or latest")
     create.add_argument("--bootloader-file", help="use a local binary linked at 0x08000000")
     create.set_defaults(handler=_profile_create)
+    hardware_profile = profile_commands.add_parser(
+        "hardware", help="profile routine cycles from a non-halting GWProv trace ring")
+    profile_target = hardware_profile.add_mutually_exclusive_group()
+    profile_target.add_argument("--probe-id", help="select one local PyOCD probe by unique ID")
+    profile_target.add_argument("--programmer", choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"),
+                                help="select one local OpenOCD adapter explicitly")
+    profile_target.add_argument("--remote-url", help="use one gnwmanager serve URL")
+    hardware_profile.add_argument("--remote-origin", help="Origin required by the selected remote server")
+    hardware_profile.add_argument("--profile", help="load firmware and app symbols from a device profile")
+    hardware_profile.add_argument("--symbols", action="append", default=[], metavar="ELF",
+                                  help="additional firmware/app ELF symbols")
+    hardware_profile.add_argument("--duration", type=float, default=10.0)
+    hardware_profile.add_argument("--interval", type=float, default=0.05)
+    hardware_profile.add_argument("--output", help="report path; default under dev-local/reports")
+    hardware_profile.add_argument("--format", choices=("text", "json", "html", "pdf"), default="text")
+    hardware_profile.add_argument("--top", type=int, default=10)
+    hardware_profile.set_defaults(handler=_profile_hardware)
     stock = profile_commands.add_parser("stock", help="create pristine stock media from hash-valid backups")
     stock.add_argument("directory")
     stock.add_argument("--backup-dir", action="append", required=True)

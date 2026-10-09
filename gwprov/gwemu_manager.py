@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import hashlib
 import os
-import re
 import socket
 import struct
 import tempfile
@@ -82,10 +82,16 @@ def _instance(pid: int, args: list[str]) -> dict[str, Any] | None:
         created = process.create_time()
     except psutil.Error:
         created = None
+    execution = _qmp_execution(qmp)
+    running = execution.get("running")
     return {
         "pid": pid,
         "profile": profile,
-        "status": _qmp_status(qmp) if qmp else "unknown (no QMP)",
+        "status": "running" if running is True else "halted" if running is False else "unknown",
+        "running": running,
+        "halted": not running if isinstance(running, bool) else None,
+        "qmpStatus": execution.get("status", "unknown"),
+        **({"stateDetail": execution["detail"]} if "detail" in execution else {}),
         "display": "visible" if _option(args, "-display") == "gwemu" else "headless",
         "gdbPort": gdb_port,
         "qmpSocket": qmp,
@@ -93,29 +99,36 @@ def _instance(pid: int, args: list[str]) -> dict[str, Any] | None:
     }
 
 
-def _qmp_status(path: str | None) -> str:
-    if not path or not Path(path).exists():
-        return "unavailable"
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
+def _qmp_execution(path: str | None) -> dict:
+    """Read actual CPU execution state; a debugger connection is not a state."""
+    if not path:
+        return {"status": "unavailable", "running": None,
+                "detail": "QMP endpoint is missing; execution state cannot be verified"}
     try:
-        sock.connect(path)
-        stream = sock.makefile("rwb", buffering=0)
-        stream.readline()  # QMP greeting
-        stream.write(b'{"execute":"qmp_capabilities"}\r\n')
-        stream.readline()
-        stream.write(b'{"execute":"query-status"}\r\n')
-        reply = json.loads(stream.readline())
-        return str(reply.get("return", {}).get("status", "unknown"))
-    except PermissionError as exc:
-        raise PermissionError(
-            f"cannot query GWemu QMP socket {path!r}: the sandbox denied AF_UNIX "
-            "socket access; grant socket-connect access or run gwprov outside it"
-        ) from exc
-    except (OSError, ValueError, json.JSONDecodeError):
-        return "unavailable"
-    finally:
-        sock.close()
+        endpoint_exists = Path(path).exists()
+    except PermissionError:
+        raise
+    except OSError as exc:
+        return {"status": "unavailable", "running": None,
+                "detail": f"QMP endpoint cannot be checked: {exc}"}
+    if not endpoint_exists:
+        return {"status": "unavailable", "running": None,
+                "detail": "QMP endpoint is missing; execution state cannot be verified"}
+    from .qmp import QMPConnection
+    try:
+        with QMPConnection(path, timeout=0.5) as qmp:
+            state = qmp.execute("query-status")["return"]
+        if not isinstance(state.get("running"), bool):
+            raise RuntimeError("query-status omitted the boolean running field")
+        return state
+    except PermissionError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"status": "unavailable", "running": None, "detail": str(exc)}
+
+
+def _qmp_status(path: str | None) -> str:
+    return str(_qmp_execution(path).get("status", "unavailable"))
 
 
 def _qmp_execute(path: str, command: str, arguments: dict[str, Any] | None = None) -> dict:
@@ -443,7 +456,7 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
         for section, pointer_symbol in rebase_specs:
             try:
                 session.at(pointer_symbol)
-                owner = session.symbols.owner(pointer_symbol)
+                session.symbols.owner(pointer_symbol)
             except KeyError as exc:
                 raise ValueError(f"rebase pointer symbol {pointer_symbol!r} is not loaded") from exc
             if not any(section in session.symbols.sections(path) for path in session.symbols.sources):
@@ -744,29 +757,14 @@ def _qmp_registers(path: str) -> dict[str, int]:
         return qmp.registers()
 
 
-def _application_state(row: dict[str, Any]) -> str:
-    """Poll Retro-Go or app state using QMP and the profile's official ELF symbols."""
-    from .debug_shell import SymbolTable
-
-    qmp = row.get("qmpSocket")
-    if not qmp:
-        raise RuntimeError("GWemu has no QMP socket; application state cannot be polled")
-    root = Path(row["profile"]) if row.get("profile") else None
-    firmware = root / "debug" / "retro-go-debug.elf" if root else None
-    if not firmware or not firmware.is_file():
-        return "Unknown"
-
-    symbol_table = SymbolTable()
-    symbol_table.load(firmware)
-    app_elfs = sorted((root / "debug" / "apps").rglob("*.elf"))
-    for elf in app_elfs:
-        symbol_table.load(elf)
-
-    registers = _qmp_registers(qmp)
+def _application_state_from_target(symbol_table, firmware: Path, app_elfs: list[Path],
+                                   read_memory, registers: dict[str, int]) -> str:
+    """Classify a paused target from shared Retro-Go and project ELF symbols."""
     pc = registers["pc"]
     frames = []
+    trace = {"frames": []}
     try:
-        trace = symbol_table.unwind(registers, lambda addr, size: _qmp_read_memory(qmp, addr, size), 16)
+        trace = symbol_table.unwind(registers, lambda addr, size: read_memory(addr, size), 16)
         for frame in trace.get("frames", []):
             symbol = frame.get("symbol")
             if symbol:
@@ -786,23 +784,8 @@ def _application_state(row: dict[str, Any]) -> str:
     if fatal_names:
         return "Fault: " + ", ".join(fatal_names)
 
-    # App projects may export a writable NUL-terminated char array with this
-    # name. It is read directly from the app ELF, so custom state text needs no
-    # per-project code in gwprov and does not depend on relocated pointers.
-    for elf in reversed(app_elfs):
-        state_symbol = next((item for item in symbol_table.nm("gwprov_application_state", elf)
-                             if item["name"] == "gwprov_application_state"), None)
-        if state_symbol and state_symbol["size"] >= 2:
-            section = state_symbol.get("section")
-            sections = symbol_table.sections(elf)
-            if section and section in sections and sections[section][0] <= (pc & ~1) < sum(sections[section]):
-                raw = _qmp_read_memory(qmp, state_symbol["address"], min(state_symbol["size"], 64))
-                custom = raw.split(b"\0", 1)[0].decode("utf-8", errors="replace").strip()
-                if custom and all(char.isprintable() for char in custom):
-                    return custom
-
-    if "run_gwhb_homebrew" in active_names or "run_homebrew" in active_names:
-        return "Starting"
+    if "handle_time_menu" in active_names:
+        return "Time settings menu"
     if "odroid_overlay_game_menu" in active_names:
         return "Game menu"
     if "odroid_overlay_game_settings_menu" in active_names:
@@ -816,6 +799,24 @@ def _application_state(row: dict[str, Any]) -> str:
             return "Overlay open in picker"
         return "Overlay open in game"
 
+    # App projects may export a writable NUL-terminated char array with this
+    # name. It is read directly from the app ELF, so custom state text needs no
+    # per-project code in gwprov and does not depend on relocated pointers.
+    for elf in reversed(app_elfs):
+        state_symbol = next((item for item in symbol_table.nm("gwprov_application_state", elf)
+                             if item["name"] == "gwprov_application_state"), None)
+        if state_symbol and state_symbol["size"] >= 2:
+            # The state array lives in data/BSS, not executable code. Prove
+            # the app is active from the current PC or its caller frames.
+            app_active = (current and current.get("elf") == str(elf)) or any(
+                (frame.get("symbol") or {}).get("elf") == str(elf)
+                for frame in trace.get("frames", []))
+            if app_active:
+                raw = read_memory(state_symbol["address"], min(state_symbol["size"], 64))
+                custom = raw.split(b"\0", 1)[0].decode("utf-8", errors="replace").strip()
+                if custom and all(char.isprintable() for char in custom):
+                    return custom
+
     # Retro-Go's GUI is a runtime tab registry. DWARF keeps this compatible
     # with firmware releases that change the layout of gui and tab_t.
     gui_address = next((item["address"] for item in symbol_table.nm()
@@ -824,13 +825,13 @@ def _application_state(row: dict[str, Any]) -> str:
     tab_members = _dwarf_typedef_members(firmware, "tab_t")
     in_picker = any(name == "retro_loop" or name.startswith("gui_") for name in active_names)
     if in_picker and gui_address is not None and {"tabs", "selected"}.issubset(gui_members) and "name" in tab_members:
-        gui_head = _qmp_read_memory(qmp, gui_address, max(gui_members.values()) + 4)
+        gui_head = read_memory(gui_address, max(gui_members.values()) + 4)
         tabs_ptr = int.from_bytes(gui_head[gui_members["tabs"]:gui_members["tabs"] + 4], "little")
         selected = int.from_bytes(gui_head[gui_members["selected"]:gui_members["selected"] + 4], "little", signed=True)
         if tabs_ptr and 0 <= selected < 32:
-            tab_ptr = int.from_bytes(_qmp_read_memory(qmp, tabs_ptr + selected * 4, 4), "little")
+            tab_ptr = int.from_bytes(read_memory(tabs_ptr + selected * 4, 4), "little")
             if tab_ptr:
-                tab_name = _qmp_read_memory(qmp, tab_ptr + tab_members["name"], 64).split(b"\0", 1)[0]
+                tab_name = read_memory(tab_ptr + tab_members["name"], 64).split(b"\0", 1)[0]
                 label = tab_name.decode("utf-8", errors="replace").strip()
             else:
                 label = ""
@@ -843,15 +844,48 @@ def _application_state(row: dict[str, Any]) -> str:
     function_names = {name for name in active_names if name}
     if current and current["elf"] != str(firmware):
         return "Running"
+    if function_names & {"run_gwhb_homebrew", "run_homebrew"}:
+        return "Starting"
     if function_names & {"app_main", "main"}:
         return "Running"
-    if "main" in active_names:
-        return "Starting"
-    return "Initializing"
+    if current or function_names:
+        return "Initializing"
+    return "Unknown"
+
+
+def _application_state(row: dict[str, Any]) -> str:
+    """Poll Retro-Go or app state using QMP and the profile's official ELF symbols."""
+    from .debug_shell import SymbolTable
+
+    qmp = row.get("qmpSocket")
+    if not qmp:
+        raise RuntimeError("GWemu has no QMP socket; application state cannot be polled")
+    root = Path(row["profile"]) if row.get("profile") else None
+    firmware = root / "debug" / "retro-go-debug.elf" if root else None
+    if not firmware or not firmware.is_file():
+        return "Unknown"
+
+    symbol_table = SymbolTable()
+    symbol_table.load(firmware)
+    app_elfs = sorted((root / "debug" / "apps").rglob("*.elf"))
+    for elf in app_elfs:
+        symbol_table.load(elf)
+    def read_memory(address, size):
+        return _qmp_read_memory(qmp, address, size)
+    symbol_table.rebase_from_runtime_pointers(read_memory)
+    registers = _qmp_registers(qmp)
+    return _application_state_from_target(symbol_table, firmware, app_elfs,
+                                          read_memory, registers)
+
 
 
 def show_instances(*, output: str = "text") -> int:
     rows = instances()
+    if not rows:
+        restriction = _process_scan_restriction()
+        if restriction:
+            raise RuntimeError("cannot confirm whether GWemu is running: process scan is "
+                               f"restricted ({restriction}); grant PID namespace visibility")
     for row in rows:
         try:
             row["application"] = _application_state(row)
@@ -875,7 +909,9 @@ def show_instances(*, output: str = "text") -> int:
         for row in rows:
             print(f"{row['pid']:<7} {row['status']:<11} {row['display']:<8} "
                   f"{row['gdbPort'] or '-':<5} {row['application']:<22} {row['profile'] or '-'}")
-    return 0
+            if row["running"] is None:
+                print(f"  Cannot verify execution: {row.get('stateDetail', 'QMP state unknown')}")
+    return 2 if any(row["running"] is None for row in rows) else 0
 
 
 def stop_instance(*, pid: int | None = None, profile: str | None = None,
@@ -911,9 +947,14 @@ def stop_instance(*, pid: int | None = None, profile: str | None = None,
                 stream.readline()
             except OSError:
                 pass
-        except (FileNotFoundError, ConnectionRefusedError):
-            # QMP may be missing after a sandboxed launch attempt removed its
-            # endpoint. SIGTERM is a graceful fallback; never force-kill here.
+        except OSError as exc:
+            path_too_long = exc.errno == errno.ENAMETOOLONG or \
+                "AF_UNIX path too long" in str(exc)
+            if exc.errno not in (errno.ENOENT, errno.ECONNREFUSED) and not path_too_long:
+                raise
+            # QMP may be missing, refused, or impossible to address because
+            # its Unix path exceeded the platform limit. SIGTERM is a graceful
+            # fallback; never force-kill here.
             qmp_missing = True
         finally:
             sock.close()
@@ -950,6 +991,14 @@ def set_instance_running(profile: str, *, running: bool) -> int:
         return 0
     command = "cont" if running else "stop"
     _qmp_execute(row["qmpSocket"], command)
+    deadline = time.monotonic() + 2.0
+    while True:
+        observed = _qmp_execution(row["qmpSocket"])
+        if observed.get("running") is running:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"QMP {command} did not establish the requested execution state: {observed}")
+        time.sleep(0.05)
     print(f"GWemu pid {row['pid']} {'resumed' if running else 'paused'}.")
     return 0
 

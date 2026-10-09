@@ -142,14 +142,30 @@ def create_profile(directory: str | Path, *, content: str | Path,
                      '--no-gencovers']
         for item in ('bios', 'covers', 'fonts', 'roms'):
             frog_args.extend(['--include', item])
+        # Raw ROM extensions are filtered from /homebrews by default. Preserve
+        # only paths explicitly owned by a GWRG homebrew install manifest.
+        raw_rom_extensions = {'.sfc', '.smc', '.fig', '.swc'}
+        for project in projects.values():
+            for relative in project.get('files', []):
+                parts = Path(relative).parts
+                if (len(parts) >= 3 and parts[0] == 'frogfs' and
+                        parts[1] == 'homebrews' and
+                        Path(parts[-1]).suffix.casefold() in raw_rom_extensions):
+                    rom_path = Path(*parts[2:])
+                    if rom_path.is_absolute() or '..' in rom_path.parts:
+                        raise ValueError(f'invalid project-owned homebrew ROM path: {relative!r}')
+                    frog_args.extend(['--include-homebrew-rom', rom_path.as_posix()])
         for item in mapped:
             path = Path(item['path'])
-            if not path.parts or path.parts[0] != 'cores' or '..' in path.parts or path.is_absolute():
+            if (not path.parts or path.parts[0] not in {'cores', 'homebrews'}
+                    or '..' in path.parts or path.is_absolute()):
                 raise ValueError(f'invalid mapped artifact path: {path}')
             base = item['relocBase']
-            if isinstance(base, str): base = int(base, 0)
-            if not isinstance(base, int): raise ValueError('mapped artifact has no relocation base')
-            frog_args.extend(['--mapped-artifact', f"{frogfs_tree/path}:{path.relative_to('cores')}:{base}"])
+            if isinstance(base, str):
+                base = int(base, 0)
+            if not isinstance(base, int):
+                raise ValueError('mapped artifact has no relocation base')
+            frog_args.extend(['--mapped-artifact', f"{frogfs_tree/path}:{path}:{base}"])
         if gen_frogfs_image.main(frog_args):
             raise ValueError('FrogFS build failed')
         littlefs_tree.mkdir(parents=True, exist_ok=True)
@@ -157,7 +173,8 @@ def create_profile(directory: str | Path, *, content: str | Path,
         lfs_args = [*common, '--sd-content', str(littlefs_tree), '--output', str(work/'littlefs.bin'),
                     '--build-dir', str(work/'littlefs-build'), '--size', str(littlefs_size),
                     '--block-size', str(metadata['littlefsBlockSize']), '--no-cores-filter']
-        for item in ('cores', 'lang', 'data'):lfs_args.extend(['--include', item])
+        for item in ('cores', 'lang', 'data'):
+            lfs_args.extend(['--include', item])
         config_file = littlefs_tree / 'CONFIG'
         if config_file.is_file():
             lfs_args.extend(['--include-root-file', 'CONFIG'])
@@ -171,16 +188,20 @@ def create_profile(directory: str | Path, *, content: str | Path,
         firmware = patch_layout((source/'firmware/intflash.bin').read_bytes(),
                                 metadata['firmware']['superblock'], frogfs_length=len(frogfs),
                                 extflash_size=total, littlefs_length=littlefs_size)
-        if len(firmware) > BANK_SIZE:raise ValueError('firmware is larger than bank 2')
+        if len(firmware) > BANK_SIZE:
+            raise ValueError('firmware is larger than bank 2')
         instance = work/'instance'
         instance.mkdir()
         _write_profile_images(instance, source, metadata, bootloader, firmware)
         project_symbols = _copy_project_symbols(source, projects, instance)
         with (instance/'extflash.bin').open('wb') as output:
-            for _ in range(chip_mib):output.write(b'\xff'*MIB)
-            output.seek(0);output.write(frogfs)
+            for _ in range(chip_mib):
+                output.write(b'\xff'*MIB)
+            output.seek(0)
+            output.write(frogfs)
             output.seek(total-littlefs_size)
-            with (work/'littlefs.bin').open('rb') as packed:shutil.copyfileobj(packed,output)
+            with (work/'littlefs.bin').open('rb') as packed:
+                shutil.copyfileobj(packed, output)
         display_name = name or root.name
         _write_profile_config(instance, display_name, sd_mode='none')
         report = {'firmware': metadata, 'projects': projects,

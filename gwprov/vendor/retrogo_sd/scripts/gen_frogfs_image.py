@@ -121,6 +121,7 @@ def stage_input_dirs(
     stage_dir,
     roms_exclude_top=None,
     roms_skip_rel_paths=None,
+    homebrew_rom_paths=None,
     *,
     skip_bios_msx=False,
 ):
@@ -131,6 +132,7 @@ def stage_input_dirs(
 
     roms_exclude_top = roms_exclude_top or frozenset()
     roms_skip_rel_paths = roms_skip_rel_paths or frozenset()
+    homebrew_rom_paths = homebrew_rom_paths or frozenset()
     # SHA1-matched source ROMs under roms/homebrew → also skip when packing /homebrews.
     homebrews_skip_rels = frozenset(
         p.relative_to(pathlib.Path("homebrew"))
@@ -171,13 +173,15 @@ def stage_input_dirs(
                         continue
                     if dest == "homebrews" and rel_path in homebrews_skip_rels:
                         continue
-                    # Do not pack raw SNES ROMs into /homebrews (homebrew payloads only).
+                    # Raw ROMs are normally omitted from /homebrews. A project
+                    # install may explicitly declare one as a runtime asset;
+                    # gwprov passes only those owned paths from its manifest.
                     if dest == "homebrews" and path.suffix.lower() in (
                         ".sfc",
                         ".smc",
                         ".fig",
                         ".swc",
-                    ):
+                    ) and rel_path not in homebrew_rom_paths:
                         continue
                     if skip_roms_file_by_extension(dest, path, rel_path):
                         continue
@@ -211,6 +215,13 @@ def main(argv=None):
     parser.add_argument("--roms-dir", default="roms", help="Project root ROM directory to merge into /roms when present")
     parser.add_argument("--reserve-size", type=parse_int, default=0, help="Optional maximum reserved size in bytes")
     parser.add_argument(
+        "--include-homebrew-rom",
+        action="append",
+        default=[],
+        metavar="RELATIVE_PATH",
+        help="Keep this manifest-owned raw ROM under /homebrews (relative to that directory)",
+    )
+    parser.add_argument(
         "--no-gencovers",
         action="store_true",
         help="Do not run tools/gencovers.py; only sd_content/covers is used for /covers (if any).",
@@ -226,8 +237,9 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="SRC:DESTREL:BASE",
-        help="Place SRC into FrogFS as cores/DESTREL, stored uncompressed, and "
-             "relocate its BASE-range sentinels to wherever it lands. BASE is the "
+        help="Place SRC into FrogFS at DESTREL (for example cores/foo.xip or "
+             "homebrews/foo.xip), stored uncompressed, and relocate its "
+             "BASE-range sentinels to wherever it lands. BASE is the "
              "address the blob was linked at (a project's relocBase). Repeatable.",
     )
     parser.add_argument(
@@ -360,15 +372,16 @@ def main(argv=None):
     if sd_roms.is_dir():
         collect_dirs.append((sd_roms, "roms"))
 
-    # Mapped (XiP) sidecars: staged into FrogFS individually rather than by
-    # directory, because their sibling .bin must stay in LittleFS -- one /cores
-    # directory spanning both filesystems. See docs/RELEASE_2_0.md.
+    # Mapped (XiP) sidecars are installed in their declared FrogFS directory.
+    # Core sidecars live under /cores; homebrew sidecars live beside their .bin
+    # under /homebrews. Both stay uncompressed and are relocated in place.
     mapped_artifacts = []
     if args.mapped_artifact:
         mst = build_dir / "frogfs_mapped_staging"
         if mst.exists():
             shutil.rmtree(mst)
         mst.mkdir(parents=True)
+        mapped_dirs = set()
         for spec in args.mapped_artifact:
             try:
                 src, destrel, base_s = spec.rsplit(":", 2)
@@ -377,13 +390,23 @@ def main(argv=None):
                 print(f"frogfs: bad --mapped-artifact {spec!r}; want SRC:DESTREL:BASE",
                       file=sys.stderr)
                 return 1
+            dest = pathlib.PurePosixPath(destrel)
+            if (dest.is_absolute() or not dest.parts or
+                    dest.parts[0] not in {"cores", "homebrews"} or
+                    ".." in dest.parts):
+                print(f"frogfs: invalid mapped destination: {destrel}", file=sys.stderr)
+                return 1
             srcp = pathlib.Path(src)
             if not srcp.is_file():
                 print(f"frogfs: --mapped-artifact source not found: {src}", file=sys.stderr)
                 return 1
-            shutil.copy2(srcp, mst / destrel)
-            mapped_artifacts.append((f"cores/{destrel}", base))
-        collect_dirs.append((mst, "cores"))
+            staged = mst.joinpath(*dest.parts)
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(srcp, staged)
+            mapped_artifacts.append((dest.as_posix(), base))
+            mapped_dirs.add(dest.parts[0])
+        for dirname in sorted(mapped_dirs):
+            collect_dirs.append((mst / dirname, dirname))
 
     pico8_ro_in_frogfs = False
     if args.bundle_pico8_ro_in_frogfs and "pico8" in active_systems:
@@ -426,11 +449,22 @@ def main(argv=None):
             file=sys.stderr,
         )
 
+    homebrew_rom_paths = set()
+    for raw_path in args.include_homebrew_rom:
+        relative = pathlib.PurePosixPath(raw_path)
+        if (relative.is_absolute() or not relative.parts or
+                any(part in ("", ".", "..") for part in relative.parts) or
+                relative.suffix.lower() not in {".sfc", ".smc", ".fig", ".swc"}):
+            print(f"frogfs: invalid --include-homebrew-rom path {raw_path!r}", file=sys.stderr)
+            return 1
+        homebrew_rom_paths.add(pathlib.Path(*relative.parts))
+
     staged_dirs, byteswapped_count = stage_input_dirs(
         collect_dirs,
         build_dir / "input",
         roms_exclude_top=frozenset(roms_exclude),
         roms_skip_rel_paths=roms_skip_merged,
+        homebrew_rom_paths=frozenset(homebrew_rom_paths),
         skip_bios_msx=skip_bios_msx,
     )
 

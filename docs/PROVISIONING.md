@@ -74,6 +74,13 @@ The ownership catalog retains every installed project instead of replacing the
 previous project's metadata. You may reinstall a project's owned files;
 conflicting unrelated files are refused.
 
+Raw SNES ROM extensions under `/homebrews/` are normally filtered from FrogFS
+to avoid treating arbitrary ROMs as homebrew payloads. When a GWRG homebrew
+converter explicitly emits a raw ROM there, `profile create` preserves only
+that project-owned path from `.gwprov-projects.json`; unowned `.sfc`, `.smc`,
+`.fig` and `.swc` files remain filtered. SD content keeps the declared path
+directly.
+
 ## Assemble and boot
 
 ```bash

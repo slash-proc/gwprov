@@ -4,6 +4,32 @@ from __future__ import annotations
 import json
 import re
 import socket
+import os
+import time
+import traceback
+from pathlib import Path
+
+
+
+def record_control_request(path: str | None, transport: str, command: str) -> None:
+    """Keep a local audit of execution controls, with Python caller locations.
+
+    Only control operations are recorded. Memory and register polling add no
+    log traffic. No register contents, memory, or source lines are recorded.
+    """
+    if not path:
+        return
+    destination = Path(path).expanduser().resolve().parent / "control.jsonl"
+    callers = [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
+               for frame in traceback.extract_stack(limit=8)[:-1]]
+    payload = json.dumps({"time_ns": time.time_ns(), "pid": os.getpid(),
+                          "transport": transport, "command": command,
+                          "callers": callers}) + "\n"
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, payload.encode())
+    finally:
+        os.close(descriptor)
 
 
 def parse_arm_registers(text: str) -> dict[str, int]:
@@ -55,6 +81,8 @@ class QMPConnection:
     def execute(self, command: str, arguments: dict | None = None) -> dict:
         if self.stream is None:
             raise RuntimeError("QMP connection is not open")
+        if command in {"stop", "cont", "system_reset", "quit"}:
+            record_control_request(self.path, "qmp", command)
         self.request_id += 1
         payload = {"execute": command, "id": self.request_id}
         if arguments:
@@ -66,6 +94,8 @@ class QMPConnection:
                 raise RuntimeError(f"GWemu closed QMP socket {self.path}")
             reply = json.loads(line)
             if "event" in reply:
+                if reply["event"] in {"STOP", "RESUME", "RESET", "SHUTDOWN", "SUSPEND"}:
+                    record_control_request(self.path, "qmp-event", reply["event"])
                 continue
             if reply.get("id") != self.request_id:
                 raise RuntimeError(f"unexpected QMP reply id from {self.path}")

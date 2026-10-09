@@ -93,8 +93,8 @@ class ShadowCellTransport(InputTransport):
 
     def open(self) -> "ShadowCellTransport":
         if self._backend is None:
-            from gnwmanager.ocdbackend.openocd_backend import OpenOCDBackend
-            self._backend = OpenOCDBackend()
+            from .backends import AutoOpenOCDBackend
+            self._backend = AutoOpenOCDBackend(operation="gwprov input transport")
             self._backend.open()
         return self
 

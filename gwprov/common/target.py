@@ -32,7 +32,7 @@ from dataclasses import dataclass
 
 from gnwmanager.gnw import GnW
 from gnwmanager.ocdbackend.gdb_backend import GDBBackend
-from gnwmanager.ocdbackend.openocd_backend import OpenOCDBackend
+from ..backends import AutoOpenOCDBackend
 
 from .sdcard import (HardwarePhysicalSDCardManager, HardwareProbeSDCardManager,
                      QemuSDCardManager)
@@ -439,7 +439,8 @@ class HardwareTarget(Target):
 
     def start(self):
         print("Attaching to hardware via OpenOCD...")
-        self.backend = _SerialBackend(OpenOCDBackend(), threading.Lock())
+        self.backend = _SerialBackend(
+            AutoOpenOCDBackend(operation="gwprov hardware target"), threading.Lock())
         self.backend.open()
 
         # OBSERVE-ONLY: attach without disturbing what is running.

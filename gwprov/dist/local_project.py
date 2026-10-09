@@ -91,13 +91,18 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
                            if variant == "flash" and destination.parts[0] == "frogfs"
                            else destination.parts if variant == "sd" else ())
             if (not isinstance(map_info, dict) or not mapped_path or
-                    mapped_path[0] != "cores"):
-                raise ValueError("mapped artifacts must be core files under FrogFS/cores or SD cores/")
+                    mapped_path[0] not in {"cores", "homebrews"}):
+                raise ValueError(
+                    "mapped artifacts must be files under FrogFS/cores, "
+                    "FrogFS/homebrews, SD cores/, or SD homebrews/"
+                )
             relative = _safe_relpath("/".join(mapped_path))
             base = map_info.get("relocBase")
             if isinstance(base, str):
-                try: base_value = int(base, 0)
-                except ValueError as exc: raise ValueError("mapped relocBase must be an integer") from exc
+                try:
+                    base_value = int(base, 0)
+                except ValueError as exc:
+                    raise ValueError("mapped relocBase must be an integer") from exc
             elif isinstance(base, int):
                 base_value = base
             else:

@@ -201,6 +201,18 @@ the leading functions, rebased section, and symbol ELF checksum. Automatic PNGs
 before/after the interval identify the actual scene. `--format json` prints the
 full structured report; Ctrl-C retains a partial profile and leaves the VM alone.
 
+The report summarizes each routine's longest and accumulated consecutive
+same-function residency observed in PC samples. It also lists individual
+routine-stall candidates whose observed span reaches `--stall-threshold`
+(default 1 second), including sample count and largest gap between samples.
+These durations estimate how long the CPU stayed in a routine; QMP sampling
+cannot prove uninterrupted execution or that interrupts and other system work
+were blocked between polls. When progress counters are available, the report
+also gives intervals where a counter stayed flat and ranks routines sampled
+inside each interval. Counter observations are about one second apart, so these
+are coarse estimates for extended freezes. Add a project heartbeat or frame
+counter with `--progress-symbol` when automatic counter discovery finds none.
+
 **Interpretation:** these are running-state PC snapshot shares, not exact
 Cortex-M cycle counts or complete caller stacks. QMP samples at emulator
 synchronization points, so MMIO/interrupt boundaries can be overrepresented.
@@ -210,10 +222,15 @@ produces no running samples and a nonzero exit status. Function attribution uses
 actual ELF function ranges, so missing symbols are counted as unresolved.
 
 Raw DWT control/CYCCNT observations are included once per second; gwprov never
-resets or enables the counter. Firmware may reset it on each loop. The currently
-used GWemu build advances CYCCNT from virtual time, which cannot measure exact
-instruction costs; consequently gwprov does not distribute that counter across
-functions. Host TCG/MMIO profiling answers a separate question. GWemu's documented
+resets or enables the counter. The structured `dwt_cycle_counter.status` reports
+whether `DWT_CTRL.CYCCNTENA` was enabled, along with observed control values and
+whether CYCCNT changed between observations. A disabled counter is explicitly
+identified and its zero values must not be read as elapsed cycles. Firmware may
+reset CYCCNT on each loop. Even when enabled, some GWemu builds advance
+CYCCNT from virtual time rather than instruction execution, so it cannot measure
+exact instruction costs; consequently gwprov does not distribute that counter
+across functions. Host TCG/MMIO profiling answers a separate question. GWemu's
+documented
 `GNW_UI_FRAME_TRACE`, `GNW_IDLE_PROF`, `GNW_BQL_PROF` and `GNW_MMIO_PROF` hooks
 remain useful for emulator-side investigation (MMIO instrumentation can itself
 be expensive).
@@ -306,16 +323,31 @@ reproduction matters, and replay from a copy of that same baseline.
 
 For unattended homebrew routes, use `gwemu debug --unpause-homebrew
 --app-symbols APP.elf --detach-after-app-entry --keep-running` with either
-timeline option and a QMP socket. This clears Retro-Go's autostart pause through
-the existing launch hook before entering the app, then frees the debugger for
-`gwemu watch`. Use the same launch options for recording and replay.
+timeline option. QMP is enabled by default, so `gwemu ps`, screenshots, state
+polling, and controls remain available after GDB detaches. Pass `--qmp-socket
+PATH` to choose another endpoint, or `--no-qmp` to disable it. This clears
+Retro-Go's autostart pause through the existing launch hook before entering the
+app, then frees the debugger for `gwemu watch`. Use the same launch options for
+recording and replay.
 This needs no wall-clock input player or changes to GWemu.
 
+For automatic symbol lookup of relocated XIP code, export a 32-bit runtime
+base global named `<section-name>_xip_runtime_base` alongside an ELF section
+named `.xip_<section-name>`. For example, `.xip_game` pairs with
+`game_xip_runtime_base`. `gwprov gwemu ps` and the profiler use that pointer to
+rebase symbols to the address where the section is mapped at runtime.
+
 For a symbolized debug session, use `gwprov gwemu debug --profile "$profile"`.
-The command starts visible GWemu stopped at reset so it can install breakpoints,
+The command starts GWemu stopped at reset so it can install breakpoints,
 loads the matching `debug/retro-go-debug.elf` from the checksum-verified firmware
-release, then continues execution. This reset halt is a debugger setup step; the
-app does not enter Retro-Go's pause menu unless `start_paused` is left enabled.
+release, then continues execution. QMP is enabled by default at a per-profile
+socket under `~/.cache/gwprov/qmp/`; it keeps `gwprov ps`, screenshots, state
+polling, and controls available after GDB detaches. Use `--qmp-socket PATH` for
+a custom endpoint or `--no-qmp` to disable it. This reset halt is a debugger
+setup step; the app does not enter Retro-Go's pause menu unless `start_paused`
+is left enabled.
+Pass `--headless` to use QEMU's `-display none` for scripted or parallel
+debugging; the GDB and QMP endpoints work the same way.
 
 Retro-Go `/CONFIG` homebrew autostart passes `start_paused=true` to
 `run_gwhb_homebrew`. The default debug session breaks on that function only with
@@ -381,6 +413,16 @@ Process management needs process-namespace visibility; QMP and GDB need AF_UNIX
 and TCP connect access. Those are not inherently `NET_ADMIN` requirements. A
 denied operation reports the socket and access type instead of appearing to be
 an absent emulator.
+
+`gwprov gwemu ps` reports CPU execution as `running` or `halted` in `STATE`,
+using QMP's boolean `running` field. A debugger stop is `halted`; having a GDB
+connection does not imply execution. JSON includes `running`, `halted`, and
+`qmpStatus` (the original QEMU reason, such as `debug` or `paused`). If QMP cannot
+verify execution, the state is `unknown`, the booleans are null, `stateDetail`
+explains why, and `ps` exits with status 2. Socket permission errors remain fatal.
+Automation must check `running == true`, rather than process existence or an
+application label. Pause/resume commands verify the resulting execution state
+before reporting success; an immediate breakpoint stop is a failure to resume.
 
 `gwprov gwemu ps` also polls an `Application` column independently of GWemu's
 process `STATE`. It uses the profile's Retro-Go ELF and app ELFs to interpret the
@@ -586,6 +628,108 @@ The launcher uses `gwemu` from PATH, starts the guest running, and does not atta
 probe or pause it. GWemu stderr goes to the instance's `gwemu.log`. For file formats,
 input constraints and verification details, see [the provisioning guide](docs/PROVISIONING.md).
 
+### Portable reports
+
+Any structured GWProv JSON report can be rendered without external assets:
+
+```sh
+gwprov report render --input dev-local/reports/profile.json \
+  --format html --output dev-local/reports/profile.html
+```
+
+PDF rendering is optional and uses `gwprov[reports]` (ReportLab); the original
+JSON remains the machine-readable evidence source.
+
+Hardware profiling emits JSON directly or renders an HTML/PDF companion:
+
+```sh
+gwprov profile hardware --probe-id PROBE_ID --profile DEVICE_PROFILE \
+  --duration 30 --format html --output dev-local/reports/hardware-profile.html
+```
+
+The target project must export the generic `gwprov_trace_header` ring described
+in [the trace ABI](docs/TRACE_ABI.md). GWProv reads it without halting the CPU,
+resolves routine PCs against the profile's firmware/app ELFs (or repeated
+`--symbols ELF` arguments), and reports exclusive cycles, percentages, lost
+events, and DWT availability. The JSON report is retained beside HTML/PDF and
+remains the complete machine-readable record. Hardware deployment and profiling
+also accept `--programmer` or `--remote-url` instead of `--probe-id`.
+
+### Hardware deployment
+
+A hardware deployment plan records every destination offset and SHA-256 before
+writing. Bank 1 (OFW or bootloader) and bank 2 are separate selectable regions;
+flash profiles write FrogFS and LittleFS at their declared offsets, while stock
+profiles can write the complete extflash backup. SD deployment copies files
+through `gnwmanager` and overlays the existing card contents.
+
+```sh
+gwprov deploy plan --profile dev-local/profiles/retro-go-demo
+gwprov deploy apply --profile dev-local/profiles/retro-go-demo --probe-id PROBE_ID
+# Or select one OpenOCD adapter explicitly:
+gwprov deploy apply --profile dev-local/profiles/retro-go-demo --programmer stlink
+```
+
+Apply defaults to all regions present in the profile. It enters gnwmanager's RAM
+programmer, writes and verifies each selected region through gnwmanager, then
+starts the bank-1 vector. Use `--region bank1` or `--region bank2` to select an
+individual internal bank; repeat `--region` for exact plans. A remote server is
+selected with `--remote-url ws[s]://host:port/gdb`; `--remote-origin` supplies its
+allowed origin when configured. SD deployment is an overlay and does not delete
+files omitted from the profile.
+
+## Local and remote device sessions
+
+`gwprov ps` combines GWemu process/application state with locally visible hardware
+probes. A physical row reports `busy` when another GWProv session owns that probe,
+or a detected local OpenOCD, PyOCD, or gnwmanager process may be using it. While busy, `ps`
+does not open the debug session or read target registers; the `Application` value
+is `Unknown` and the row identifies the owner when available. Otherwise it reads
+the Cortex-M halt bit. Without `--profile`, this is read-only and application state
+is `Unknown`. With matching firmware/app ELFs, it briefly halts each running target
+to capture registers, stack, and menu/app state from symbols, resumes it, and
+verifies the final run state. It leaves an already halted target halted.
+Applications may export the writable SRAM string `gwprov_application_state` for
+custom game states. GWProv hardware, deployment, profiling, and remote sessions
+hold process-shared leases for their duration; they release automatically on exit.
+Install `gwprov[device]` for selected-probe sessions and enumeration.
+
+The `Application` column is separate from VM/CPU `STATE`. Retro-Go symbols can
+identify initialization, homebrew startup, picker tabs (Favorites, Homebrew, and
+each registered core), the game menu, pause/settings and time menus, and dialogs
+over the picker or a running game. An app can report a project-specific state by
+exporting the SRAM string `gwprov_application_state`; without usable symbols the
+application value is `Unknown`.
+
+A single Python debugger process can keep several hardware targets connected:
+
+```sh
+gwprov debug python --target hardware --probe-id PROBE_ID_A --probe-id PROBE_ID_B
+```
+
+The REPL exposes `sessions` and `backends` dictionaries keyed by probe ID, and
+`dbg` aliases the first session. With no `--probe-id`, GWProv preserves
+`gnwmanager`'s OpenOCD autodetection order, which selects one matching programmer.
+Use repeatable `--programmer stlink|jlink|cmsis-dap|rpi-gpio` options to start
+separate OpenOCD sessions for explicit adapter types; `--probe-id` pins individual
+PyOCD probes by unique ID. Deployment and hardware profiling accept the same
+single-target selectors.
+
+Each `gnwmanager serve` endpoint represents one target. Multiple server endpoints
+can be attached in the same Python session:
+
+```sh
+gwprov debug python --target hardware \
+  --remote-url ws://host-a:8765/gdb \
+  --remote-url wss://host-b:8765/gdb
+```
+
+Install `gwprov[remote]` for WebSocket support. If a server restricts browser
+origins, pass the matching `--remote-origin` once per URL. The remote protocol
+supports memory writes and target control, so expose servers only on loopback or
+a trusted network, preferably through an SSH tunnel or TLS. Its reset operation
+uses the server's reset-and-halt followed by resume.
+
 ## CLI
 
 `gwprov tree` prints the command hierarchy and each subcommand's short help text. Use `-h` on
@@ -727,3 +871,30 @@ installation timestamp and its dependent CRC. Inventories retain the raw SHA256,
 `installedAt`, and a separate `comparisonSha256`. Every other byte remains part
 of the comparison; invalid markers receive no normalization. Image comparison
 always checks raw image and partition hashes.
+
+Debugger stop polling uses QMP and register reads, without issuing RSP `?`.
+QEMU interprets that packet as an initial attachment and clears all breakpoints;
+using it on every stop can invalidate launch hooks and fault monitoring.
+
+Python profiling accepts `stop_event=threading.Event()`. A concurrent fault
+monitor can set it to finish sampling immediately and save the partial report
+(`stopped_early: true`), rather than wait out a capture of a halted target.
+
+`dbg.symbols.source_locations([pc1, pc2, ...])` resolves runtime addresses
+(including relocations and inline callers) in a batch. Profiling uses this
+interface, loading each ELF through addr2line once instead of once per hotspot.
+
+For frame-driven GWemu input schedules, `dbg.key_event("GAME", True)` presses
+a button and `dbg.key_event("GAME", False)` releases it. These use structured
+QMP events rather than a wall-time hold; callers must release held keys in
+cleanup. `dbg.key("GAME", hold_ms=600)` remains the timed tap interface.
+
+
+Execution control through the Python debugger and shared QMP interface is
+recorded in `runtime/gwprov/control.jsonl` beside the monitor socket. Each halt,
+resume, reset or quit request records its transport, process ID, timestamp and
+Python caller locations. Received STOP/RESUME events are recorded separately.
+This identifies which automation issued a stop; polling memory and registers
+adds no control-log traffic. An emulator reporting `running` does not establish
+that a guest game's simulation is advancing: pair it with project progress
+counters or a project-provided Application state.

@@ -156,6 +156,31 @@ class SymbolTable:
         self._section_deltas[(owner, section)] = delta
         return delta
 
+    def rebase_from_runtime_pointers(self, read_memory) -> dict[str, int]:
+        """Rebase .xip_<name> sections from matching <name>_xip_runtime_base globals.
+
+        Port code can expose a 32-bit runtime-base global for each relocated XIP
+        section. This convention lets local profiling and state inspection
+        resolve mapped code without a project-specific symbol list.
+        """
+        rebased = {}
+        for owner in self.sources:
+            sections = self._sections.get(owner, {})
+            rows = {row["name"]: row for row in self.nm(elf=owner)}
+            for section, (_, size) in sections.items():
+                if not section.startswith(".xip_"):
+                    continue
+                stem = section[len(".xip_"):]
+                pointer = rows.get(f"{stem}_xip_runtime_base")
+                if not pointer or pointer["type"] != "STT_OBJECT" or pointer["size"] < 4:
+                    continue
+                actual_base = int.from_bytes(read_memory(pointer["address"], 4), "little")
+                if not actual_base or actual_base + size > 0x100000000:
+                    continue
+                self.rebase(section, actual_base, owner)
+                rebased[f"{owner}:{section}"] = actual_base
+        return rebased
+
     def find(self, prefix: str) -> dict[str, int]:
         return {name: self[name] for name in self._symbols if prefix in name}
 
@@ -198,6 +223,47 @@ class SymbolTable:
             [tool, "-d", "-C", f"--disassemble={symbol}", str(owner)],
             check=True, capture_output=True, text=True)
         return result.stdout
+
+    def source_locations(self, addresses) -> list[dict]:
+        """Resolve many PCs with one addr2line invocation per owning ELF."""
+        addresses = list(addresses)
+        results = {}
+        groups = {}
+        tool = shutil.which("arm-none-eabi-addr2line") or shutil.which("addr2line")
+        for address in addresses:
+            info = self._owner_for_pc(address)
+            if not info or info[0] in self._map_sources or not tool:
+                results[address] = self.source_location(address)
+                continue
+            owner, link = info
+            groups.setdefault(owner, {}).setdefault(link, []).append(address)
+        for owner, links in groups.items():
+            try:
+                output = subprocess.run(
+                    [tool, "-a", "-f", "-C", "-i", "-e", str(owner),
+                     *[hex(link) for link in links]],
+                    check=True, capture_output=True, text=True).stdout
+                decoded = {}
+                current = None
+                for line in output.splitlines():
+                    if re.fullmatch(r"0x[0-9a-fA-F]+", line):
+                        current = int(line, 16)
+                        decoded[current] = []
+                    elif current is not None:
+                        decoded[current].append(line)
+                for link, runtime_addresses in links.items():
+                    lines = decoded.get(link, [])
+                    frames = [{"function": lines[i], "file": lines[i + 1]}
+                              for i in range(0, len(lines) - 1, 2)]
+                    for address in runtime_addresses:
+                        results[address] = {"address": address, "link_address": link,
+                            "elf": str(owner), "available": bool(frames), "frames": frames}
+            except (OSError, subprocess.SubprocessError) as exc:
+                for link, runtime_addresses in links.items():
+                    for address in runtime_addresses:
+                        results[address] = {"address": address, "link_address": link,
+                            "elf": str(owner), "available": False, "reason": str(exc)}
+        return [results[address] for address in addresses]
 
     def source_location(self, address: int) -> dict:
         """Resolve a runtime PC to source lines, accounting for section rebases."""
@@ -485,14 +551,31 @@ class GwemuGDBBackend(GDBBackend):
 
         read_feature("target.xml")
 
+    def halt(self):
+        # gnwmanager's default halt sends '?' after Ctrl-C. QEMU treats
+        # that packet as a fresh attachment and removes all breakpoints.
+        # A register-bank read synchronizes with the interrupt while the
+        # transport consumes any asynchronous stop packet, preserving hooks.
+        from .qmp import record_control_request
+        record_control_request(getattr(self, "_control_audit_socket", None), "gdb", "halt")
+        self._write(b"\x03")
+        reply = self._send_command(b"g")
+        self._decode_hex(reply, b"g")
+        self._is_running = False
+
     def resume(self):
         if getattr(self, "_opening_halted", False):
             self._is_running = False
             return
+        from .qmp import record_control_request
+        record_control_request(getattr(self, "_control_audit_socket", None), "gdb", "resume")
         return super().resume()
 
     def open(self, *, halt: bool = False):
         """Attach without releasing a paused target when halt=True."""
+        from .qmp import record_control_request
+        record_control_request(getattr(self, "_control_audit_socket", None), "gdb",
+                               "attach_halted" if halt else "attach_resume")
         self._opening_halted = halt
         try:
             super().open()
@@ -569,6 +652,8 @@ class DebugSession:
         self.backend = backend
         self.transport = transport
         self.qmp_socket = qmp_socket
+        if transport == "gwemu" and backend is not None:
+            backend._control_audit_socket = qmp_socket
         self.symbols = SymbolTable()
 
     def halt(self):
@@ -592,9 +677,10 @@ class DebugSession:
             status = self.qmp("query-status").get("return", {})
             if not status.get("running", False):
                 self.backend._is_running = False
-                reply = self.backend._send_command(b"?").decode("ascii", errors="replace")
+                # QEMU treats '?' as initial attachment and deletes all
+                # breakpoints. Poll QMP and read registers without that packet.
                 return {"stopped": True, "status": status.get("status"),
-                        "stop_reply": reply, "registers": self.regs()}
+                        "stop_reply": None, "registers": self.regs()}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return {"stopped": False, "status": status.get("status"),
@@ -657,7 +743,7 @@ class DebugSession:
         """Decode a Cortex-M fault captured at handler entry, before its prologue.
 
         EXC_RETURN describes the pre-exception stack and FP frame. The stacked
-        core registers start at the exception SP; an extended FP frame follows.
+        core registers start at the exception SP; an extended FP frame follows them.
         Read only while halted so the frame and SCB registers stay coherent.
         """
         import struct
@@ -670,18 +756,30 @@ class DebugSession:
             frame_address = self.reg("psp")
         else:
             frame_address = current["sp"]
-        raw = self.read(frame_address, 32)
+        try:
+            handler_entry = self.symbols["common_fault_handler_c"] & ~1
+        except KeyError:
+            handler_entry = None
+        if handler_entry is not None and (current.get("pc", 0) & ~1) == handler_entry:
+            # The C fault handler receives the original exception SP in r0.
+            # Its current SP is also valid at entry, but r0 makes the contract
+            # explicit and keeps this correct if the stub reports a banked SP.
+            frame_address = current["r0"]
+        extended = not bool(exc_return & (1 << 4))
+        core_frame_address = frame_address
+        raw = self.read(core_frame_address, 32)
         values = struct.unpack("<8I", raw)
         if not values[7] & (1 << 24):
             return {"available": False, "reason": "stacked xPSR has no Thumb bit",
-                    "frame_address": frame_address, "frame_bytes": raw.hex()}
+                    "frame_address": frame_address,
+                    "core_frame_address": core_frame_address,
+                    "extended_fp_frame": extended, "frame_bytes": raw.hex()}
         names = ["r0", "r1", "r2", "r3", "r12", "lr", "pc", "xpsr"]
         stacked = dict(zip(names, values))
-        extended = not bool(exc_return & (1 << 4))
         padding = 4 if values[7] & (1 << 9) else 0
         recovered = dict(current)
         recovered.update(stacked)
-        recovered["sp"] = frame_address + (104 if extended else 32) + padding
+        recovered["sp"] = frame_address + 32 + (72 if extended else 0) + padding
         scb_values = struct.unpack("<6I", self.read(0xe000ed28, 24))
         scb = dict(zip(["CFSR", "HFSR", "DFSR", "MMFAR", "BFAR", "AFSR"], scb_values))
         cfsr = scb["CFSR"]
@@ -693,6 +791,7 @@ class DebugSession:
         result = {"available": True,
                   "exception": {3: "HardFault", 4: "MemManage", 5: "BusFault", 6: "UsageFault"}[exception],
                   "exception_return": exc_return, "frame_address": frame_address,
+                  "core_frame_address": core_frame_address,
                   "frame_bytes": raw.hex(), "extended_fp_frame": extended,
                   "registers": recovered, "scb": scb,
                   "fault_flags": [name for bit, name in bits.items() if cfsr & (1 << bit)],
@@ -732,7 +831,8 @@ class DebugSession:
                 result["handler_frames"] = result["frames"]
                 handler = [frame for frame in result["frames"] if frame.get("symbol")]
                 result["frames"] = handler + original["frames"]
-                for index, frame in enumerate(result["frames"]): frame["index"] = index
+                for index, frame in enumerate(result["frames"]):
+                    frame["index"] = index
                 result["stop_reason"] = original["stop_reason"]
                 result["fault"] = fault
             return result
@@ -822,7 +922,7 @@ class DebugSession:
         return settings
 
     def profile(self, *, duration=15.0, interval=0.02, progress_symbols=None,
-                rebase_symbols=None) -> dict:
+                rebase_symbols=None, stop_event=None, stall_threshold=1.0) -> dict:
         """Sample native function PCs through QMP alongside this debug session."""
         if self.transport != "gwemu" or not self.qmp_socket:
             raise RuntimeError("native PC sampling requires a GWemu QMP socket")
@@ -834,7 +934,8 @@ class DebugSession:
             rebase_symbols = settings.get("rebase_symbols")
         return sample_profile(self.qmp_socket, self.symbols, duration=duration,
                               interval=interval, progress_symbols=progress_symbols,
-                              rebase_symbols=rebase_symbols)
+                              rebase_symbols=rebase_symbols, stop_event=stop_event,
+                              stall_threshold=stall_threshold)
 
     def bp(self, address: int):
         """Set a hardware breakpoint, suitable for flash code addresses."""
@@ -988,6 +1089,20 @@ class DebugSession:
         finally:
             sock.close()
 
+    def key_event(self, name: str, down: bool) -> dict:
+        """Press/release a GWemu button explicitly for frame-driven schedules."""
+        if not isinstance(down, bool):
+            raise ValueError("down must be a boolean")
+        qcodes = {"A": "x", "B": "z", "GAME": "g", "TIME": "t",
+                  "PAUSE": "esc", "POWER": "p", "START": "ret",
+                  "SELECT": "shift_r", "UP": "up", "DOWN": "down",
+                  "LEFT": "left", "RIGHT": "right"}
+        button = name.upper()
+        if button not in qcodes:
+            raise ValueError(f"unknown Game & Watch button {name!r}")
+        return self.qmp("input-send-event", {"events": [{"type": "key",
+            "data": {"down": down, "key": {"type": "qcode", "data": qcodes[button]}}}]})
+
     def key(self, name: str, hold_ms: int = 600) -> dict:
         """Send one Game & Watch button through GWemu's QMP keyboard map."""
         qcodes = {"A": "x", "B": "z", "GAME": "g", "TIME": "t",
@@ -1023,32 +1138,66 @@ class DebugSession:
 
 def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
                  symbols: list[str] | None = None, openocd_port: int = 6666,
+                 probe_ids: list[str] | None = None, programmers: list[str] | None = None,
+                 remote_urls: list[str] | None = None, remote_origins: list[str] | None = None,
                  qmp_socket: str | None = None, debug_config: str | None = None) -> None:
-    """Attach once, then keep a Python REPL and target connection alive."""
-    from gnwmanager.ocdbackend.openocd_backend import OpenOCDBackend
-
+    """Attach target sessions and expose them together in one Python REPL."""
+    backends = {}
+    sessions = {}
     if target == "gwemu":
-        backend = GwemuGDBBackend(host=host, port=port)
+        if probe_ids or programmers or remote_urls:
+            raise ValueError("probe/programmer selections apply only to hardware targets")
+        backends["gwemu"] = GwemuGDBBackend(host=host, port=port)
     elif target == "hardware":
-        backend = OpenOCDBackend(port=openocd_port)
+        from .backends import (AutoOpenOCDBackend, SelectedOpenOCDBackend,
+                               SelectedPyOCDBackend, WebSocketBackend)
+        if len(programmers or []) != len(set(programmers or [])):
+            raise ValueError("select each OpenOCD programmer type at most once; use --probe-id for probe IDs")
+        for programmer in programmers or []:
+            key = f"openocd:{programmer}"
+            backends[key] = SelectedOpenOCDBackend(programmer, operation="gwprov debug session")
+        for probe_id in probe_ids or []:
+            key = f"probe:{probe_id}"
+            backends[key] = SelectedPyOCDBackend(probe_id, operation="gwprov debug session")
+        urls = remote_urls or []
+        origins = remote_origins or []
+        if origins and len(origins) != len(urls):
+            raise ValueError("provide one --remote-origin for each --remote-url")
+        for index, remote_url in enumerate(urls):
+            key = f"remote:{index + 1}"
+            origin = origins[index] if origins else None
+            backends[key] = WebSocketBackend(remote_url, origin=origin,
+                                             operation="gwprov remote debug session")
+        if not backends:
+            backends["hardware"] = AutoOpenOCDBackend(
+                port=openocd_port, operation="gwprov debug session")
     else:
         raise ValueError(f"unknown target {target!r}")
-    session = DebugSession(backend, target, qmp_socket=qmp_socket)
+
     try:
-        backend.open()
-        for elf in symbols or []:
-            count = session.symbols.load(elf)
-            print(f"Loaded {count} symbols: {Path(elf).expanduser()}")
-        if debug_config:
-            print("Loaded local debug config:", session.configure(debug_config))
-        print("Connected:", session)
-        print("Python debugger: dbg.regs(), dbg.read(address, size), dbg.u32(address),")
-        print("  dbg.halt(), dbg.resume(), dbg.step(), dbg.where(), dbg.traceback()")
-        print("  dbg.screenshot([path]), dbg.diagnose([path])")
-        print("  dbg.bp(address), dbg.at('symbol'), dbg.rebase_from_pointer(section, symbol)")
-        print("  dbg.symbols.find('prefix') lists matching symbols")
-        print("  dbg.nm('pattern') returns structured symbols; dbg.disasm('function')")
-        code.interact(banner="gwprov interactive debug (Ctrl-D disconnects)",
-                      local={"dbg": session, "symbols": session.symbols, "backend": backend})
+        for key, backend in backends.items():
+            backend.open()
+            session = DebugSession(backend, target,
+                                   qmp_socket=qmp_socket if target == "gwemu" else None)
+            sessions[key] = session
+            for elf in symbols or []:
+                count = session.symbols.load(elf)
+                print(f"[{key}] loaded {count} symbols: {Path(elf).expanduser()}")
+            if debug_config:
+                print(f"[{key}] loaded local debug config:", session.configure(debug_config))
+        first_key = next(iter(sessions))
+        session = sessions[first_key]
+        backend = backends[first_key]
+        print("Connected sessions:", {key: repr(value) for key, value in sessions.items()})
+        print("Python debugger: dbg is the first session; sessions[key] accesses each target.")
+        print("Use dbg.regs(), dbg.read(address, size), dbg.u32(address), dbg.halt(),")
+        print("  dbg.resume(), dbg.step(), dbg.where(), dbg.traceback(), dbg.nm()/dbg.disasm()")
+        namespace = {"dbg": session, "sessions": sessions,
+                     "backends": backends, "symbols": session.symbols}
+        code.interact(banner="gwprov interactive debug (Ctrl-D disconnects)", local=namespace)
     finally:
-        backend.close()
+        for backend in reversed(list(backends.values())):
+            try:
+                backend.close()
+            except Exception:
+                pass

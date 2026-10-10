@@ -935,6 +935,14 @@ class DebugSession:
                   "fault_flags": [name for bit, name in bits.items() if cfsr & (1 << bit)],
                   "fault_address": scb["MMFAR"] if cfsr & (1 << 7)
                                    else scb["BFAR"] if cfsr & (1 << 15) else None}
+        memmanage_status = cfsr & 0x3F
+        if result["exception"] == "MemManage" or memmanage_status:
+            try:
+                result["mpu"] = self._mpu_context(
+                    pc=recovered["pc"], fault_address=result["fault_address"],
+                    cfsr=cfsr)
+            except Exception as exc:
+                result["mpu"] = {"available": False, "reason": str(exc)}
         try:
             guard = self.at("_stack_redzone")
             size = self.at("_Stack_Redzone_Size")
@@ -945,6 +953,118 @@ class DebugSession:
             pass
         result["source_location"] = self.symbols.source_location(recovered["pc"])
         result["code_context"] = self.symbols.code_context(recovered["pc"])
+        return result
+
+    def _read_u32_register(self, address: int) -> int:
+        """Read a peripheral register as one aligned word transaction."""
+        if address & 3:
+            raise ValueError(f"unaligned 32-bit register address 0x{address:08x}")
+        backend = self.backend
+        if hasattr(backend, "read_uint32"):
+            return int(backend.read_uint32(address))
+        target = getattr(backend, "target", None)
+        if target is not None and hasattr(target, "read32"):
+            return int(target.read32(address))
+        # QEMU's GDB debug-memory path supports aligned word reads as a
+        # single request. OpenOCD bytewise accessors are deliberately excluded
+        # because peripheral registers need mdw. Remote access needs an
+        # explicit word-operation protocol before it is safe for MPU registers.
+        if backend.__class__.__name__ == "GwemuGDBBackend":
+            return int.from_bytes(self.read(address, 4), "little")
+        raise RuntimeError(f"{backend.__class__.__name__} has no safe 32-bit register read")
+
+    def _write_u32_register(self, address: int, value: int):
+        """Write a peripheral register as one aligned word transaction."""
+        if address & 3:
+            raise ValueError(f"unaligned 32-bit register address 0x{address:08x}")
+        backend = self.backend
+        if hasattr(backend, "write_uint32"):
+            backend.write_uint32(address, value)
+            return
+        target = getattr(backend, "target", None)
+        if target is not None and hasattr(target, "write32"):
+            target.write32(address, value)
+            return
+        if backend.__class__.__name__ == "GwemuGDBBackend":
+            self.write(address, value.to_bytes(4, "little"))
+            return
+        raise RuntimeError(f"{backend.__class__.__name__} has no safe 32-bit register write")
+
+    def _mpu_context(self, *, pc: int, fault_address: int | None,
+                     cfsr: int) -> dict:
+        """Capture ARMv7-M MPU regions and identify the effective fault region.
+
+        MPU_RNR is temporarily changed to read RBAR/RASR and restored before
+        returning. Higher numbered enabled regions take precedence.
+        """
+        mpu_type_address = 0xE000ED90
+        mpu_ctrl_address = 0xE000ED94
+        mpu_rnr_address = 0xE000ED98
+        mpu_rbar_address = 0xE000ED9C
+        mpu_rasr_address = 0xE000EDA0
+        mpu_type = self._read_u32_register(mpu_type_address)
+        mpu_ctrl = self._read_u32_register(mpu_ctrl_address)
+        region_count = (mpu_type >> 8) & 0xFF
+        if region_count == 0:
+            return {"available": True, "architecture": "ARMv7-M",
+                    "type": mpu_type, "control": mpu_ctrl,
+                    "enabled": bool(mpu_ctrl & 1), "regions": [], "pc": pc,
+                    "fault_address": fault_address}
+
+        original_rnr = self._read_u32_register(mpu_rnr_address)
+        regions = []
+        restore_error = None
+        try:
+            for index in range(region_count):
+                self._write_u32_register(mpu_rnr_address, index)
+                rbar = self._read_u32_register(mpu_rbar_address)
+                rasr = self._read_u32_register(mpu_rasr_address)
+                enabled = bool(rasr & 1)
+                size = (1 << (((rasr >> 1) & 0x1F) + 1)) if enabled else None
+                base = ((rbar & 0xFFFFFFE0) & ~(size - 1)) if enabled else None
+                subregion_mask = (rasr >> 8) & 0xFF
+                def contains(address):
+                    if not enabled or not (mpu_ctrl & 1) or address is None:
+                        return False, False
+                    if not base <= address < base + size:
+                        return False, False
+                    disabled = False
+                    if size >= 256:
+                        subregion = (address - base) // (size // 8)
+                        disabled = bool(subregion_mask & (1 << subregion))
+                    return not disabled, disabled
+                pc_covered, pc_subregion_disabled = contains(pc)
+                addr_covered, addr_subregion_disabled = contains(fault_address)
+                regions.append({"number": index, "enabled": enabled,
+                                "base": base, "size_bytes": size,
+                                "xn": bool(rasr & (1 << 28)),
+                                "access_permission": (rasr >> 24) & 7,
+                                "subregion_disable_mask": subregion_mask,
+                                "covers_pc": pc_covered,
+                                "pc_subregion_disabled": pc_subregion_disabled,
+                                "covers_fault_address": addr_covered,
+                                "fault_address_subregion_disabled": addr_subregion_disabled,
+                                "rbar": rbar, "rasr": rasr})
+        finally:
+            try:
+                self._write_u32_register(mpu_rnr_address, original_rnr)
+            except Exception as exc:
+                restore_error = str(exc)
+
+        enabled_regions = [r for r in regions if r["enabled"] and (mpu_ctrl & 1)]
+        def effective(field):
+            matches = [r for r in enabled_regions if r[field]]
+            return max(matches, key=lambda r: r["number"]) if matches else None
+        result = {"available": True, "architecture": "ARMv7-M",
+                  "type": mpu_type, "control": mpu_ctrl,
+                  "enabled": bool(mpu_ctrl & 1),
+                  "privileged_default": bool(mpu_ctrl & 4), "pc": pc,
+                  "fault_address": fault_address,
+                  "effective_pc_region": effective("covers_pc"),
+                  "effective_fault_address_region": effective("covers_fault_address"),
+                  "regions": regions}
+        if restore_error:
+            result["region_selector_restore_error"] = restore_error
         return result
 
     def traceback(self, max_frames: int = 32) -> dict:

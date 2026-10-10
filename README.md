@@ -530,7 +530,9 @@ gwprov debug python --target hardware --probe-id PROBE_ID --profile PROFILE
 `HardFault_Handler`, `MemManage_Handler`, `BusFault_Handler`, and
 `UsageFault_Handler` are present in loaded symbols. At a handler-entry stop,
 `wait_fault()` collects core registers, the stacked exception frame, SCB fault
-registers, and the symbolized unwind. The reset-halt establishes a known boot point before breakpoints are installed.
+registers, the symbolized unwind, and (for MemManage faults) MPU region
+permissions with the region covering the faulting PC identified. MPU region
+selection is restored after capture. The reset-halt establishes a known boot point before breakpoints are installed.
 Use `dbg.run_until("emulator_start")`, `dbg.run_until("run_gwhb_homebrew")`,
 and then `dbg.run_until("app_main")` to inspect the Retro-Go launch path when
 those symbols are present. A stop remains halted for inspection; resume it

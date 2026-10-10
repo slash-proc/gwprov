@@ -47,6 +47,7 @@ def _read_frogfs(image: Path, offset: int, destination: Path) -> None:
     from .inventory import frogfs
     listing = frogfs(image, offset)
     with image.open("rb") as stream:
+        stream.seek(offset)
         _, _, _, count, size = struct.unpack("<IBBHI", stream.read(12))
         table_offsets = [struct.unpack("<II", stream.read(8))[1] for _ in range(count)]
         nodes = {}
@@ -67,9 +68,13 @@ def _read_frogfs(image: Path, offset: int, destination: Path) -> None:
                 parent, name, _, _ = nodes[position]
                 parts.append(name)
                 position = parent
-            return "/".join(reversed(parts))
+            # FrogFS stores the root directory name as "/". The inventory
+            # API exposes paths relative to that root, so normalize both to
+            # the same relative form before matching file entries.
+            return "/".join(reversed(parts)).strip("/")
 
-        path_to_position = {node_path(position): position for position in nodes}
+        path_to_position = {node_path(position): position for position in nodes
+                            if node_path(position)}
         for row in listing["entries"]:
             path = destination / _safe_name(row["path"])
             if row["type"] == "directory":
@@ -115,7 +120,12 @@ def _build_frogfs(source: Path, output: Path, work: Path) -> None:
     script = Path(__file__).parent / "vendor/frogfs/mkfrogfs.py"
     config = work / "frogfs.yml"
     build = work / "build"
-    config.write_text(yaml.safe_dump({"collect": {str(source): ""}}), encoding="utf-8")
+    # Collect children so a temporary staging directory name never becomes
+    # an unexpected top-level filesystem directory.
+    config.write_text(yaml.safe_dump({"collect": {str(source / "*"): ""}}), encoding="utf-8")
+    # mkfrogfs creates its cache directory as a child of build_dir, so the
+    # parent must exist before its first Stage 1 directory entry is visited.
+    build.mkdir(parents=True, exist_ok=True)
     subprocess.run([sys.executable, str(script), str(config), str(build), str(output)],
                    check=True, cwd=work)
 
@@ -355,7 +365,6 @@ def operate(*, operation: str, target: str, profile: str | None = None,
                 with src.open("rb") as inp, fs.open(name, "wb") as out: shutil.copyfileobj(inp, out)
             elif operation == "delete":
                 fs.remove(name)
-            fs.unmount()
         finally:
             try: fs.unmount()
             except Exception: pass

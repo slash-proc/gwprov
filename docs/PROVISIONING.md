@@ -104,6 +104,26 @@ gwprov set active gwemu:12345
 gwprov gwemu screenshot
 ```
 
+`gwprov config show` reads and decodes the active device's stored Retro-Go
+`/CONFIG`, including its CRC status. GWemu reads the running instance's extflash
+image; hardware reads its mapped LittleFS partition using the assigned profile's
+layout. Hardware inspection takes a target lease and fails while another session
+owns the probe. The command does not write flash or halt the target.
+
+Before a hardware flow loads gnwmanager's RAM service, GWProv reads VTOR,
+mailbox status at `0x24025800`, and DHCSR. It follows gnw-web-builder's
+Recovery Mode signals: `IDLE` plus a running core confirms a live idle stub,
+while an SRAM VTOR identifies a stub that is busy or otherwise not confirmed
+idle. A resident stub blocks another implicit reset/load. Once the mailbox is
+idle, run `gwprov device recover` to reset and boot bank 1. GWProv refuses this
+recovery while the mailbox is busy or unreadable.
+The target lease also keeps a durable recovery marker from the moment the RAM
+service is loaded until return to bank 1 is verified. If a process exits in
+between, `gwprov ps` skips target reads and later hardware commands fail closed
+until the explicit recovery succeeds. Recovery is refused during `ERASE`,
+`PROG`, or `HASH`; it is allowed at `IDLE`, after a terminal service error, or
+during `BOOTING` only before VTOR enters the stub's SRAM range.
+
 Assigning a profile is separate from selecting the active device. `gwprov apply`
 uses the active device's saved assignment: for GWemu it starts the assigned
 profile and replaces the active VM when its profile differs; for hardware it
@@ -113,6 +133,8 @@ part of apply.
 
 ```sh
 gwprov set active probe:PROBE_ID
+gwprov config show
+gwprov config show --output json
 gwprov set profile dkc1
 gwprov sdcard add /Volumes/RETROGO       # name defaults to RETROGO
 gwprov set sdcard RETROGO

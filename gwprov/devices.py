@@ -62,9 +62,20 @@ def device_rows(profile: str | None = None) -> list[dict]:
         owner = lease_owner(f"probe:{probe['id']}") or adapter_lease or matching_external
         if owner:
             pid = owner.get("pid")
-            detail = f"Target traffic skipped: {owner.get('operation', 'another session')} owns it"
+            if owner.get("recovery_required"):
+                if owner.get("lease_active"):
+                    detail = ("Target traffic skipped: "
+                              f"{owner.get('phase', 'hardware operation')} is in progress")
+                else:
+                    detail = ("Target traffic skipped: the previous session left the "
+                              f"{owner.get('phase', 'hardware operation')} active; "
+                              "run `gwprov device recover` after it is idle")
+            else:
+                detail = f"Target traffic skipped: {owner.get('operation', 'another session')} owns it"
             if pid:
-                detail += f" (pid {pid})"
+                active_owner = owner.get("lease_active", not owner.get("recovery_required"))
+                detail += (f" (pid {pid})" if active_owner else
+                           f" (last session pid {pid})")
             rows.append({"id": f"probe:{probe['id']}", "kind": "hardware",
                          "backend": probe["backend"], "name": probe["name"],
                          "probeId": probe["id"], "vendor": probe["vendor"],
@@ -151,9 +162,15 @@ def device_rows(profile: str | None = None) -> list[dict]:
         remote_id = f"remote:{uri}"
         owner = lease_owner(f"remote:{uri}")
         if owner:
+            detail = (("gnwmanager RAM service operation is in progress"
+                       if owner.get("lease_active") else
+                       "Previous session left the gnwmanager RAM service active; "
+                       "run `gwprov device recover` after its mailbox is idle")
+                      if owner.get("recovery_required") else
+                      f"Target traffic skipped: {owner.get('operation', 'another session')} owns it")
             rows.append({"id": remote_id, "kind": "hardware", "backend": "gnwmanager WebSocket",
                          "name": remote["name"], "status": "busy", "application": "Unknown",
-                         "detail": f"Target traffic skipped: {owner.get('operation', 'another session')} owns it",
+                         "detail": detail,
                          "adapterName": remote["name"], "remoteOrigin": remote["origin"]})
         else:
             backend = None

@@ -97,18 +97,35 @@ def load_debug_config(path, table) -> dict:
         table.load(elf)
     if normalized:
         table.add_symbol_map(config_path, normalized, sections)
+    gauges = data.get("sampleGauges", [])
+    if not isinstance(gauges, list):
+        raise ValueError("sampleGauges must be a list")
+    gauge_names = set()
+    for gauge in gauges:
+        if not isinstance(gauge, dict) or not isinstance(gauge.get("symbol"), str) or not gauge["symbol"]:
+            raise ValueError("sampleGauges require symbol names")
+        name = gauge["symbol"]
+        patterns = gauge.get("whenFunctions", [])
+        if not isinstance(patterns, list) or any(not isinstance(item, str) or not item for item in patterns):
+            raise ValueError("sampleGauges whenFunctions must be a list of function patterns")
+        if name in gauge_names:
+            raise ValueError(f"duplicate sample gauge: {name}")
+        gauge_names.add(name)
+        if not any(row["name"] == name and row["size"] in (1, 2, 4, 8) and row["type"] == "STT_OBJECT"
+                   for row in table.nm(name)):
+            raise ValueError(f"sample gauge {name!r} must be a named scalar object")
     for name in progress:
         rows = table.nm(name)
-        if not any(row["name"] == name and row["size"] == 4 and row["type"] == "STT_OBJECT"
+        if not any(row["name"] == name and row["size"] in (1, 2, 4, 8) and row["type"] == "STT_OBJECT"
                    for row in rows):
-            raise ValueError(f"progress symbol {name!r} must be a named 32-bit object")
+            raise ValueError(f"progress symbol {name!r} must be a named 1, 2, 4, or 8-byte object")
     for spec in relocations:
         section, pointer = spec.split("=", 1)
         if not any(row["name"] == pointer and row["size"] == 4 and row["type"] == "STT_OBJECT"
                    for row in table.nm(pointer)):
-            raise ValueError(f"base pointer {pointer!r} must be a named 32-bit object")
+            raise ValueError(f"base pointer {pointer!r} must be a named 1, 2, 4, or 8-byte object")
         if not any(section in table.sections(elf) for elf in table.sources):
             raise ValueError(f"relocated section {section!r} is absent from symbol sources")
     return {"path": str(config_path), "elfs": [str(elf) for elf in elf_paths],
-            "progress_symbols": progress, "rebase_symbols": relocations,
+            "progress_symbols": progress, "sample_gauges": gauges, "rebase_symbols": relocations,
             "mapped_symbols": len(normalized)}

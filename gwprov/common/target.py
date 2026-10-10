@@ -471,8 +471,13 @@ class HardwareTarget(Target):
             self._start_timeline()
             return
 
+        from ..hw_lifecycle import (assert_application_mode,
+                                    mark_backend_recovery_required)
+        assert_application_mode(self.backend, operation="start a hardware target")
+        mark_backend_recovery_required(self.backend, "starting gnwmanager RAM programmer")
         self.gnw = GnW(self.backend)
         self.gnw.start_gnwmanager()
+        mark_backend_recovery_required(self.backend, "gnwmanager RAM programmer")
 
         # Flash the bank the image was LINKED for. A bank-2 firmware written to
         # bank 1 boots nothing, and this used to be hardcoded to bank 1.
@@ -545,6 +550,7 @@ class HardwareTarget(Target):
             if self.precise_faults:
                 self._enable_precise_faults()
             self.backend.resume()
+            self._confirm_application_running()
             return
 
         base = 0x08100000 if self.image.intflash_bank == 2 else 0x08000000
@@ -552,6 +558,19 @@ class HardwareTarget(Target):
         self.backend.write_register("msp", self.gnw.read_uint32(base))
         self.backend.write_register("pc", self.gnw.read_uint32(base + 4))
         self.backend.resume()
+        self._confirm_application_running()
+
+    def _confirm_application_running(self):
+        from ..hw_lifecycle import (clear_backend_recovery_required,
+                                    inspect_target_mode)
+        state = inspect_target_mode(self.backend)
+        if state["halted"] or state["stubResident"]:
+            raise RuntimeError(
+                "firmware did not leave gnwmanager Recovery Mode; GWProv is "
+                "holding the target traffic guard. Check `gwprov ps` and use "
+                "`gwprov device recover` when the mailbox is idle."
+            )
+        clear_backend_recovery_required(self.backend)
 
     def _start_timeline(self):
         """Begin replaying --timeline over the probe, from THIS instant.

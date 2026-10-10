@@ -70,16 +70,26 @@ def inventory() -> list[dict]:
                  or lease_owner(f"adapter:{adapter_type}"))
         if owner is None and external and external.get("adapter") in (None, adapter_type):
             owner = external
+        detail = None
+        if owner:
+            detail = (f"interrupted {owner.get('phase', 'hardware operation')}; "
+                      "run `gwprov device recover` when idle"
+                      if owner.get("recovery_required") else owner.get("operation"))
         rows.append({"id": f"probe:{probe['id']}", "name": probe["name"],
                      "adapter": adapter_type, "type": "local", "state": "busy" if owner else "available",
-                     "detail": owner.get("operation") if owner else None})
+                     "detail": detail})
     for remote in list_remote():
         device_id = f"remote:{remote['url']}"
         owner = lease_owner(f"remote:{remote['url']}")
+        detail = None
+        if owner:
+            detail = (f"interrupted {owner.get('phase', 'hardware operation')}; "
+                      "run `gwprov device recover` when idle"
+                      if owner.get("recovery_required") else owner.get("operation"))
         rows.append({"id": device_id, "name": remote["name"], "adapter": "gnwmanager WebSocket",
                      "type": "remote", "state": "busy" if owner else "registered",
                      "url": remote["url"], "origin": remote["origin"],
-                     "detail": owner.get("operation") if owner else None})
+                     "detail": detail})
     return sorted(rows, key=lambda row: (row["type"], row["name"].casefold(), row["id"]))
 
 

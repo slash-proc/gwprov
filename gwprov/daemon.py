@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import queue
@@ -34,6 +35,7 @@ class ManagedVM:
         self.log_path = str(log_path)
         self.cleanup_path = cleanup_path
         self.created = time.time()
+        self.timing = {"mode": "default", "cycleSemantics": "virtual-elapsed-time"}
         self._lock = threading.RLock()
         self._request_id = 0
         self._messages: queue.Queue[dict | None] = queue.Queue()
@@ -50,6 +52,8 @@ class ManagedVM:
         self._request_id += 1
         self._send({"execute": "qmp_capabilities", "id": self._request_id})
         self._read_reply(self._request_id, timeout=10.0)
+        from .binary_identity import process_binary_identity
+        self.binary_identity = process_binary_identity(process.pid)
 
     @property
     def qmp_uri(self) -> str:
@@ -117,7 +121,7 @@ class ManagedVM:
                     "qmpSocket": self.qmp_uri, "qmpHandle": self.qmp_uri,
                     "qmpTransport": "daemon-stdio",
                     "display": "headless" if self.headless else "visible",
-                    "gdbPort": self.gdb_port, "created": self.created,
+                    "gdbPort": self.gdb_port, "created": self.created, "timing": self.timing, "binaryIdentity": self.binary_identity,
                     "stateDetail": f"GWemu exited with status {self.process.returncode}"}
         result = self.execute("query-status").get("return", {})
         running = result.get("running")
@@ -127,7 +131,7 @@ class ManagedVM:
                 "qmpStatus": result.get("status", "unknown"), "qmpSocket": self.qmp_uri,
                 "qmpHandle": self.qmp_uri, "qmpTransport": "daemon-stdio",
                 "display": "headless" if self.headless else "visible",
-                "gdbPort": self.gdb_port, "created": self.created}
+                "gdbPort": self.gdb_port, "created": self.created, "timing": self.timing, "binaryIdentity": self.binary_identity}
 
 
 class Service:
@@ -200,7 +204,7 @@ class Service:
                 return {"stopping": True}
             if operation == "ping":
                 self.last_busy = time.monotonic()
-                return {"daemonPid": os.getpid()}
+                return {"daemonPid": os.getpid(), "capabilities": ["gwemu-bin", "process-binary-inode", "timing-experimental-m7"]}
             raise ValueError(f"unsupported daemon operation: {operation!r}")
 
     def start_vm(self, message: dict) -> dict:
@@ -219,20 +223,40 @@ class Service:
                 profile, headless=headless, audio=audio, timeline=message.get("timeline"),
                 record_timeline=message.get("record_timeline"), gdb_port=gdb_port,
                 qmp_stdio=True, start_halted=bool(message.get("start_halted", False)),
-                shared_sd_root=message.get("shared_sd_root"))
+                shared_sd_root=message.get("shared_sd_root"),
+                timing_mode=message.get("timing_mode", "default"),
+                icount=message.get("icount"), rtc_epoch=message.get("rtc_epoch"),
+                gwemu_bin=message.get("gwemu_bin"))
         else:
             profile = "raw image"
             cmd, cwd, env, log_path, cleanup_path = image_launch_spec(
                 message.get("image", {}), headless=headless, audio=audio,
                 timeline=message.get("timeline"),
                 record_timeline=message.get("record_timeline"), gdb_port=gdb_port,
-                icount=message.get("icount"), keep_temp=bool(message.get("keep_temp", False)))
+                icount=message.get("icount"), keep_temp=bool(message.get("keep_temp", False)),
+                timing_mode=message.get("timing_mode", "default"), rtc_epoch=message.get("rtc_epoch"),
+                gwemu_bin=message.get("gwemu_bin"))
+        from .binary_identity import file_identity
+        expected_binary = file_identity(cmd[0]) if message.get("gwemu_bin") else None
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with log_path.open("w") as log:
                 process = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE,
                                            stdout=subprocess.PIPE, stderr=log, bufsize=0)
             vm = ManagedVM(process, profile, headless, gdb_port, log_path, cleanup_path)
+            if expected_binary and vm.binary_identity["sha256"] != expected_binary["sha256"]:
+                raise RuntimeError("GWemu executable changed between launch validation and startup")
+            with log_path.open("r", errors="replace") as startup_log:
+                for line in startup_log.read(8192).splitlines():
+                    if line.startswith("gwemu_version:"):
+                        vm.binary_identity["version"] = line.partition(":")[2].strip()
+                        break
+            mode = message.get("timing_mode", "default")
+            vm.timing = {"mode": mode, "icountShift": 0 if mode in ("baseline", "experimental-m7") else message.get("icount"),
+                         "rtcEpoch": message.get("rtc_epoch"),
+                         "cycleSemantics": "one-instruction-one-cycle" if mode == "baseline" else
+                                           "experimental-m7-issue-dependency-model" if mode == "experimental-m7" else "virtual-elapsed-time",
+                         "hardwareCycleAccurate": False}
         except Exception:
             process = locals().get("process")
             if process is not None:
@@ -343,8 +367,13 @@ def ensure_running(*, timeout: float = 8.0) -> None:
             pass
         log_path = runtime_directory() / "daemon.log"
         log = log_path.open("ab")
+        child_env = dict(os.environ)
+        package_root = str(Path(__file__).resolve().parent.parent)
+        child_env["PYTHONPATH"] = package_root + (os.pathsep + child_env["PYTHONPATH"]
+                                                    if child_env.get("PYTHONPATH") else "")
         kwargs: dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": log,
-                                  "stderr": subprocess.STDOUT, "close_fds": True}
+                                  "stderr": subprocess.STDOUT, "close_fds": True,
+                                  "env": child_env}
         if os.name == "nt":
             kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
                                        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
@@ -393,28 +422,55 @@ def _startup_lock():
         os.close(fd)
 
 
+def require_binary_override_support(binary):
+    if binary is None:
+        return
+    capabilities = request({"op": "ping"}, timeout=1.0).get("capabilities", [])
+    if "gwemu-bin" not in capabilities:
+        raise RuntimeError("running GWProv daemon does not support --gwemu-bin; finish active VM/hardware operations before restarting the daemon")
+
+
+def require_timing_support(timing_mode):
+    if timing_mode != "experimental-m7":
+        return
+    capabilities = request({"op": "ping"}, timeout=1.0).get("capabilities", [])
+    if "timing-experimental-m7" not in capabilities:
+        raise RuntimeError("running GWProv daemon does not support experimental-m7; finish active VM/hardware operations and let the idle daemon exit before retrying")
+
+
 def start_instance(profile: str, *, audio: bool = False, gdb_port: int | None = None,
                    headless: bool = False, timeline: str | None = None,
                    record_timeline: str | None = None,
                    start_halted: bool = False,
-                   shared_sd_root: str | None = None) -> dict:
+                   shared_sd_root: str | None = None, timing_mode: str = "default",
+                   icount: int | None = None, rtc_epoch: int | None = None,
+                   gwemu_bin: str | None = None) -> dict:
     ensure_running()
+    require_binary_override_support(gwemu_bin)
+    require_timing_support(timing_mode)
     return request({"op": "start-vm", "profile": profile, "audio": audio,
                     "gdb_port": gdb_port, "headless": headless,
                     "timeline": timeline, "record_timeline": record_timeline,
                     "start_halted": start_halted,
-                    "shared_sd_root": shared_sd_root}, timeout=20.0)["instance"]
+                    "shared_sd_root": shared_sd_root, "timing_mode": timing_mode,
+                    "icount": icount, "rtc_epoch": rtc_epoch, "gwemu_bin": gwemu_bin}, timeout=20.0)["instance"]
 
 
 def start_image(image: dict[str, str], *, audio: bool = False,
                 gdb_port: int | None = None, headless: bool = False,
                 timeline: str | None = None, record_timeline: str | None = None,
-                icount: int | None = None, keep_temp: bool = False) -> dict:
+                icount: int | None = None, keep_temp: bool = False,
+                timing_mode: str = "default", rtc_epoch: int | None = None,
+                gwemu_bin: str | None = None) -> dict:
     ensure_running()
+    require_binary_override_support(gwemu_bin)
+    require_timing_support(timing_mode)
     return request({"op": "start-vm", "image": image, "audio": audio,
                     "gdb_port": gdb_port, "headless": headless,
                     "timeline": timeline, "record_timeline": record_timeline,
-                    "icount": icount, "keep_temp": keep_temp}, timeout=20.0)["instance"]
+                    "icount": icount, "keep_temp": keep_temp,
+                    "timing_mode": timing_mode, "rtc_epoch": rtc_epoch,
+                    "gwemu_bin": gwemu_bin}, timeout=20.0)["instance"]
 
 
 def managed_instances(*, start: bool = False) -> list[dict]:

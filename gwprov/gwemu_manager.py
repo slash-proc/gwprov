@@ -242,7 +242,8 @@ def screenshot_qmp(qmp_socket: str, output: str | Path | None = None) -> dict[st
                 prefix=".gwprov-screenshot-", suffix=".ppm",
                 dir=output_path.parent, delete=False) as temporary:
             temp_path = Path(temporary.name)
-        _qmp_execute(str(qmp_path), "screendump", {"filename": str(temp_path)})
+        endpoint = qmp_socket if qmp_socket.startswith("gwprov://") else str(qmp_path)
+        _qmp_execute(endpoint, "screendump", {"filename": str(temp_path)})
         width, height, pixels = _read_ppm(temp_path.read_bytes())
         output_path.write_bytes(_rgb_to_png(width, height, pixels))
     finally:
@@ -1032,7 +1033,9 @@ def set_instance_running(profile: str | None = None, *, pid: int | None = None,
 def start_instance(profile: str, *, audio: bool = False,
                    gdb_port: int | None = None, qmp_socket: str | None = None,
                    headless: bool = False, timeline: str | None = None,
-                   record_timeline: str | None = None) -> int:
+                   record_timeline: str | None = None, timing_mode: str = "default",
+                   icount: int | None = None, rtc_epoch: int | None = None,
+                   gwemu_bin: str | None = None) -> int:
     from .profiles import DeviceProfile
 
     device = DeviceProfile.load(profile)
@@ -1051,7 +1054,8 @@ def start_instance(profile: str, *, audio: bool = False,
             gdb_port = probe.getsockname()[1]
     from .daemon import start_instance as daemon_start
     row = daemon_start(str(root), audio=audio, gdb_port=gdb_port, headless=headless,
-                      timeline=timeline, record_timeline=record_timeline)
+                      timeline=timeline, record_timeline=record_timeline,
+                      timing_mode=timing_mode, icount=icount, rtc_epoch=rtc_epoch, gwemu_bin=gwemu_bin)
     display = "headless" if headless else "visible"
     print(f"Started {display} GWemu for {root} (pid {row['pid']}); "
           f"GDB :{gdb_port}; QMP managed by GWProv daemon.", flush=True)

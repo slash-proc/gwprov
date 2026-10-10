@@ -29,6 +29,7 @@ class SymbolTable:
         self._symbol_sections: dict[str, str] = {}
         self._symbol_types: dict[str, str] = {}
         self._symbol_sizes: dict[str, int] = {}
+        self._symbol_file_hints: dict[str, str] = {}
         self._sections: dict[Path, dict[str, tuple[int, int]]] = {}
         self._section_deltas: dict[tuple[Path, str], int] = {}
         self._cfi: dict[Path, list[tuple[int, int, FDE]]] = {}
@@ -37,6 +38,8 @@ class SymbolTable:
         self._function_sources: dict[Path, list[dict]] = {}
 
     def load(self, path: str | Path) -> int:
+        from .debug_types import clear_layout_caches
+        clear_layout_caches()
         elf = Path(path).expanduser().resolve()
         if not elf.is_file():
             raise FileNotFoundError(elf)
@@ -55,10 +58,18 @@ class SymbolTable:
             }
             count = 0
             function_rows = []
+            current_file = None
             for symbol in symtab.iter_symbols() if isinstance(symtab, SymbolTableSection) else ():
                 if not symbol.name:
                     continue
                 name = symbol.name
+                if str(symbol['st_info']['type']) == 'STT_FILE':
+                    current_file = name
+                if (str(symbol['st_info']['bind']) == 'STB_LOCAL' and current_file
+                        and str(symbol['st_info']['type']) != 'STT_FILE'):
+                    self._symbol_file_hints[name] = current_file
+                else:
+                    self._symbol_file_hints.pop(name, None)
                 if str(symbol["st_info"]["type"]) == "STT_FUNC":
                     section_index = symbol["st_shndx"]
                     function_rows.append({"name": name, "address": int(symbol["st_value"]),
@@ -84,6 +95,47 @@ class SymbolTable:
             self.sources.append(elf)
         self._function_sources[elf] = function_rows
         return count
+
+    def compilation_units(self, *, elf: str | Path | None = None) -> list[dict]:
+        """Return original DWARF CU source and compiler producer strings in order."""
+        selected = Path(elf).expanduser().resolve() if elf is not None else None
+        result = []
+        def value(die, name):
+            attribute = die.attributes.get(name)
+            if attribute is None:
+                return None
+            raw = attribute.value
+            return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        for owner in self.sources:
+            if owner in self._map_sources or (selected is not None and owner != selected):
+                continue
+            with owner.open("rb") as stream:
+                dwarf = ELFFile(stream).get_dwarf_info()
+                for cu in dwarf.iter_CUs():
+                    die = cu.get_top_DIE()
+                    result.append({"elf": str(owner), "offset": cu.cu_offset,
+                                   "source": value(die, "DW_AT_name"),
+                                   "directory": value(die, "DW_AT_comp_dir"),
+                                   "producer": value(die, "DW_AT_producer"),
+                                   "language": value(die, "DW_AT_language"),
+                                   "dwarf_version": cu["version"]})
+        if selected is not None and selected not in self.sources:
+            raise ValueError(f"ELF is not loaded: {selected}")
+        return result
+
+    def compact_debug(self, output: str | Path, *, elf: str | Path | None = None) -> dict:
+        """Create a separate compressed-debug ELF without changing loadable data."""
+        from .elf_tools import compact_debug
+        choices = [source for source in self.sources if source not in self._map_sources]
+        if elf is None:
+            if len(choices) != 1:
+                raise ValueError("specify elf= when more than one ELF is loaded")
+            owner = choices[0]
+        else:
+            owner = Path(elf).expanduser().resolve()
+            if owner not in choices:
+                raise ValueError("compression requires a loaded ELF, not a symbol map")
+        return compact_debug(owner, output)
 
     def functions(self) -> list[dict]:
         """All ELF/map routines, including repeated static names across ELFs."""
@@ -184,12 +236,20 @@ class SymbolTable:
     def find(self, prefix: str) -> dict[str, int]:
         return {name: self[name] for name in self._symbols if prefix in name}
 
+    def source_hint(self, symbol: str) -> str | None:
+        """Return the owning ELF's local STT_FILE hint, never a guessed CU."""
+        return self._symbol_file_hints.get(symbol)
+
+    def link_address(self, symbol: str) -> int:
+        """Original ELF address for DWARF selection, before runtime rebasing."""
+        return self._symbols[symbol]
+
     def type_layout(self, symbol: str) -> dict:
         """Describe a global's C layout from its owning ELF's DWARF."""
         from .debug_types import variable_layout
         if self.owner(symbol) in self._map_sources:
             raise ValueError("compact symbol maps have no DWARF type layouts")
-        return variable_layout(self.owner(symbol), symbol)
+        return variable_layout(self.owner(symbol), symbol, self.source_hint(symbol), self.link_address(symbol))
 
     def nm(self, query: str = "", elf: str | Path | None = None) -> list[dict]:
         """Return structured nm-style symbol rows, optionally filtered by ELF."""
@@ -206,8 +266,16 @@ class SymbolTable:
                          "elf": str(owner)})
         return sorted(rows, key=lambda row: (row["address"], row["name"]))
 
+    def disassembly_tool(self, symbol: str) -> dict:
+        """Report the ELF machine and selected executable/version for a symbol."""
+        from .elf_binutils import select_elf_tool
+        owner = self.owner(symbol)
+        if owner in self._map_sources:
+            raise ValueError("ELF disassembly requires an ELF, not a compact symbol map")
+        return select_elf_tool(owner, "objdump")
+
     def disassemble(self, symbol: str, elf: str | Path | None = None) -> str:
-        """Disassemble one ELF symbol with arm-none-eabi-objdump or objdump."""
+        """Disassemble one symbol with binutils selected for its ELF machine."""
         if symbol not in self._symbols:
             raise KeyError(f"symbol {symbol!r} is not loaded")
         owner = (Path(elf).expanduser().resolve() if elf is not None
@@ -216,12 +284,15 @@ class SymbolTable:
             raise ValueError(f"symbol {symbol!r} does not belong to {owner}")
         if owner in self._map_sources:
             raise ValueError("ELF disassembly requires an ELF, not a compact symbol map")
-        tool = shutil.which("arm-none-eabi-objdump") or shutil.which("objdump")
-        if not tool:
-            raise FileNotFoundError("arm-none-eabi-objdump or objdump is required")
-        result = subprocess.run(
-            [tool, "-d", "-C", f"--disassemble={symbol}", str(owner)],
-            check=True, capture_output=True, text=True)
+        from .elf_binutils import select_elf_tool
+        selection = select_elf_tool(owner, "objdump")
+        try:
+            result = subprocess.run(
+                [selection["path"], "-d", "-C", f"--disassemble={symbol}", str(owner)],
+                check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as error:
+            raise ValueError(f"{selection['path']} cannot disassemble ELF machine "
+                             f"{selection['machine']}: {error.stderr.strip()}") from error
         return result.stdout
 
     def source_locations(self, addresses) -> list[dict]:
@@ -571,6 +642,26 @@ class GwemuGDBBackend(GDBBackend):
         record_control_request(getattr(self, "_control_audit_socket", None), "gdb", "resume")
         return super().resume()
 
+    def single_step(self):
+        """Consume the step stop packet; the base transport treats it as asynchronous."""
+        from .qmp import record_control_request
+        record_control_request(getattr(self, "_control_audit_socket", None), "gdb", "step")
+        packet = b"$s#73"
+        self._write(packet)
+        while True:
+            character = self._read(1)
+            if character == b"+":
+                break
+            if character == b"-":
+                self._write(packet)
+            elif character == b"$":
+                self._read_packet_data()
+        reply = self._wait_for_packet()
+        if not reply.startswith((b"T", b"S")):
+            raise RuntimeError(f"unexpected single-step reply: {reply!r}")
+        self._is_running = False
+        return reply
+
     def open(self, *, halt: bool = False):
         """Attach without releasing a paused target when halt=True."""
         from .qmp import record_control_request
@@ -657,40 +748,76 @@ class DebugSession:
         self.symbols = SymbolTable()
 
     def halt(self):
-        return self.backend.halt()
+        result = self.backend.halt()
+        if self.transport == "gwemu":
+            self.backend._is_running = False
+        return result
 
     def resume(self):
-        return self.backend.resume()
+        result = self.backend.resume()
+        if self.transport == "gwemu":
+            self.backend._is_running = True
+        return result
+
+    def _target_state(self) -> str:
+        if self.transport == "gwemu":
+            return "running" if self.backend._is_running else "halted"
+        target = getattr(self.backend, "target", None)
+        if target is not None:
+            return target.get_state().name.lower()
+        # OpenOCD and remote gnwmanager both expose memory reads. DHCSR is a
+        # non-invasive Cortex-M execution-state query.
+        dhcsr = int.from_bytes(self.backend.read_memory(0xE000EDF0, 4), "little")
+        if dhcsr & (1 << 17):
+            return "halted"
+        if dhcsr & (1 << 19):
+            return "lockup"
+        if dhcsr & (1 << 18):
+            return "sleeping"
+        if dhcsr & (1 << 25):
+            return "reset"
+        return "running"
+
+    def _target_is_running(self) -> bool:
+        # Cortex-M core registers are not readable while the core is sleeping
+        # in WFI. Treat sleep as active execution for helpers that temporarily
+        # halt the target to capture coherent register or memory state.
+        return self._target_state() in {"running", "sleeping"}
 
     def wait_stopped(self, timeout: float = 30.0, poll_interval: float = 0.05) -> dict:
-        """Wait through QMP without interrupting the target or competing with GDB.
+        """Wait for a debug stop without interrupting a running target.
 
-        A timeout leaves the target running and returns stopped=False. A real
-        stop updates the backend state before reading the stop packet/registers.
+        GWemu uses QMP. Hardware polls the Cortex-M state through the selected
+        probe/gnwmanager session while its process-shared target lease is held.
+        A timeout leaves execution running.
         """
-        if self.transport != "gwemu" or not self.qmp_socket:
-            raise ValueError("wait_stopped requires a GWemu QMP endpoint")
+        if self.transport == "gwemu" and not self.qmp_socket:
+            raise ValueError("GWemu wait_stopped requires a QMP endpoint")
         if timeout < 0 or poll_interval <= 0:
             raise ValueError("timeout must be nonnegative and poll_interval positive")
         deadline = time.monotonic() + timeout
         while True:
-            status = self.qmp("query-status").get("return", {})
-            if not status.get("running", False):
-                self.backend._is_running = False
-                # QEMU treats '?' as initial attachment and deletes all
-                # breakpoints. Poll QMP and read registers without that packet.
-                return {"stopped": True, "status": status.get("status"),
+            if self.transport == "gwemu":
+                status = self.qmp("query-status").get("return", {})
+                running = status.get("running", False)
+                state = status.get("status")
+            else:
+                state = self._target_state()
+                running = state in {"running", "sleeping"}
+            if not running:
+                if self.transport == "gwemu":
+                    self.backend._is_running = False
+                return {"stopped": True, "status": state,
                         "stop_reply": None, "registers": self.regs()}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return {"stopped": False, "status": status.get("status"),
-                        "reason": "timeout"}
+                return {"stopped": False, "status": state, "reason": "timeout"}
             time.sleep(min(poll_interval, remaining))
 
     def run_until(self, location: str | int, timeout: float = 30.0) -> dict:
         """Resume to one temporary breakpoint; report other stops and timeouts."""
-        if self.transport != "gwemu" or not self.qmp_socket:
-            raise ValueError("run_until requires a GWemu QMP endpoint")
+        if self.transport == "gwemu" and not self.qmp_socket:
+            raise ValueError("GWemu run_until requires a QMP endpoint")
         address = (self.at(location) if isinstance(location, str) else location) & ~1
         response = self.bp(address)
         if response != "OK":
@@ -720,16 +847,27 @@ class DebugSession:
         """Execute one instruction and leave the target halted."""
         self.backend.halt()
         if self.transport == "gwemu":
-            reply = self.backend._send_command(b"s")
+            reply = self.backend.single_step()
             self.backend._is_running = False
             return reply.decode("ascii", errors="replace")
+        target = getattr(self.backend, "target", None)
+        if target is not None:
+            target.step()
+            return "stepped"
         return self.backend("step", decode=False).decode("utf-8", errors="replace")
 
     def reg(self, name: str) -> int:
-        return self.backend.read_register(name)
+        was_running = self._target_is_running()
+        if was_running:
+            self.backend.halt()
+        try:
+            return self.backend.read_register(name)
+        finally:
+            if was_running:
+                self.backend.resume()
 
     def regs(self) -> dict[str, int]:
-        was_running = self.backend._is_running
+        was_running = self._target_is_running()
         if was_running:
             self.backend.halt()
         try:
@@ -813,7 +951,7 @@ class DebugSession:
         """Return symbol-resolved ARM call frames from the current target state."""
         if max_frames < 1:
             raise ValueError("max_frames must be positive")
-        was_running = self.backend._is_running
+        was_running = self._target_is_running()
         if was_running:
             self.backend.halt()
         try:
@@ -841,7 +979,7 @@ class DebugSession:
                 self.backend.resume()
 
     def where(self) -> dict:
-        was_running = self.backend._is_running
+        was_running = self._target_is_running()
         if was_running:
             self.backend.halt()
         try:
@@ -877,13 +1015,133 @@ class DebugSession:
             raise ValueError(f"{symbol} is {layout['size']} bytes; limit is {max_bytes}")
         return decode_value(layout, self.read(self.at(symbol), layout["size"]))
 
+    def memory_path(self, expression: str) -> dict:
+        """Resolve a dotted C global/member path using DWARF and live pointers."""
+        from .debug_types import path_layout
+        parts = expression.split(".")
+        if not parts or any(not part.isidentifier() for part in parts):
+            raise ValueError("memory paths use GLOBAL.member identifiers")
+        root = parts[0]
+        layout = path_layout(self.symbols.owner(root), root, tuple(parts[1:]),
+                             self.symbols.source_hint(root), self.symbols.link_address(root))
+        address = self.at(root)
+        for operation in layout["operations"]:
+            if operation["kind"] == "dereference":
+                address = int.from_bytes(self.read(address, operation["size"]),
+                                         layout["type"]["byteorder"])
+                if address == 0:
+                    raise ValueError(f"null pointer resolving {expression!r}")
+            else:
+                address += operation["bytes"]
+        return {"expression": expression, "address": address,
+                "size": layout["type"]["size"], "type": layout["type"]}
+
+    def read_path(self, expression: str, *, max_bytes: int = 65536):
+        """Decode a dotted C global/member path; intermediate pointers are followed."""
+        from .debug_types import decode_value
+        resolved = self.memory_path(expression)
+        if resolved["size"] > max_bytes:
+            raise ValueError(f"{expression} is {resolved['size']} bytes; limit is {max_bytes}")
+        return decode_value(resolved["type"], self.read(resolved["address"], resolved["size"]))
+
+    def read_paths(self, expressions, *, max_bytes=65536, max_total_bytes=4 * 1024 * 1024,
+                   errors="raise") -> dict:
+        """Read typed fields together, sharing pointer reads and adjacent ranges.
+
+        Only requested bytes are read: no gap filling or MMIO over-read. Pointer
+        values are cached for this call only. Caller owns any required halt.
+        Returns explicit values/errors plus transport metrics; no app schema.
+        """
+        from .debug_types import path_layouts, decode_value
+        if errors not in ("raise", "collect"):
+            raise ValueError("errors must be raise or collect")
+        if max_bytes <= 0 or max_total_bytes <= 0:
+            raise ValueError("read limits must be positive")
+        if isinstance(expressions, str):
+            raise ValueError("read_paths requires an iterable of paths, not one string")
+        expressions = tuple(dict.fromkeys(expressions))
+        groups, failures, resolved = {}, {}, {}
+        pointer_cache = {}
+        def fail(expression, error):
+            if errors == "raise":
+                raise error
+            failures[expression] = {"type": type(error).__name__, "message": str(error)}
+        for expression in expressions:
+            parts = expression.split(".")
+            if not parts or any(not part.isidentifier() for part in parts):
+                raise ValueError("memory paths use GLOBAL.member identifiers")
+            try:
+                owner = self.symbols.owner(parts[0])
+            except (KeyError, ValueError) as error:
+                fail(expression, error)
+                continue
+            groups.setdefault((owner, parts[0]), []).append((expression, tuple(parts[1:])))
+        for (owner, root), fields in groups.items():
+            try:
+                hint = getattr(self.symbols, 'source_hint', lambda symbol: None)(root)
+                options = {}
+                if hint:
+                    options['source_hint'] = hint
+                if hasattr(self.symbols, 'link_address'):
+                    options['symbol_address'] = self.symbols.link_address(root)
+                plans = path_layouts(owner, root, [members for _, members in fields], **options)
+            except (KeyError, ValueError) as error:
+                for expression, _ in fields:
+                    fail(expression, error)
+                continue
+            for expression, members in fields:
+                plan = plans[members]
+                try:
+                    if "error" in plan:
+                        exception = KeyError if plan["error_type"] == "KeyError" else ValueError
+                        raise exception(plan["error"])
+                    if plan["type"]["size"] > max_bytes:
+                        raise ValueError(f"{expression} exceeds the per-value read limit")
+                    address = self.at(root)  # Includes current section rebasing.
+                    for operation in plan["operations"]:
+                        if operation["kind"] == "dereference":
+                            key = (address, operation["size"])
+                            if key not in pointer_cache:
+                                pointer_cache[key] = self.read(*key)
+                            address = int.from_bytes(pointer_cache[key], plan["type"]["byteorder"])
+                            if address == 0:
+                                raise ValueError(f"null pointer resolving {expression!r}")
+                        else:
+                            address += operation["bytes"]
+                    resolved[expression] = (address, plan["type"])
+                except (KeyError, ValueError) as error:
+                    fail(expression, error)
+        ranges = []
+        for address, layout in sorted(resolved.values(), key=lambda item: item[0]):
+            end = address + layout["size"]
+            if ranges and address <= ranges[-1][1]:
+                ranges[-1][1] = max(ranges[-1][1], end)
+            else:
+                ranges.append([address, end])
+        total = sum(end - start for start, end in ranges)
+        if total > max_total_bytes:
+            raise ValueError(f"requested memory union {total} exceeds total read limit")
+        regions = [(start, end, self.read(start, end - start)) for start, end in ranges]
+        values = {}
+        for expression, (address, layout) in resolved.items():
+            start, _, data = next(region for region in regions
+                                 if region[0] <= address and address + layout["size"] <= region[1])
+            offset = address - start
+            values[expression] = decode_value(layout, data[offset:offset + layout["size"]])
+        return {"values": {name: values[name] for name in expressions if name in values},
+                "errors": {name: failures[name] for name in expressions if name in failures},
+                "memory_reads": len(regions), "pointer_reads": len(pointer_cache),
+                "requested_union_bytes": total,
+                "transport_bytes": total + sum(len(data) for data in pointer_cache.values()),
+                "regions": [{"address": start, "size": end - start} for start, end in ranges]}
+
     def read_ring(self, symbol: str, head_symbol: str, *, max_bytes: int = 65536) -> dict:
         """Read a fixed C array with a monotonic next-write head, oldest first.
 
         The two globals are sampled under one halt. The head must count all
         writes, rather than only hold a wrapped array index.
         """
-        was_running = self.backend._is_running
+        was_running = self._target_is_running()
         if was_running:
             self.halt()
         try:
@@ -922,7 +1180,8 @@ class DebugSession:
         return settings
 
     def profile(self, *, duration=15.0, interval=0.02, progress_symbols=None,
-                rebase_symbols=None, stop_event=None, stall_threshold=1.0) -> dict:
+                rebase_symbols=None, stop_event=None, stall_threshold=1.0, sample_gauges=None,
+                progress_interval=1.0) -> dict:
         """Sample native function PCs through QMP alongside this debug session."""
         if self.transport != "gwemu" or not self.qmp_socket:
             raise RuntimeError("native PC sampling requires a GWemu QMP socket")
@@ -932,23 +1191,272 @@ class DebugSession:
             progress_symbols = settings.get("progress_symbols") or None
         if rebase_symbols is None:
             rebase_symbols = settings.get("rebase_symbols")
+        if sample_gauges is None:
+            sample_gauges = settings.get("sample_gauges")
         return sample_profile(self.qmp_socket, self.symbols, duration=duration,
                               interval=interval, progress_symbols=progress_symbols,
                               rebase_symbols=rebase_symbols, stop_event=stop_event,
-                              stall_threshold=stall_threshold)
+                              stall_threshold=stall_threshold, sample_gauges=sample_gauges,
+                              progress_interval=progress_interval)
 
     def bp(self, address: int):
         """Set a hardware breakpoint, suitable for flash code addresses."""
         address &= ~1  # RSP breakpoints use the instruction address, not Thumb's ISA bit.
         if self.transport == "gwemu":
             return self.backend._send_command(f"Z1,{address:x},2".encode()).decode()
-        return self.backend(f"bp 0x{address:08x} 2 hw", decode=False).decode().strip()
+        target = getattr(self.backend, "target", None)
+        if target is not None:
+            from pyocd.core.target import Target
+            if not target.set_breakpoint(address, Target.BreakpointType.HW):
+                raise RuntimeError(f"could not set hardware breakpoint at 0x{address:08x}; "
+                                   "the probe may have no free comparator slots")
+            return "OK"
+        if hasattr(self.backend, "__call__"):
+            return self.backend(f"bp 0x{address:08x} 2 hw", decode=False).decode().strip()
+        raise NotImplementedError("hardware breakpoints are unavailable for this remote backend")
+
+    def watchpoint(self, address: int, size: int = 4, access: str = "read"):
+        """Set a DWT or remote-debug watchpoint on a memory access.
+
+        This is useful for discovering code that reads a known MMIO register
+        when firmware symbols are unavailable. It watches memory accesses,
+        not the value of a CPU register.
+        """
+        access = access.strip().lower().replace("-", "_")
+        rsp_types = {"write": 2, "read": 3, "read_write": 4, "access": 4}
+        if access not in {"read", "write", "read_write", "access"}:
+            raise ValueError("access must be 'read', 'write', or 'read_write'")
+        if not isinstance(address, int) or address < 0 or address > 0xFFFFFFFF:
+            raise ValueError("watchpoint address must be a 32-bit integer")
+        if size not in {1, 2, 4, 8}:
+            raise ValueError("watchpoint size must be 1, 2, 4, or 8 bytes")
+        if self.transport == "gwemu":
+            kind = rsp_types[access]
+            reply = self.backend._send_command(
+                f"Z{kind},{address:x},{size:x}".encode()).decode()
+            if reply != "OK":
+                raise RuntimeError(f"GWemu watchpoint installation failed: {reply}")
+            return "OK"
+        target = getattr(self.backend, "target", None)
+        if target is not None:
+            from pyocd.core.target import Target
+            kinds = {"read": Target.WatchpointType.READ,
+                     "write": Target.WatchpointType.WRITE,
+                     "read_write": Target.WatchpointType.READ_WRITE,
+                     "access": Target.WatchpointType.READ_WRITE}
+            if not target.set_watchpoint(address, size, kinds[access]):
+                raise RuntimeError(f"could not set {access} watchpoint at "
+                                   f"0x{address:08x}; the target may have no free DWT comparators")
+            return "OK"
+        if hasattr(self.backend, "_send_command"):
+            kind = rsp_types[access]
+            reply = self.backend._send_command(
+                f"Z{kind},{address:x},{size:x}".encode()).decode()
+            if reply != "OK":
+                raise RuntimeError(f"remote watchpoint installation failed: {reply}")
+            return "OK"
+        raise NotImplementedError("watchpoints are unavailable for this debug backend")
+
+    def clear_watchpoint(self, address: int, size: int = 4, access: str = "read"):
+        """Remove a watchpoint previously set with :meth:`watchpoint`."""
+        access = access.strip().lower().replace("-", "_")
+        if access not in {"read", "write", "read_write", "access"}:
+            raise ValueError("access must be 'read', 'write', or 'read_write'")
+        if self.transport == "gwemu":
+            kind = {"write": 2, "read": 3, "read_write": 4, "access": 4}[access]
+            reply = self.backend._send_command(
+                f"z{kind},{address:x},{size:x}".encode()).decode()
+            if reply != "OK":
+                raise RuntimeError(f"GWemu watchpoint removal failed: {reply}")
+            return "OK"
+        target = getattr(self.backend, "target", None)
+        if target is not None:
+            from pyocd.core.target import Target
+            kinds = {"read": Target.WatchpointType.READ,
+                     "write": Target.WatchpointType.WRITE,
+                     "read_write": Target.WatchpointType.READ_WRITE,
+                     "access": Target.WatchpointType.READ_WRITE}
+            target.remove_watchpoint(address, size, kinds[access])
+            return "OK"
+        if hasattr(self.backend, "_send_command"):
+            kind = {"write": 2, "read": 3, "read_write": 4, "access": 4}[access]
+            reply = self.backend._send_command(
+                f"z{kind},{address:x},{size:x}".encode()).decode()
+            if reply != "OK":
+                raise RuntimeError(f"remote watchpoint removal failed: {reply}")
+            return "OK"
+        raise NotImplementedError("watchpoints are unavailable for this debug backend")
+
+    def inject_return(self, return_at: str | int, value: int, *,
+                      register: str = "r0", timeout: float = 30.0) -> dict:
+        """Override one function result at its return site, then resume.
+
+        ``return_at`` is the address of the instruction reached after the
+        function has computed its result (or a symbol resolving to that site).
+        On ARM EABI, scalar results normally use r0. This primitive is generic;
+        callers must know the target routine's ABI and result meaning.
+        """
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError("injected value must fit in a 32-bit register")
+        if register not in {f"r{index}" for index in range(13)}:
+            raise ValueError("return register must be r0 through r12")
+        address = (self.at(return_at) if isinstance(return_at, str) else return_at) & ~1
+        result = self.run_until(address, timeout=timeout)
+        if not result.get("hit"):
+            return result
+        self.backend.write_register(register, value)
+        result["injected"] = {"address": address, "register": register,
+                              "value": value}
+        self.resume()
+        return result
+
+    def press_button(self, return_at: str | int, mask: int, *,
+                     release_polls: int = 1, hold_polls: int = 1,
+                     release_value: int = 0, register: str = "r0",
+                     timeout: float = 30.0) -> dict:
+        """Pulse a button bit through a routine returning a button mask.
+
+        This works with any firmware whose button-read routine returns a mask
+        in the selected register. It first injects release polls to establish
+        a clean edge, injects ``mask`` for ``hold_polls``, then injects a
+        release. Supply the return-site symbol/address and firmware's button
+        mask; the debugger does not assume a project-specific mapping.
+        """
+        if release_polls < 0 or hold_polls < 1:
+            raise ValueError("release_polls must be nonnegative and hold_polls at least one")
+        if not 0 <= mask <= 0xFFFFFFFF or not 0 <= release_value <= 0xFFFFFFFF:
+            raise ValueError("button masks must fit in a 32-bit register")
+        stages = ([release_value] * release_polls + [mask] * hold_polls + [release_value])
+        captures = []
+        for value in stages:
+            result = self.inject_return(return_at, value, register=register, timeout=timeout)
+            captures.append(result)
+            if not result.get("hit"):
+                return {"pressed": False, "reason": "routine return was not reached",
+                        "stages": captures}
+        return {"pressed": True, "return_at": (self.at(return_at)
+                                                   if isinstance(return_at, str)
+                                                   else return_at) & ~1,
+                "mask": mask, "release_polls": release_polls,
+                "hold_polls": hold_polls, "stages": captures}
 
     def clear_bp(self, address: int):
         address &= ~1
         if self.transport == "gwemu":
             return self.backend._send_command(f"z1,{address:x},2".encode()).decode()
-        return self.backend(f"rbp 0x{address:08x}", decode=False).decode().strip()
+        target = getattr(self.backend, "target", None)
+        if target is not None:
+            target.remove_breakpoint(address)
+            return "OK"
+        if hasattr(self.backend, "__call__"):
+            return self.backend(f"rbp 0x{address:08x}", decode=False).decode().strip()
+        raise NotImplementedError("hardware breakpoints are unavailable for this remote backend")
+
+    def arm_fault_breakpoints(self) -> list[dict]:
+        """Install available Cortex-M fault-entry breakpoints before repro."""
+        names = ("common_fault_handler_c", "HardFault_Handler", "MemManage_Handler",
+                 "BusFault_Handler", "UsageFault_Handler")
+        armed = []
+        seen = set()
+        for name in names:
+            try:
+                address = self.at(name) & ~1
+            except KeyError:
+                continue
+            if address in seen:
+                continue
+            seen.add(address)
+            self.bp(address)
+            armed.append({"symbol": name, "address": address})
+        if not armed:
+            raise RuntimeError("loaded symbols contain no recognized Cortex-M fault handlers")
+        return armed
+
+    def wait_fault(self, timeout: float = 30.0, poll_interval: float = 0.05) -> dict:
+        """Wait for an armed stop and return symbolized stack/fault evidence."""
+        stop = self.wait_stopped(timeout, poll_interval)
+        if not stop.get("stopped"):
+            return {"stop": stop, "triage": None}
+        return {"stop": stop, "triage": self.traceback()}
+
+    def watchdog_context(self, registers: dict[str, int] | None = None,
+                         max_frames: int = 32) -> dict:
+        """Decode the interrupted Cortex-M context at a watchdog IRQ entry.
+
+        Unlike a fault, a watchdog reset does not preserve the faulting stack.
+        STM32 WWDG early-wakeup arrives as an ordinary IRQ before reset, so its
+        hardware-stacked PC/LR can be recovered while halted at
+        ``WWDG_IRQHandler``. The result includes source-resolved interrupted
+        frames when symbols and unwind data are available.
+        """
+        import struct
+        current = registers or self.regs()
+        exception = current.get("xpsr", 0) & 0x1ff
+        exc_return = current.get("lr", 0)
+        if exception < 16 or exc_return & 0xffffff00 != 0xffffff00:
+            return {"available": False,
+                    "reason": "not at a Cortex-M exception entry; halt at WWDG_IRQHandler"}
+        frame_address = self.reg("psp") if exc_return & 4 else current["sp"]
+        extended = not bool(exc_return & (1 << 4))
+        # STM32 Cortex-M exception frames place the core registers at the
+        # exception SP; an extended FP frame follows the eight core words.
+        core_frame_address = frame_address
+        raw = self.read(core_frame_address, 32)
+        values = struct.unpack("<8I", raw)
+        names = ["r0", "r1", "r2", "r3", "r12", "lr", "pc", "xpsr"]
+        stacked = dict(zip(names, values))
+        if not stacked["xpsr"] & (1 << 24):
+            return {"available": False, "reason": "stacked xPSR has no Thumb bit",
+                    "frame_address": frame_address, "frame_bytes": raw.hex()}
+        padding = 4 if stacked["xpsr"] & (1 << 9) else 0
+        interrupted = dict(current)
+        interrupted.update(stacked)
+        interrupted["sp"] = frame_address + 32 + (72 if extended else 0) + padding
+        handler_pc = current.get("pc", 0)
+        handler = self.symbols.nearest(handler_pc)
+        result = {"available": True, "exception_number": exception,
+                  "handler": handler, "frame_address": frame_address,
+                  "core_frame_address": core_frame_address,
+                  "extended_fp_frame": extended, "frame_bytes": raw.hex(),
+                  "handler_registers": current, "interrupted_registers": interrupted,
+                  "interrupted_pc": self.symbols.source_location(stacked["pc"]),
+                  "interrupted_lr": self.symbols.source_location(stacked["lr"]),
+                  "interrupted_traceback": self.symbols.unwind(interrupted, self.read, max_frames)}
+        result["code_context"] = self.symbols.code_context(stacked["pc"])
+        return result
+
+    def arm_watchdog_breakpoints(self) -> list[dict]:
+        """Break before an STM32 WWDG reset so the interrupted stack survives."""
+        names = ("WWDG_IRQHandler", "WWDG1_IRQHandler")
+        armed = []
+        seen = set()
+        for name in names:
+            try:
+                address = self.at(name) & ~1
+            except KeyError:
+                continue
+            if address in seen:
+                continue
+            seen.add(address)
+            self.bp(address)
+            armed.append({"symbol": name, "address": address})
+        if not armed:
+            raise RuntimeError("loaded symbols contain no WWDG interrupt handler; "
+                               "load firmware symbols or set a breakpoint manually")
+        return armed
+
+    def wait_watchdog(self, timeout: float = 30.0,
+                      poll_interval: float = 0.05) -> dict:
+        """Wait for a WWDG early-wakeup IRQ and report its interrupted code path."""
+        stop = self.wait_stopped(timeout, poll_interval)
+        if not stop.get("stopped"):
+            return {"stop": stop, "watchdog": None}
+        registers = stop.get("registers") or self.regs()
+        context = self.watchdog_context(registers)
+        if not context.get("available"):
+            return {"stop": stop, "watchdog": context,
+                    "triage": self.traceback()}
+        return {"stop": stop, "watchdog": context}
 
     def at(self, symbol: str) -> int:
         return self.symbols[symbol]
@@ -978,6 +1486,27 @@ class DebugSession:
             raise RuntimeError("pass --qmp-socket to enable GWemu screenshots")
         from .gwemu_manager import screenshot_qmp
         return screenshot_qmp(self.qmp_socket, path)
+
+    def diagnose_qmp(self, path=None, *, max_frames: int = 32) -> dict:
+        """Recover halted-target evidence when the GDB connection is unusable."""
+        if self.transport != "gwemu" or not self.qmp_socket:
+            raise ValueError("QMP diagnosis requires a managed GWemu endpoint")
+        from .qmp import QMPConnection
+        with QMPConnection(self.qmp_socket) as qmp:
+            state = qmp.execute("query-status")["return"]
+            if state.get("running"):
+                raise ValueError("QMP diagnosis requires an intentionally halted target")
+            registers = qmp.registers()
+            trace = self.symbols.unwind(registers, qmp.read_memory, max_frames)
+            trace["registers"] = registers
+            trace["code_context"] = self.symbols.code_context(registers["pc"])
+            trace["source_location"] = self.symbols.source_location(registers["pc"])
+            raw = qmp.read_memory(0xE000ED28, 20)
+            fault_registers = {name: int.from_bytes(raw[index * 4:index * 4 + 4], "little")
+                               for index, name in enumerate(("cfsr", "hfsr", "dfsr", "mmfar", "bfar"))}
+        return {"method": "qmp-halted-diagnosis", "state": state,
+                "traceback": trace, "fault_registers": fault_registers,
+                "screenshot": self.screenshot(path)}
 
     def diagnose(self, path: str | Path | None = None,
                  max_frames: int = 32,
@@ -1195,7 +1724,12 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
         print("Connected sessions:", {key: repr(value) for key, value in sessions.items()})
         print("Python debugger: dbg is the first session; sessions[key] accesses each target.")
         print("Use dbg.regs(), dbg.read(address, size), dbg.u32(address), dbg.halt(),")
-        print("  dbg.resume(), dbg.step(), dbg.where(), dbg.traceback(), dbg.nm()/dbg.disasm()")
+        print("  dbg.resume(), dbg.step(), dbg.where(), dbg.traceback(), dbg.addr2line(address)")
+        print("  dbg.bp(address), dbg.watchpoint(address, size=4, access='read')")
+        print("  dbg.inject_return(return_at, value) or dbg.press_button(return_at, mask)")
+        if target == "hardware":
+            print("  dbg.arm_fault_breakpoints(), dbg.wait_fault() capture Cortex-M faults")
+            print("  dbg.arm_watchdog_breakpoints(), dbg.wait_watchdog() capture WWDG pre-reset context")
         namespace = {"dbg": session, "sessions": sessions,
                      "backends": backends, "symbols": session.symbols}
         code.interact(banner="gwprov interactive debug (Ctrl-D disconnects)", local=namespace)

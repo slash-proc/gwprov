@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from pathlib import PurePosixPath
 import shutil
-from typing import Iterable
+from typing import Callable, Iterable
 
 CHUNK_SIZE = 256 * 1024
 
@@ -220,7 +220,8 @@ def overlay_sd_directory(image: str | Path, destination: str | Path) -> int:
 def apply_deployment(profile_path: str | Path, *, probe_id: str | None = None,
                      programmer: str | None = None, remote_url: str | None = None,
                      remote_origin: str | None = None,
-                     regions: Iterable[str] | None = None) -> dict:
+                     regions: Iterable[str] | None = None,
+                     progress: Callable[[dict], None] | None = None) -> dict:
     """Write the selected deployment plan and boot bank 1 afterwards."""
     selected = sum(bool(value) for value in (probe_id, programmer, remote_url))
     if selected > 1:
@@ -245,24 +246,55 @@ def apply_deployment(profile_path: str | Path, *, probe_id: str | None = None,
 
     from gnwmanager.gnw import GnW
     written = []
+    total_bytes = sum(int(row.get("bytes", 0)) for row in plan["regions"])
+    overall_done = 0
+
+    def report(event: str, **values) -> None:
+        if progress is not None:
+            progress({"event": event, **values})
+
+    report("start", total_bytes=total_bytes, region_count=len(plan["regions"]))
     try:
+        report("phase", message="Connecting to hardware")
         backend.open()
+        from .hw_lifecycle import (assert_application_mode,
+                                   clear_backend_recovery_required,
+                                   inspect_target_mode,
+                                   mark_backend_recovery_required)
+        assert_application_mode(backend, operation="start a deployment")
         gnw = GnW(backend)
         # This is intentionally the first mutating operation: it switches the
         # target into gnwmanager's RAM service to perform explicit region writes.
+        report("phase", message="Starting gnwmanager RAM programmer")
+        mark_backend_recovery_required(backend, "starting gnwmanager RAM programmer")
         gnw.start_gnwmanager()
+        mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
         for row in plan["regions"]:
             region = row["region"]
             path = Path(row["path"])
+            region_total = int(row.get("bytes", 0))
+            region_done = 0
+            report("region_start", region=region, bytes=region_total,
+                   overall_done=overall_done, overall_total=total_bytes)
             if row["kind"] == "internal-flash":
                 gnw.flash(row["bank"], row["offset"], path.read_bytes())
+                region_done = region_total
+                overall_done += region_total
+                report("progress", region=region, region_done=region_done,
+                       region_total=region_total, overall_done=overall_done,
+                       overall_total=total_bytes)
                 written.append({"region": region, "bytes": row["bytes"],
                                 "sha256": row["sha256"]})
             elif region == "sd":
                 count = _push_sd_image(gnw, path)
+                region_done = region_total
+                overall_done += region_total
+                report("progress", region=region, region_done=region_done,
+                       region_total=region_total, overall_done=overall_done,
+                       overall_total=total_bytes)
                 written.append({"region": region, "files": count, "mode": "overlay"})
             else:
-                offset, remaining = row["offset"], row["bytes"]
+                offset, remaining = row["offset"], region_total
                 with path.open("rb") as stream:
                     stream.seek(offset)
                     while remaining:
@@ -272,15 +304,34 @@ def apply_deployment(profile_path: str | Path, *, probe_id: str | None = None,
                         gnw.flash(0, offset, data)
                         offset += len(data)
                         remaining -= len(data)
+                        region_done += len(data)
+                        overall_done += len(data)
+                        report("progress", region=region, region_done=region_done,
+                               region_total=region_total, overall_done=overall_done,
+                               overall_total=total_bytes)
                 written.append({"region": region, "bytes": row["bytes"],
                                 "sha256": row["sha256"]})
+            report("region_complete", region=region, region_done=region_done,
+                   region_total=region_total, overall_done=overall_done,
+                   overall_total=total_bytes)
         # Match `gnwmanager start bank1`: reset, load MSP/PC from the bank-1
         # vector table, then resume. Bank 1 is therefore a real deployable part
         # of every profile, including stock OFW and bootloader payloads.
+        report("phase", message="Starting from bank 1")
         backend.reset_and_halt()
         backend.write_register("msp", backend.read_uint32(0x08000000))
         backend.write_register("pc", backend.read_uint32(0x08000004))
         backend.resume()
+        state = inspect_target_mode(backend)
+        if state["halted"] or state["stubResident"]:
+            raise RuntimeError(
+                "deployment wrote the selected regions, but bank 1 did not leave "
+                "gnwmanager Recovery Mode; GWProv is holding the target traffic "
+                "guard. Inspect `gwprov ps` and use `gwprov device recover` "
+                "when the mailbox is idle."
+            )
+        clear_backend_recovery_required(backend)
+        report("complete", overall_done=overall_done, overall_total=total_bytes)
     finally:
         backend.close()
     return {**plan, "written": written, "booted": "bank1"}

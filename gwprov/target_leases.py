@@ -19,6 +19,17 @@ class DeviceBusyError(RuntimeError):
         super().__init__(f"target {key!r} is busy with {operation}{suffix}")
 
 
+class DeviceRecoveryRequired(DeviceBusyError):
+    """A previous operation left the target in a mode requiring explicit recovery."""
+
+    def __init__(self, key: str, owner: dict | None = None):
+        self.key = key
+        self.owner = owner or {}
+        phase = self.owner.get("phase", "hardware operation")
+        super().__init__(key, {**self.owner,
+                               "operation": f"interrupted {phase}; run `gwprov device recover`"})
+
+
 def _lock_dir() -> Path:
     override = os.environ.get("GWPROV_LEASE_DIR")
     return Path(override).expanduser() if override else Path.home() / ".cache" / "gwprov" / "target-leases"
@@ -68,6 +79,23 @@ def _unlock(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+def _read_metadata(fd: int, key: str) -> dict:
+    os.lseek(fd, 1 if os.name == "nt" else 0, os.SEEK_SET)
+    try:
+        return json.loads(os.read(fd, 4096).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"key": key}
+
+
+def _write_metadata(fd: int, owner: dict) -> None:
+    payload = json.dumps(owner, separators=(",", ":")).encode("utf-8")
+    offset = 1 if os.name == "nt" else 0
+    os.ftruncate(fd, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    os.write(fd, payload)
+    os.fsync(fd)
+
+
 def lease_owner(key: str) -> dict | None:
     """Return the live lease owner without contacting the debug probe."""
     path = _path_for(key)
@@ -78,14 +106,15 @@ def lease_owner(key: str) -> dict | None:
         if os.name == "nt" and os.fstat(fd).st_size == 0:
             os.write(fd, b"\0")
         if _lock(fd, blocking=False):
+            owner = _read_metadata(fd, key)
             _unlock(fd)
+            if owner.get("recovery_required"):
+                return {**owner, "lease_active": False}
             return None
-        os.lseek(fd, 1 if os.name == "nt" else 0, os.SEEK_SET)
-        raw = os.read(fd, 4096)
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return {"key": key, "operation": "target operation (owner metadata pending)"}
+        owner = _read_metadata(fd, key)
+        if not owner.get("operation"):
+            owner = {"key": key, "operation": "target operation (owner metadata pending)"}
+        return {**owner, "lease_active": True}
     finally:
         os.close(fd)
 
@@ -93,15 +122,18 @@ def lease_owner(key: str) -> dict | None:
 class TargetLease:
     """Exclusive process-shared target lease, held for a backend's lifetime."""
 
-    def __init__(self, key: str, operation: str, *, wait: float = 30.0):
+    def __init__(self, key: str, operation: str, *, wait: float = 30.0,
+                 allow_recovery: bool = False):
         if not key:
             raise ValueError("target lease key must not be empty")
         self.key = key
         self.operation = operation
         self.wait = max(0.0, wait)
+        self.allow_recovery = allow_recovery
         self.path = _path_for(key)
         self.fd: int | None = None
         self.daemon_token: str | None = None
+        self.owner: dict | None = None
 
     def acquire(self) -> "TargetLease":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,16 +143,17 @@ class TargetLease:
         deadline = time.monotonic() + self.wait
         while True:
             if _lock(fd, blocking=False):
+                previous = _read_metadata(fd, self.key)
+                if previous.get("recovery_required") and not self.allow_recovery:
+                    _unlock(fd)
+                    os.close(fd)
+                    raise DeviceRecoveryRequired(self.key, previous)
                 self.fd = fd
-                owner = {"key": self.key, "operation": self.operation,
+                owner = {**previous, "key": self.key, "operation": self.operation,
                          "pid": os.getpid(), "started": time.time()}
-                payload = json.dumps(owner, separators=(",", ":")).encode("utf-8")
-                offset = 1 if os.name == "nt" else 0
-                os.ftruncate(fd, offset)
-                os.lseek(fd, offset, os.SEEK_SET)
+                self.owner = owner
                 try:
-                    os.write(fd, payload)
-                    os.fsync(fd)
+                    _write_metadata(fd, owner)
                     token = secrets.token_hex(16)
                     from .daemon import register_lease
                     register_lease(token, owner)
@@ -138,6 +171,21 @@ class TargetLease:
                 os.close(fd)
                 raise DeviceBusyError(self.key, owner)
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+    def mark_recovery_required(self, phase: str) -> None:
+        if self.fd is None or self.owner is None:
+            raise RuntimeError("target lease must be held before recording its device mode")
+        self.owner.update(recovery_required=True, phase=phase,
+                          recovery_marked=time.time())
+        _write_metadata(self.fd, self.owner)
+
+    def clear_recovery_required(self) -> None:
+        if self.fd is None or self.owner is None:
+            raise RuntimeError("target lease must be held before clearing device mode")
+        self.owner.pop("recovery_required", None)
+        self.owner.pop("phase", None)
+        self.owner.pop("recovery_marked", None)
+        _write_metadata(self.fd, self.owner)
 
     def release(self) -> None:
         fd, self.fd = self.fd, None

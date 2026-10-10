@@ -20,7 +20,7 @@ class SelectedPyOCDBackend(OCDBackend):
 
     def __init__(self, unique_id: str, *, frequency: int | None = None,
                  operation: str = "GWProv hardware session", lease_wait: float = 30.0,
-                 probe_adapter: str | None = None):
+                 probe_adapter: str | None = None, allow_recovery: bool = False):
         super().__init__()
         if not unique_id:
             raise ValueError("probe unique ID must not be empty")
@@ -44,7 +44,8 @@ class SelectedPyOCDBackend(OCDBackend):
         self._connect_helper = ConnectHelper
         self._session_options = options
         self.session = None
-        self._lease = TargetLease(f"probe:{unique_id}", operation, wait=lease_wait)
+        self._lease = TargetLease(f"probe:{unique_id}", operation, wait=lease_wait,
+                                  allow_recovery=allow_recovery)
         self._opened = False
         self._frequency_override = frequency or 0
         self.version = tuple(int(x) for x in pyocd.__version__.split("."))
@@ -161,7 +162,7 @@ class WebSocketBackend(OCDBackend):
 
     def __init__(self, uri: str, *, frequency: int | None = None, timeout: float = 10.0,
                  origin: str | None = None, operation: str = "GWProv remote session",
-                 lease_wait: float = 30.0):
+                 lease_wait: float = 30.0, allow_recovery: bool = False):
         super().__init__()
         parsed = urlparse(uri)
         if parsed.scheme not in {"ws", "wss"} or not parsed.netloc or parsed.path != "/gdb":
@@ -174,7 +175,8 @@ class WebSocketBackend(OCDBackend):
         self._lock = threading.Lock()
         self._backend_name = "gnwmanager remote"
         self.version = (0, 0, 0)
-        self._lease = TargetLease(f"remote:{uri}", operation, wait=lease_wait)
+        self._lease = TargetLease(f"remote:{uri}", operation, wait=lease_wait,
+                                  allow_recovery=allow_recovery)
 
     @property
     def probe_name(self) -> str:

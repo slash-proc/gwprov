@@ -14,7 +14,12 @@ its changes:
 - **State and hardware steward:** Report observed device/process state faithfully.
   Distinguish running, halted, busy, and unknown; never turn missing visibility
   or symbols into a confident guess. Do not poll a target while an operation
-  lease says its interface is busy.
+  lease says its interface is busy or carries an interrupted-operation marker.
+  Before any flow calls `GnW.start_gnwmanager()`, passively inspect the
+  gnwmanager mailbox, DHCSR, and VTOR. Mark the lease as requiring recovery
+  before entering the RAM service, and clear that marker only after verified
+  return to application firmware. `gwprov device recover` is the explicit
+  transition out of an idle Recovery Mode stub.
 - **Systems integrator:** Keep local hardware, remote gnwmanager, and GWemu
   workflows coherent while respecting the different transports and side
   effects each backend requires.
@@ -75,3 +80,30 @@ deterministic and free of color or layout glyphs.
   expose them through the same filesystem verbs where their behavior is the
   same. Preserve existing commands as aliases or compatible entry points while
   transitioning help and completion.
+
+## Pre-reset hardware diagnosis
+
+When firmware reports a watchdog reset, do not treat the later BSOD screen as
+the original fault context: the reset has already destroyed that stack. If
+firmware symbols expose an STM32 `WWDG_IRQHandler`, use
+`dbg.arm_watchdog_breakpoints()` and `dbg.wait_watchdog()` before reproducing.
+The handler-entry capture decodes the hardware-stacked interrupted PC/LR/xPSR
+and resolves its source and unwind. Keep this generic across projects; do not
+hard-code an application name or assume a WWDG capture proves the interrupted
+routine caused the stall without timing/evidence. Fault handlers and watchdog
+interrupts are different mechanisms and need separate reports.
+
+## Interactive input and symbol-free tracing
+
+- Keep `dbg.addr2line(address)` available in the Python console and advertise
+  it in the console's startup help; address resolution should not require a
+  separate shell command.
+- For firmware without symbols, prefer DWT or remote-debug data watchpoints on
+  known MMIO input registers, then use the captured PC/LR and disassembly to
+  identify the read path. A watchpoint observes memory access, not a CPU
+  register value.
+- Keep input injection generic. Accept the firmware's explicit return-site
+  address or symbol and button mask; do not bake in an application, firmware,
+  button mapping, or pause-state variable. For scalar-returning input routines,
+  offer release/press/release polls through the ABI return register and clearly
+  report when another breakpoint, timeout, or fault interrupts the sequence.

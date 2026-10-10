@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 
 try:
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 
 
 PROFILE_DIR_ENV = "GWPROV_PROFILE_DIR"
+_FICLONE = 0x40049409
 
 
 def profile_directory(override: str | Path | None = None) -> Path:
@@ -106,6 +108,64 @@ def list_profiles(*, profile_dir: str | Path | None = None) -> list[dict[str, st
             "firmware": str(details.get("firmware", "")),
         })
     return rows
+
+
+def _copy_independent_file(source: str | Path, destination: str | Path) -> str:
+    """Copy one file, using a private copy-on-write clone where Linux supports it."""
+    source_path = Path(source)
+    destination_path = Path(destination)
+    if sys.platform.startswith("linux"):
+        try:
+            import fcntl
+
+            with source_path.open("rb") as source_file:
+                with destination_path.open("xb") as destination_file:
+                    fcntl.ioctl(destination_file.fileno(), _FICLONE, source_file.fileno())
+            shutil.copystat(source_path, destination_path, follow_symlinks=True)
+            return str(destination_path)
+        except OSError:
+            destination_path.unlink(missing_ok=True)
+    return shutil.copy2(source_path, destination_path, follow_symlinks=True)
+
+
+def duplicate_profile(source: str | Path, destination: str | Path, *,
+                      output_dir: str | Path | None = None) -> dict[str, str | int]:
+    """Create an independent working copy of a complete profile directory."""
+    source_path = resolve_profile_path(source)
+    destination_path = profile_destination(destination, output_dir=output_dir)
+    manifest = source_path / "profile.toml"
+    if not source_path.is_dir() or not manifest.is_file():
+        raise ValueError(f"profile does not contain profile.toml: {source_path}")
+    try:
+        tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"profile manifest is invalid: {manifest}: {exc}") from exc
+    if source_path == destination_path:
+        raise ValueError("source and destination profile must be different")
+    if source_path in destination_path.parents:
+        raise ValueError("destination profile cannot be inside the source profile")
+    if destination_path.exists():
+        raise ValueError(f"destination profile already exists: {destination_path}")
+
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copytree(
+            source_path,
+            destination_path,
+            symlinks=False,
+            copy_function=_copy_independent_file,
+        )
+    except BaseException:
+        if destination_path.exists():
+            shutil.rmtree(destination_path)
+        raise
+
+    files = sum(1 for path in destination_path.rglob("*") if path.is_file())
+    return {
+        "source": str(source_path),
+        "destination": str(destination_path),
+        "files": files,
+    }
 
 
 @dataclass(frozen=True)

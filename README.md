@@ -207,8 +207,22 @@ These durations estimate how long the CPU stayed in a routine; QMP sampling
 cannot prove uninterrupted execution or that interrupts and other system work
 were blocked between polls. When progress counters are available, the report
 also gives intervals where a counter stayed flat and ranks routines sampled
-inside each interval. Counter observations are about one second apart, so these
-are coarse estimates for extended freezes. Add a project heartbeat or frame
+inside each interval. `--progress-interval SECONDS` controls counter polling (default 1 second;
+minimum 5 ms). More frequent observations improve freeze localization while
+adding monitor traffic. Actual counter spacing is also bounded by the PC/status
+poll interval and monitor latency. `longest_no_progress` reports each counter's longest
+observed plateau, including episodes below the warning threshold. Use a monotonic
+frame or heartbeat counter for this measurement; equal values alone cannot rule
+out counter resets or a full wrap.
+
+Timestamped `state_timeline` transitions and `running_epoch` identifiers preserve
+observed halts and resumes. Stall and residency spans never cross an observed
+halt, even a brief one between counter reads. Progress reports retain wall-time
+rates and add rates from counter pairs within the same running epoch. A pause
+entirely between status polls remains unobservable; transition boundaries have
+polling uncertainty. Residency retains SP/LR context counts but always marks
+`single_invocation_proven: false`: repeated calls with identical stack context,
+unsampled callees and interrupts cannot be distinguished by PC sampling. Add a project heartbeat or frame
 counter with `--progress-symbol` when automatic counter discovery finds none.
 
 **Interpretation:** these are running-state PC snapshot shares, not exact
@@ -493,12 +507,43 @@ and registers when stopped. `dbg.wait_stopped(timeout=30)` waits for an already
 armed breakpoint. A timeout is explicit and leaves execution running. A debug
 stop leaves execution halted for inspection; resume with `dbg.resume()`.
 Use a breakpoint address that is not already owned by another routine.
-These wait helpers currently require GWemu and a QMP endpoint.
+These wait helpers support GWemu through QMP and physical hardware through the
+attached debug backend. Hardware waiting polls Cortex-M `DHCSR.S_HALT` (or
+PyOCD's target state), so a wait does not halt/resume the running device just to
+check it. Hardware breakpoints use the probe's FPB comparators; remote
+`gnwmanager serve` breakpoint support depends on the server protocol and may be
+unavailable.
+
+For a physical fault capture, load the official firmware and app symbols from a
+device profile, then arm breakpoints before reproducing the crash:
+
+```text
+gwprov debug python --target hardware --probe-id PROBE_ID --profile PROFILE
+>>> dbg.reset(halt=True)
+>>> dbg.arm_fault_breakpoints()
+>>> dbg.resume()
+>>> report = dbg.wait_fault(timeout=180)
+>>> report["triage"]
+```
+
+`arm_fault_breakpoints()` uses whichever of `common_fault_handler_c`,
+`HardFault_Handler`, `MemManage_Handler`, `BusFault_Handler`, and
+`UsageFault_Handler` are present in loaded symbols. At a handler-entry stop,
+`wait_fault()` collects core registers, the stacked exception frame, SCB fault
+registers, and the symbolized unwind. The reset-halt establishes a known boot point before breakpoints are installed.
+Use `dbg.run_until("emulator_start")`, `dbg.run_until("run_gwhb_homebrew")`,
+and then `dbg.run_until("app_main")` to inspect the Retro-Go launch path when
+those symbols are present. A stop remains halted for inspection; resume it
+explicitly. This captures and diagnoses a fault automatically, but deterministic
+hardware crash bisection still requires a recorded/replayable controller-input
+schedule and a reset-to-repro runner. GWemu already supplies that timeline path;
+physical input recording/replay is the remaining parity work.
 
 The `dbg` object stays connected for the whole REPL session. It provides
 `dbg.halt()`, `dbg.resume()`, `dbg.step()`, `dbg.regs()`, `dbg.where()`,
 `dbg.traceback()`, `dbg.diagnose()`, `dbg.read(addr, n)`, `dbg.u32(addr)`, and
-hardware breakpoints with `dbg.bp(addr)`.
+hardware breakpoints with `dbg.bp(addr)`. `dbg.addr2line(address)` resolves a
+runtime PC directly in the console, including mapped section rebases.
 Thumb function symbols are normalized automatically for breakpoints and nearest
 symbol lookup. Register and symbol-location reads restore the target's prior
 running state.
@@ -513,6 +558,19 @@ loaded ELF and returns that function's assembly listing. `dbg.addr2line(address)
 uses `arm-none-eabi-addr2line` (or `addr2line`) to resolve runtime addresses to
 source lines, including section rebases. `diagnose` includes source locations
 and nearby disassembly when the PC belongs to a loaded ELF.
+Use `dbg.watchpoint(address, size=4, access="read")` to stop on a DWT or
+GWemu remote-debug memory access. This can reveal which code reads a known
+peripheral register even when firmware symbols are missing; the stop PC and
+`dbg.addr2line()` identify the access site when symbols or debug data are
+available. A watchpoint observes memory accesses, not CPU register values.
+For firmware that returns its button mask in a register,
+`dbg.press_button(return_at, mask)` injects clean release polls, one or more
+pressed polls, then a release at the routine's return site. Supply the firmware-
+specific return address or symbol and button mask; the debugger does not assume
+an application or button mapping. `dbg.inject_return(return_at, value,
+register="r0")` is the single-poll primitive for other scalar-returning
+routines. Both helpers resume after each injected value and leave the target
+halted if another breakpoint or fault interrupts the operation.
 `dbg.symbols.sections()` shows link-time ranges. When a mapped sidecar's runtime
 base is known, call `dbg.symbols.rebase(".xip_dkc1", actual_base)`; later
 lookups translate symbols in that section while leaving the ELF unchanged.
@@ -644,13 +702,19 @@ gwprov perf hardware --probe-id PROBE_ID --profile DEVICE_PROFILE \
   --duration 30 --format html --output dev-local/reports/hardware-profile.html
 ```
 
-The target project must export the generic `gwprov_trace_header` ring described
-in [the trace ABI](docs/TRACE_ABI.md). GWProv reads it without halting the CPU,
-resolves routine PCs against the profile's firmware/app ELFs (or repeated
-`--symbols ELF` arguments), and reports exclusive cycles, percentages, lost
-events, and DWT availability. The JSON report is retained beside HTML/PDF and
-remains the complete machine-readable record. Hardware deployment and profiling
-also accept `--programmer` or `--remote-url` instead of `--probe-id`.
+Projects can export the generic `gwprov_trace_header` ring described in
+[the trace ABI](docs/TRACE_ABI.md) for routine-level exclusive cycle reports.
+For projects that already expose integer counters, repeat `--counter-symbol`
+with symbols from the profile ELFs or `--symbols ELF`; `--frame-counter` also
+reports the observed logical frame rate, and `--total-cycle-counter` provides
+a denominator for cycle-counter percentages. Counter capture is read-only while
+the target runs. To measure a reset-to-app run on a local PyOCD probe,
+`--start-at SYMBOL` resets the target and starts capture at that function entry; repeat
+`--set-register REG=VALUE` to explicitly patch launch arguments at the
+breakpoint. The register hook is useful when firmware configuration normally
+starts an app paused. The profile JSON records all sampled counters and the
+capture window. Hardware profiling also accepts `--programmer` or
+`--remote-url` for passive trace-ABI captures.
 
 ### Hardware deployment
 
@@ -658,22 +722,50 @@ A hardware deployment plan records every destination offset and SHA-256 before
 writing. Bank 1 (OFW or bootloader) and bank 2 are separate selectable regions;
 flash profiles write FrogFS and LittleFS at their declared offsets, while stock
 profiles can write the complete extflash backup. SD deployment copies files
-through `gnwmanager` and overlays the existing card contents.
+through `gnwmanager` and overlays the existing card contents. Text deployment
+output reports the active phase and per-region progress to stdout; use
+`--output json` when a script needs one clean machine-readable result.
 
 ```sh
 gwprov deploy plan --profile dev-local/profiles/retro-go-demo
 gwprov deploy apply --profile dev-local/profiles/retro-go-demo --probe-id PROBE_ID
 # Or select one OpenOCD adapter explicitly:
 gwprov deploy apply --profile dev-local/profiles/retro-go-demo --programmer stlink
+# Keep stdout machine-readable when scripting:
+gwprov deploy apply --profile dev-local/profiles/retro-go-demo --probe-id PROBE_ID --output json
 ```
 
-Apply defaults to all regions present in the profile. It enters gnwmanager's RAM
-programmer, writes and verifies each selected region through gnwmanager, then
-starts the bank-1 vector. Use `--region bank1` or `--region bank2` to select an
-individual internal bank; repeat `--region` for exact plans. A remote server is
+Apply defaults to all regions present in the profile. Text output shows live
+region and byte progress on stdout while it enters gnwmanager's RAM programmer,
+writes and verifies each selected region, then starts the bank-1 vector. Use
+`--region bank1` or `--region bank2` to select an individual internal bank;
+repeat `--region` for exact plans. `--output json` emits only the final structured
+result for scripts. A remote server is
 selected with `--remote-url ws[s]://host:port/gdb`; `--remote-origin` supplies its
 allowed origin when configured. SD deployment is an overlay and does not delete
 files omitted from the profile.
+
+Before starting that RAM programmer, GWProv passively checks VTOR, the
+gnwmanager mailbox status, and DHCSR. This follows the web-builder's Recovery
+Mode heuristic: an idle mailbox alone can be stale, so a live idle stub also
+requires the CPU to be running; a non-idle stub is recognized by its SRAM VTOR.
+If the RAM service is already resident, GWProv stops before resetting or
+replacing it. GWProv also persists a recovery marker in the target lease before
+loading the service. If a command exits before verified return to bank 1,
+`gwprov ps` reports the device busy and skips all target traffic; new hardware
+commands are blocked until recovery. Successful deployments boot bank 1 and
+clear the marker. For an interrupted operation, recover after the mailbox
+reports `IDLE` (or a terminal error):
+
+```sh
+gwprov device recover
+```
+
+That command requires the active hardware device. It resets into bank 1 and
+verifies the CPU left the stub. If the mailbox reports active `ERASE`, `PROG`,
+or `HASH`, or its state cannot be read, GWProv refuses recovery so an active
+flash operation is not interrupted. A stub still in `BOOTING` is recoverable
+only when VTOR has not moved into the stub's SRAM range yet.
 
 ## Local and remote device sessions
 
@@ -748,6 +840,7 @@ gwprov devices
 gwprov adapters list
 gwprov adapters add pi-probe ws://10.2.3.122:8765/gdb
 gwprov set active DEVICE_ID
+gwprov config show
 gwprov set profile PROFILE
 gwprov apply
 gwprov sdcard add /Volumes/RETROGO
@@ -888,9 +981,22 @@ also honored on any OS.
 gwprov profile create dkc1 --content dev-local/content/dkc1
 gwprov profile list
 gwprov gwemu run --profile dkc1
+gwprov profile duplicate dkc1 dkc1-perf-a
+gwprov gwemu run --profile dkc1-perf-a --headless
 gwprov profile create dkc1-test --content dev-local/content/dkc1 \
   --output-dir build/test-profiles
 ```
+
+`profile duplicate SOURCE DESTINATION` creates an independent working copy of
+the complete profile package, including firmware, storage media, symbols, debug
+metadata, and device state. It never overwrites an existing destination.
+Symlinks and hard links are materialized so writes in an experimental run cannot
+mutate the baseline through a shared file. On Linux filesystems that support it,
+GWProv uses private copy-on-write clones to make large flash images fast and
+space efficient; other hosts receive ordinary independent copies. Use
+`--output-dir` to place a named copy in a temporary profile store, and retain
+performance reports outside that directory before deleting an experimental
+copy.
 
 For repeated use of a custom store, set `GWPROV_PROFILE_DIR` to that directory;
 then names such as `dkc1-test` resolve there from any profile-aware command.
@@ -958,3 +1064,128 @@ This identifies which automation issued a stop; polling memory and registers
 adds no control-log traffic. An emulator reporting `running` does not establish
 that a guest game's simulation is advancing: pair it with project progress
 counters or a project-provided Application state.
+
+For repeatable cohorts, `gwemu start/run --gwemu-bin /absolute/path/to/gwemu`
+selects a developer's immutable executable without changing PATH. The daemon
+validates it and confirms the running executable's SHA-256. Linux identity is
+read from `/proc/PID/exe`, preserving the running inode even when a sibling
+build replaces its pathname. A daemon predating this option fails explicitly;
+finish its active operations before restarting it.
+
+`dbg.symbols.compact_debug(output, elf=...)` writes a separate ELF using native
+`SHF_COMPRESSED` debug sections. It verifies every PT_LOAD byte and address,
+records source/output hashes, and never replaces an existing file. GNU
+addr2line and pyelftools can read this format directly, including DWARF member
+paths, inline source, and CFI. Preserve the original build hash/archive and the
+returned provenance when using a compact ELF as a debug artifact.
+`dbg.symbols.compilation_units(elf=...)` exposes each CU's ordered source,
+compilation directory, DWARF version and original compiler producer string.
+Use these strings to audit actual optimization options, including options
+introduced by SDK makefiles rather than a project's named flag manifest.
+
+Managed GWemu launches also support `--timing-mode baseline` for the experimental
+one-instruction/one-cycle DWT timeline, `--icount SHIFT`, and `--rtc-epoch` for a
+repeatable RTC seed. This baseline does not predict Cortex-M7 cache or memory
+placement costs; see [timing controls](docs/DAEMON.md#repeatable-gwemu-timing)
+before interpreting its cycle values as performance evidence.
+
+The structured debugger's `dbg.memory_path("global.member")` resolves a C
+member path through DWARF and live intermediate pointers, returning address,
+size, and type. `dbg.read_path("global.member")` decodes that value. Final
+pointers remain numeric, null intermediate pointers fail explicitly, and
+member offsets are read from the owning ELF rather than supplied manually.
+These operations work through the existing hardware or GWemu backend.
+Local ELF symbols carry their STT_FILE source hints into type lookup. A hint
+selects only a unique matching DWARF compilation unit; missing, ambiguous or
+unmatched hints fall back to the original full scan. The cached CU index keeps
+primitive offsets rather than live DIEs/streams. Loading an ELF invalidates
+these indexes and compiled layouts. This avoids repeated full scans for late
+static counters while preserving decoded types and explicit lookup errors.
+
+Global type lookup indexes located DWARF variable definitions once per owning
+ELF identity (device, inode, size and modification time). The index retains only
+primitive CU/DIE offsets, source names and link-time addresses, never open ELF
+streams. Original ELF symbol addresses disambiguate definitions before runtime
+rebasing; unique source hints provide a fallback. Standalone declarations and
+block-local shadows cannot substitute for a global definition. Located
+`DW_AT_specification` definitions may inherit their declaration's name/type;
+ambiguous or address-mismatched definitions fail explicitly. Reloading symbols
+invalidates these indexes and typed member plans.
+
+`dbg.read_paths(["global.member", "other.field"], errors="collect")` batches
+DWARF layout planning and exact adjacent or overlapping memory reads. It returns
+ordered `values`, explicit `errors`, read counts, byte counts and covered regions.
+Pointers are refreshed for every call; read unions never include unrequested
+gaps. `errors="raise"` is the default, and per-value/total byte limits fail loudly.
+The caller owns halt/coherence when requesting an atomic snapshot. Loading an
+ELF invalidates layout caches; symbol ownership and live rebasing remain explicit.
+
+Debug descriptors may define conditional sampled gauges, independently of
+monotonic progress counters:
+
+```json
+{"schemaVersion": 1, "sampleGauges": [
+  {"symbol": "virtual_pc", "whenFunctions": ["interpreter_*", "dispatch_*"]}
+]}
+```
+
+`dbg.profile(sample_gauges=[...])` accepts the same descriptors. Gauge values
+retain zero and nonmonotonic observations, are counted only when the native
+function matches a supplied glob, and are reported as value histograms with
+explicit eligible sample counts. Missing or nonscalar symbols fail before
+sampling. Empty `whenFunctions` samples the gauge at every running snapshot.
+
+Profile reports retain both native machine-symbol shares (`functions`) and
+DWARF source shares (`inline_functions`). The latter assigns each saved PC to
+the innermost available inline function, with source-coverage counts. Both are
+PC sample shares, not cycle measurements; source attribution adds no VM polls.
+
+Managed instance metadata includes `binaryIdentity`: actual executable path,
+SHA-256, byte size, and process arguments captured once at launch. Reports
+should retain it with timing mode, workload, and project build identities when
+comparing experimental emulator builds.
+
+`dbg.step()` consumes the remote GDB single-step stop reply directly. It does
+not leave the target running while waiting for a separate status query.
+
+If a GDB transport failure prevents ordinary diagnosis,
+`dbg.diagnose_qmp(path)` captures a halted VM's status, registers, unwind,
+source context, SCB fault registers, and PNG through QMP. It requires an
+intentionally halted target and does not resume or halt it implicitly.
+
+`--timing-mode experimental-m7` opts into GWemu's provisional Cortex-M7 issue/dependency model (`cortex-m7-arm-cpu.x-gnw-m7-cycle-model=on`), with precise icount shift 0 and DWT timing enabled. This is a separate comparison cohort: fractional issue, limited dependency/latency rules and baseline fallback are modeled; cache, NOR/XIP and full load/store timing remain unvalidated. It is not calibrated hardware cycle timing. Unsupported binaries fail at launch; no test-only scaling knobs are exposed.
+
+Native PC reports classify resolved routines, unresolved addresses and Cortex-M exception-return tokens using the captured PC/LR/xPSR. Corroborated SysTick/PendSV return snapshots are identified as transient control context, never reported as a routine or proof of a fault. No additional target polling is required.
+
+`gwprov.profiling.frame_clock_metrics(frame_count=..., elapsed_cycles=...,
+clock_hz=..., excluded_wait_cycles=...)` separates elapsed-clock paced frame
+rate from an unpaced work-capacity projection. Supply a stable clock and matched
+frame/cycle window. DWT cycles may include virtual timer advancement during
+WFI; they are not necessarily retired instruction counts. Removing an explicitly
+measured wait does not prove sustained paced FPS or hardware performance. The
+summary retains both rates, target cycle budget and required work reduction.
+
+### Architecture-aware ELF inspection
+
+`SymbolTable.disassembly_tool(symbol)` reports the owning ELF machine and the selected binutils executable/version. `disassemble(symbol)` selects a tool for that architecture, including host executables used to audit emulator timing. Unsupported ELF machines, missing tools, and unsupported binutils targets fail explicitly. Native-tool fallback does not assert that every cross target is supported. ELF bytes and runtime rebasing remain unchanged.
+
+### Watchdog pre-reset capture on hardware
+
+For STM32 Retro-Go firmware that includes the WWDG interrupt symbol, capture the
+interrupted application before the watchdog reset erases its live stack:
+
+```text
+gwprov debug python --target hardware --probe-id PROBE_ID --profile PROFILE
+>>> dbg.reset(halt=True)
+>>> dbg.arm_watchdog_breakpoints()
+>>> dbg.resume()
+>>> report = dbg.wait_watchdog(timeout=180)
+>>> report["watchdog"]
+```
+
+The stop is at `WWDG_IRQHandler`, before its prologue changes the exception
+frame. GWProv decodes the Cortex-M stacked PC/LR/xPSR and resolves the interrupted
+source and unwind when symbols are available. A timeout leaves the target
+running. A captured watchdog stop remains halted for inspection; resume it
+explicitly. This is distinct from `arm_fault_breakpoints()`: a WWDG reset is not
+a HardFault, and the post-reset BSOD cannot recover the pre-reset call stack.

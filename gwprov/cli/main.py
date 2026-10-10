@@ -160,6 +160,22 @@ def _profile_create(args) -> int:
     return 0
 
 
+def _profile_duplicate(args) -> int:
+    from gwprov.profiles import duplicate_profile
+
+    result = duplicate_profile(args.source, args.destination, output_dir=args.output_dir)
+    if args.output == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        console = Console()
+        console.print("[bold green]Profile duplicated[/]")
+        console.print(f"  [dim]From[/]  {result['source']}")
+        console.print(f"  [dim]To[/]    [bold cyan]{result['destination']}[/]")
+        console.print(f"  [dim]Files[/] {result['files']}")
+        console.print(f"\nRun it with [bold]gwprov gwemu run --profile {result['destination']}[/]")
+    return 0
+
+
 def _profile_list(args) -> int:
     from gwprov.profiles import list_profiles, profile_directory
 
@@ -229,9 +245,12 @@ def _run_gwemu(args) -> int:
         from gwprov.daemon import start_instance
         row = start_instance(args.profile, headless=args.headless, audio=args.audio,
                              timeline=args.timeline, record_timeline=args.record_timeline,
-                             gdb_port=args.gdb_port, shared_sd_root=args.shared_sd_root)
+                             gdb_port=args.gdb_port, shared_sd_root=args.shared_sd_root,
+                             timing_mode=args.timing_mode, icount=args.icount, rtc_epoch=args.rtc_epoch, gwemu_bin=args.gwemu_bin)
     else:
         if args.stdio_gdb:
+            if args.timing_mode != "default" or args.rtc_epoch is not None or args.gwemu_bin is not None:
+                raise ValueError("timing-mode, rtc-epoch and gwemu-bin require daemon-managed GWemu; omit --stdio-gdb")
             # GDB stdio consumes QEMU's stdin/stdout, so this legacy harness
             # transport cannot share the daemon's QMP stdio channel.
             from gwprov.common.target import GwemuTarget, Image
@@ -257,7 +276,8 @@ def _run_gwemu(args) -> int:
                            "extflash": args.extflash, "sdcard": args.sdcard},
                           headless=args.headless, audio=args.audio,
                           timeline=args.timeline, record_timeline=args.record_timeline,
-                          icount=args.icount, keep_temp=args.keep_temp)
+                          icount=args.icount, keep_temp=args.keep_temp,
+                          timing_mode=args.timing_mode, rtc_epoch=args.rtc_epoch, gwemu_bin=args.gwemu_bin)
     from gwprov.active_device import set_active
     set_active(f"gwemu:{row['pid']}")
     from gwprov.gwemu_manager import stop_instance
@@ -282,7 +302,8 @@ def _gwemu_start(args) -> int:
     from gwprov.gwemu_manager import start_instance
     result = start_instance(args.profile, audio=args.audio, gdb_port=args.gdb_port,
                             headless=args.headless,
-                            timeline=args.timeline, record_timeline=args.record_timeline)
+                            timeline=args.timeline, record_timeline=args.record_timeline,
+                            timing_mode=args.timing_mode, icount=args.icount, rtc_epoch=args.rtc_epoch, gwemu_bin=args.gwemu_bin)
     if result == 0:
         from gwprov.active_device import set_active
         from gwprov.gwemu_manager import instances
@@ -373,7 +394,7 @@ def _gwemu_profile(args) -> int:
                             symbols=args.symbols, progress_symbols=args.progress_symbol,
                             rebase_symbols=args.rebase, output=args.output,
                             output_format=args.format, top=args.top, debug_config=args.debug_config,
-                            stall_threshold=args.stall_threshold)
+                            stall_threshold=args.stall_threshold, progress_interval=args.progress_interval)
 
 
 def _gwemu_diagnose(args) -> int:
@@ -417,6 +438,42 @@ def _debug_gwemu(args) -> int:
 def _ps(args) -> int:
     from gwprov.devices import show_devices
     return show_devices(output=args.output, profile=args.profile, no_pager=args.no_pager)
+
+
+def _device_config(args) -> int:
+    from gwprov.device_config import show_device_config
+    return show_device_config(output=args.output)
+
+
+def _device_recover(args) -> int:
+    from gwprov.active_device import get_active, get_active_origin
+
+    device_id = get_active()
+    if not device_id:
+        raise ValueError("no active device; select one with `gwprov set active DEVICE`")
+    if device_id.startswith("probe:"):
+        from gwprov.backends import SelectedPyOCDBackend
+        backend = SelectedPyOCDBackend(device_id.removeprefix("probe:"),
+                                       operation="gwprov device recover", lease_wait=0,
+                                       allow_recovery=True)
+    elif device_id.startswith("remote:"):
+        from gwprov.backends import WebSocketBackend
+        backend = WebSocketBackend(device_id.removeprefix("remote:"),
+                                   origin=get_active_origin(),
+                                   operation="gwprov device recover", lease_wait=0,
+                                   allow_recovery=True)
+    else:
+        raise ValueError("device recover requires an active physical device")
+
+    from gwprov.hw_lifecycle import recover_to_bank1
+    try:
+        backend.open()
+        state = recover_to_bank1(backend)
+    finally:
+        backend.close()
+    print("Device recovered: bank 1 is running")
+    print(f"  PC: 0x{state['pc']:08x}  VTOR: 0x{state['vtor']:08x}")
+    return 0
 
 
 def _devices_command(args) -> int:
@@ -525,6 +582,7 @@ def _sdcard(args) -> int:
 
 
 def _apply_assigned(args) -> int:
+    output = getattr(args, "output", "text")
     from gwprov.active_device import get_active, get_active_origin, set_active
     from gwprov.device_assignments import get_assignment, set_assignment
     from gwprov.devices import device_rows
@@ -548,7 +606,11 @@ def _apply_assigned(args) -> int:
         from gwprov.daemon import start_instance
         current_profile = row.get("profile")
         if current_profile == str(profile.root) and not assignment.get("sdcard"):
-            print(f"GWemu pid {row['pid']} already uses profile {profile.root}.")
+            if output == "json":
+                print(json.dumps({"device": device_id, "profile": str(profile.root),
+                                  "status": "already-applied"}, indent=2))
+            else:
+                print(f"GWemu pid {row['pid']} already uses profile {profile.root}.")
             return 0
         if row.get("status") == "unknown":
             raise ValueError("cannot apply to a GWemu instance with unknown execution state; inspect `gwprov ps`")
@@ -577,7 +639,11 @@ def _apply_assigned(args) -> int:
         if assignment.get("sdcard"):
             set_assignment(new_id, "sdcard", assignment["sdcard"])
         set_active(new_id)
-        print(f"Applied profile {profile.root} to GWemu; active device is {new_id}.")
+        if output == "json":
+            print(json.dumps({"device": new_id, "profile": str(profile.root),
+                              "status": "applied"}, indent=2))
+        else:
+            print(f"Applied profile {profile.root} to GWemu; active device is {new_id}.")
         return 0
 
     target = {}
@@ -603,16 +669,27 @@ def _apply_assigned(args) -> int:
         regions = [item["region"] for item in planned_regions if item["region"] != "sd"]
         sd_written = overlay_sd_directory(profile.resolved_sd, Path(card["path"]))
     if regions == []:
-        print(json.dumps({"profile": str(profile.root), "written": [
+        result = {"profile": str(profile.root), "written": [
             {"region": "sd", "files": sd_written, "mode": "mounted-folder-overlay"}
-        ]}, indent=2))
+        ]}
+        if output == "json":
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Updated SD card with {sd_written} file(s).", flush=True)
         return 0
     from gwprov.deploy import apply_deployment
-    result = apply_deployment(str(profile.root), regions=regions, **target)
+    callback, finish = _deployment_progress_display(output)
+    try:
+        result = apply_deployment(str(profile.root), regions=regions,
+                                  progress=callback, **target)
+    finally:
+        if finish:
+            finish()
     if sd_written is not None:
         result["written"].append({"region": "sd", "files": sd_written,
                                   "mode": "mounted-folder-overlay"})
-    print(json.dumps(result, indent=2))
+    if output == "json":
+        print(json.dumps(result, indent=2))
     return 0
 
 
@@ -771,7 +848,7 @@ def _show(args) -> int:
             print(f"{len(profiles)} device profile(s)")
             for profile in profiles:
                 print(f"  {profile['name']:<20} {profile['status']:<10} {profile['display_name']}")
-            print("Manage profiles with: gwprov profile create|list|show")
+            print("Manage profiles with: gwprov profile create|duplicate|list|show")
         return 0
     if section == "sdcard":
         from gwprov.sd_cards import list_cards
@@ -846,6 +923,68 @@ def _deploy_plan(args) -> int:
     return 0
 
 
+def _deployment_progress_display(output: str):
+    """Return a stdout callback for readable deployment progress."""
+    if output == "json":
+        return None, None
+    from rich.progress import (BarColumn, DownloadColumn, Progress, TaskProgressColumn,
+                               TextColumn, TimeElapsedColumn)
+    console = Console(file=sys.stdout, force_terminal=sys.stdout.isatty())
+    if sys.stdout.isatty():
+        progress = Progress(TextColumn("{task.description}"), BarColumn(),
+                            TaskProgressColumn(), DownloadColumn(), TimeElapsedColumn(),
+                            console=console)
+        progress.start()
+        task_id = None
+
+        def update(event: dict) -> None:
+            nonlocal task_id
+            kind = event["event"]
+            if kind == "start":
+                task_id = progress.add_task("Preparing deployment", total=event["total_bytes"])
+            elif kind == "phase" and task_id is not None:
+                progress.update(task_id, description=event["message"])
+            elif kind == "region_start" and task_id is not None:
+                progress.update(task_id, description=f"Writing {event['region']}")
+            elif kind == "progress" and task_id is not None:
+                progress.update(task_id, completed=event["overall_done"])
+            elif kind == "complete" and task_id is not None:
+                progress.update(task_id, completed=event["overall_total"],
+                                description="Deployment complete")
+
+        def finish() -> None:
+            progress.stop()
+        return update, finish
+
+    last_percent = -1
+
+    def update(event: dict) -> None:
+        nonlocal last_percent
+        kind = event["event"]
+        if kind == "start":
+            print(f"Preparing deployment ({event['region_count']} regions, "
+                  f"{event['total_bytes'] / (1024 * 1024):.1f} MiB).", flush=True)
+        elif kind == "phase":
+            print(f"{event['message']}…", flush=True)
+        elif kind == "region_start":
+            print(f"Writing {event['region']} ({event['bytes'] / 1024:.0f} KiB).", flush=True)
+            last_percent = -1
+        elif kind == "progress":
+            total = event["region_total"]
+            percent = 100 if total == 0 else event["region_done"] * 100 // total
+            if percent == 100 or percent >= last_percent + 10:
+                print(f"  {event['region']}: {percent}% "
+                      f"({event['region_done'] / (1024 * 1024):.1f}/"
+                      f"{total / (1024 * 1024):.1f} MiB)", flush=True)
+                last_percent = percent
+        elif kind == "region_complete":
+            print(f"  {event['region']}: complete.", flush=True)
+        elif kind == "complete":
+            print("Deployment complete; booted bank 1.", flush=True)
+
+    return update, None
+
+
 def _deploy_apply(args) -> int:
     from gwprov.deploy import apply_deployment
     probe_id, programmer, remote_url = args.probe_id, args.programmer, args.remote_url
@@ -865,10 +1004,16 @@ def _deploy_apply(args) -> int:
             remote_origin = remote_origin or get_active_origin()
         else:
             raise ValueError("deployment requires a physical hardware device")
-    result = apply_deployment(args.profile, probe_id=probe_id, programmer=programmer,
-                              remote_url=remote_url, remote_origin=remote_origin,
-                              regions=args.region)
-    print(json.dumps(result, indent=2))
+    callback, finish = _deployment_progress_display(args.output)
+    try:
+        result = apply_deployment(args.profile, probe_id=probe_id, programmer=programmer,
+                                  remote_url=remote_url, remote_origin=remote_origin,
+                                  regions=args.region, progress=callback)
+    finally:
+        if finish:
+            finish()
+    if args.output == "json":
+        print(json.dumps(result, indent=2))
     return 0
 
 
@@ -896,7 +1041,13 @@ def _profile_hardware(args) -> int:
                             remote_origin=remote_origin, profile=args.profile,
                             symbols=args.symbols, duration=args.duration,
                             interval=args.interval, output=args.output,
-                            output_format=args.format, top=args.top)
+                            output_format=args.format, top=args.top,
+                            counter_symbols=args.counter_symbol,
+                            frame_counter=args.frame_counter,
+                            total_cycle_counter=args.total_cycle_counter,
+                            start_at=args.start_at,
+                            set_registers=args.set_register,
+                            startup_timeout=args.startup_timeout)
 
 
 def _add_hardware_perf_command(subparsers, *, name: str = "hardware", help_text: str,
@@ -912,6 +1063,17 @@ def _add_hardware_perf_command(subparsers, *, name: str = "hardware", help_text:
     command.add_argument("--profile", help="load firmware and app symbols from a device profile")
     command.add_argument("--symbols", action="append", default=[], metavar="ELF",
                          help="additional firmware/app ELF symbols")
+    command.add_argument("--counter-symbol", action="append", default=[], metavar="SYMBOL",
+                         help="capture a sized integer counter from the loaded ELF; repeatable")
+    command.add_argument("--frame-counter", help="counter symbol whose delta is reported as logical FPS")
+    command.add_argument("--total-cycle-counter",
+                         help="cycle counter used to calculate percentages for *_cycles counters")
+    command.add_argument("--start-at", metavar="SYMBOL",
+                         help="reset hardware and begin capture at this function entry (local PyOCD only)")
+    command.add_argument("--set-register", action="append", default=[], metavar="REG=VALUE",
+                         help="write a core register at --start-at before resuming; repeatable")
+    command.add_argument("--startup-timeout", type=float, default=120.0,
+                         help="maximum seconds to reach --start-at after reset")
     command.add_argument("--duration", type=float, default=10.0)
     command.add_argument("--interval", type=float, default=0.05)
     command.add_argument("--output", help="report path; default under dev-local/reports")
@@ -1357,7 +1519,7 @@ _gwprov_complete() {
   extra_candidates=""
   case "$cur" in
     --profile=*) _gwprov_complete_profiles "$cur"; return ;;
-    --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*)
+    --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*|--gwemu-bin=*)
       _gwprov_complete_dirs "$cur"
       return
       ;;
@@ -1382,8 +1544,9 @@ _gwprov_complete() {
     --output=*)
       local output_values
       case "$context" in
-        ps:*|deploy:plan|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps) output_values="text json" ;;
+        ps:*|apply:|deploy:plan|deploy:apply|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps) output_values="text json" ;;
         profile:list|sdcard:list) output_values="text json names" ;;
+        profile:duplicate) output_values="text json" ;;
         *) output_values="" ;;
       esac
       if [[ -n "$output_values" ]]; then
@@ -1405,9 +1568,10 @@ _gwprov_complete() {
     --format:gwemu:profile) candidates="text json" ;;
     --format:profile:hardware|--format:perf:hardware) candidates="text json html pdf" ;;
     --format:report:render) candidates="html pdf" ;;
-    --output:ps:*|--output:deploy:plan|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps)
+    --output:ps:*|--output:apply:|--output:deploy:plan|--output:deploy:apply|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps)
       candidates="text json" ;;
     --output:profile:list|--output:sdcard:list) candidates="text json names" ;;
+    --output:profile:duplicate) candidates="text json" ;;
     --region:deploy:plan|--region:deploy:apply) candidates="bank1 bank2 frogfs littlefs extflash sd" ;;
     --programmer:deploy:apply|--programmer:debug:python|--programmer:profile:hardware|--programmer:perf:hardware)
       candidates="stlink jlink cmsis-dap rpi-gpio" ;;
@@ -1415,6 +1579,8 @@ _gwprov_complete() {
     --target:filesystem:*|--target:fs:*) candidates="flash/ext sdcard sd" ;;
     --filesystem:filesystem:create|--filesystem:fs:create) candidates="frogfs littlefs lfs fatfs sdcard sd" ;;
     --variant:projects:install|--variant:project:install|--variant:retro-go:install) candidates="flash sd" ;;
+    --timing-mode:gwemu:start|--timing-mode:gwemu:run) candidates="default baseline experimental-m7" ;;
+    --icount:gwemu:start|--icount:gwemu:run) candidates="0 1 2 3 4 5 6 7 8 9 10" ;;
     --bank:retro-go:build|--bank:gwemu:run) candidates="1 2" ;;
     --oc-level:retro-go:config) candidates="0 1 2 3" ;;
     --filesystem:media:inventory) candidates="frogfs littlefs fatfs" ;;
@@ -1423,11 +1589,11 @@ _gwprov_complete() {
     --model:profile:create) candidates="auto mario zelda" ;;
     *) candidates="" ;;
   esac
-  if [[ -n "$candidates" && ( "$prev" == "--variant" || "$prev" == "--format" || "$prev" == "--output" || "$prev" == "--region" || "$prev" == "--programmer" || "$prev" == "--target" || "$prev" == "--bank" || "$prev" == "--oc-level" || "$prev" == "--filesystem" || "$prev" == "--mode" || "$prev" == "--extflash-mib" || "$prev" == "--model" ) ]]; then
+  if [[ -n "$candidates" && ( "$prev" == "--variant" || "$prev" == "--format" || "$prev" == "--output" || "$prev" == "--region" || "$prev" == "--programmer" || "$prev" == "--target" || "$prev" == "--bank" || "$prev" == "--oc-level" || "$prev" == "--filesystem" || "$prev" == "--mode" || "$prev" == "--extflash-mib" || "$prev" == "--model" || "$prev" == "--timing-mode" || "$prev" == "--icount" ) ]]; then
     COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
     return
   fi
-  if [[ "$prev" == "--input" || "$prev" == "--input-dir" || "$prev" == "--firmware" || "$prev" == "--bios" || "$prev" == "--firmware-dir" || "$prev" == "--bios-dir" || "$prev" == "--game" || "$prev" == "--game-dir" || "$prev" == "--content" || "$prev" == "--source" || "$prev" == "--profile" || "$prev" == "--output" || "$prev" == "--output-dir" || "$prev" == "--bootloader-file" || "$prev" == "--backup-dir" || "$prev" == "--source-tree" || "$prev" == "--image" || "$prev" == "--shared-sd-root" || "$prev" == "--retro-go-root" || "$prev" == "--rom" || "$prev" == "--rom-dir" || "$prev" == "--config" || "$prev" == "--timeline" || "$prev" == "--record-timeline" || "$prev" == "--bank1" || "$prev" == "--bank2" || "$prev" == "--extflash" || "$prev" == "--sdcard" || "$prev" == "--symbols" || "$prev" == "--debug-config" || "$prev" == "--app-symbols" || "$prev" == "--gdb" ]]; then
+  if [[ "$prev" == "--input" || "$prev" == "--input-dir" || "$prev" == "--firmware" || "$prev" == "--bios" || "$prev" == "--firmware-dir" || "$prev" == "--bios-dir" || "$prev" == "--game" || "$prev" == "--game-dir" || "$prev" == "--content" || "$prev" == "--source" || "$prev" == "--profile" || "$prev" == "--output" || "$prev" == "--output-dir" || "$prev" == "--bootloader-file" || "$prev" == "--backup-dir" || "$prev" == "--source-tree" || "$prev" == "--image" || "$prev" == "--shared-sd-root" || "$prev" == "--retro-go-root" || "$prev" == "--rom" || "$prev" == "--rom-dir" || "$prev" == "--config" || "$prev" == "--timeline" || "$prev" == "--record-timeline" || "$prev" == "--bank1" || "$prev" == "--bank2" || "$prev" == "--extflash" || "$prev" == "--sdcard" || "$prev" == "--symbols" || "$prev" == "--debug-config" || "$prev" == "--app-symbols" || "$prev" == "--gdb" || "$prev" == "--gwemu-bin" ]]; then
     _gwprov_complete_dirs "$cur"
     return
   fi
@@ -1436,11 +1602,13 @@ _gwprov_complete() {
   elif (( COMP_CWORD == 2 )) && [[ "$cur" != -* ]]; then
     case "${COMP_WORDS[1]}" in
       show) candidates="adapters devices projects profile perf sdcard" ;;
+      config) candidates="show" ;;
       set) candidates="active profile sdcard" ;;
       deploy) candidates="plan apply" ;;
       ps) candidates="--help -h --output --no-pager --profile" ;;
       completion) candidates="bash zsh" ;;
       adapters) candidates="list add remove rm" ;;
+      device) candidates="recover" ;;
       projects|project) candidates="list versions info install stage-local" ;;
       tree) candidates="--format --no-pager" ;;
       debug) candidates="python" ;;
@@ -1451,7 +1619,7 @@ _gwprov_complete() {
       sdcard|sd) candidates="list ls add remove rm create compose" ;;
       input) candidates="tap" ;;
       report) candidates="render" ;;
-      profile) candidates="create list show" ;;
+      profile) candidates="create duplicate list show" ;;
         perf) candidates="hardware" ;;
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       *) candidates="" ;;
@@ -1472,6 +1640,8 @@ _gwprov_complete() {
         ;;
       *) candidates="" ;;
     esac
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == config && "$cur" != -* ]]; then
+    candidates="show"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == active && "$cur" != -* ]]; then
     candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == profile && "$cur" != -* ]]; then
@@ -1479,6 +1649,8 @@ _gwprov_complete() {
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == sdcard && "$cur" != -* ]]; then
     candidates="$(_gwprov_sdcard_names) clear none"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == show && "$cur" != -* ]]; then
+    candidates=$(_gwprov_profile_names)
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == duplicate && "$cur" != -* ]]; then
     candidates=$(_gwprov_profile_names)
   elif (( COMP_CWORD == 3 )) && [[ ( "${COMP_WORDS[1]-}" == sdcard || "${COMP_WORDS[1]-}" == sd ) && ( "${COMP_WORDS[2]-}" == remove || "${COMP_WORDS[2]-}" == rm ) && "$cur" != -* ]]; then
     candidates=$(_gwprov_sdcard_names)
@@ -1490,8 +1662,9 @@ _gwprov_complete() {
     extra_candidates="--help -h"
     case "$context" in
       ps:*) candidates="--output --no-pager --profile" ;;
+      config:show) candidates="--output" ;;
       deploy:plan) candidates="--profile --region --output" ;;
-      deploy:apply) candidates="--profile --probe-id --programmer --remote-url --remote-origin --region" ;;
+      deploy:apply) candidates="--profile --probe-id --programmer --remote-url --remote-origin --region --output" ;;
       projects:list|project:list) candidates="--firmware-repo --output" ;;
       projects:versions|project:versions) candidates="--output" ;;
       projects:info|project:info) candidates="--version --output" ;;
@@ -1503,15 +1676,15 @@ _gwprov_complete() {
       retro-go:install) candidates="--repo --version --variant --output" ;;
       retro-go:build) candidates="--path --make-target --bank --extflash-part-mb --extflash-offset-mb --jobs --makevar --clean --docker --quiet --dry-run" ;;
       retro-go:config) candidates="--output --rom --menu-timeout --oc-level --selected-tab --cursor --browse-subpath" ;;
-      gwemu:start) candidates="--profile --gdb-port --audio --headless --timeline --record-timeline" ;;
+      gwemu:start) candidates="--profile --gdb-port --audio --headless --timeline --record-timeline --timing-mode --icount --rtc-epoch --gwemu-bin" ;;
       gwemu:stop) candidates="--profile --pid --timeout" ;;
       gwemu:pause|gwemu:resume) candidates="--profile --pid" ;;
       gwemu:ps) candidates="--output --no-pager" ;;
       gwemu:screenshot) candidates="--profile --pid --output" ;;
-      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --stall-threshold --rebase --debug-config --output --format --top" ;;
+      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --progress-interval --stall-threshold --rebase --debug-config --output --format --top" ;;
       gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes --value --ring --debug-config" ;;
       gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --value --ring --interval --stall-after --duration --output --debug-config" ;;
-      gwemu:run) candidates="--profile --gdb-port --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --record-timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
+      gwemu:run) candidates="--profile --gdb-port --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --record-timeline --icount --timing-mode --rtc-epoch --gwemu-bin --headless --audio --keep-temp --stdio-gdb" ;;
       gwemu:debug) candidates="--profile --gdb-port --headless --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running --timeline --record-timeline" ;;
       debug:python) candidates="--target --host --port --openocd-port --probe-id --programmer --remote-url --remote-origin --qmp-socket --profile --symbols --debug-config" ;;
       ofw:patch) candidates="--source-tree --backup-dir --output-dir" ;;
@@ -1525,9 +1698,10 @@ _gwprov_complete() {
       sdcard:compose|sd:compose) candidates="--content-dir --core --core-name --rom --rom-dir --config" ;;
       input:tap) candidates="--repeat --tap-ms --gap-ms" ;;
       report:render) candidates="--input --output --format" ;;
-      profile:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --duration --interval --output --format --top" ;;
-      perf:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --duration --interval --output --format --top" ;;
+      profile:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
+      perf:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
       profile:create) candidates="--stock --content --backup-dir --locked --model --output-dir --name --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file" ;;
+      profile:duplicate) candidates="--output-dir --output" ;;
       profile:list) candidates="--output --no-pager" ;;
       profile:show) candidates="--shared-sd-root" ;;
       completion) candidates="bash zsh" ;;
@@ -1570,7 +1744,7 @@ _gwprov() {
       IPREFIX=$prefix PREFIX=$pathpart _gwprov_profile_complete "$pathpart"
       return
       ;;
-    --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*|--symbols=*|--debug-config=*|--app-symbols=*|--gdb=*)
+    --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*|--symbols=*|--debug-config=*|--app-symbols=*|--gdb=*|--gwemu-bin=*)
       prefix=${cur%%=*}=; pathpart=${cur#*=}
       IPREFIX=$prefix PREFIX=$pathpart _files
       return
@@ -1588,7 +1762,8 @@ _gwprov() {
     --output=*)
       case "$context" in
         profile:list|sdcard:list) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=names"; return ;;
-        ps:*|deploy:plan|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps)
+        profile:duplicate) compadd -- "${cur%%=*}=text" "${cur%%=*}=json"; return ;;
+        ps:*|apply:|deploy:plan|deploy:apply|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps)
           compadd -- "${cur%%=*}=text" "${cur%%=*}=json"; return ;;
       esac
       prefix=${cur%%=*}=; pathpart=${cur#*=}; IPREFIX=$prefix PREFIX=$pathpart _files; return
@@ -1596,7 +1771,7 @@ _gwprov() {
   esac
   case "$prev" in
     --profile) _gwprov_profile_complete "$cur"; return ;;
-    --input|--input-dir|--firmware|--bios|--firmware-dir|--bios-dir|--game|--game-dir|--content|--source|--profile|--output|--output-dir|--bootloader-file|--backup-dir|--source-tree|--image|--shared-sd-root|--retro-go-root|--rom|--rom-dir|--config|--timeline|--record-timeline|--bank1|--bank2|--extflash|--sdcard|--symbols|--debug-config|--app-symbols|--gdb)
+    --input|--input-dir|--firmware|--bios|--firmware-dir|--bios-dir|--game|--game-dir|--content|--source|--profile|--output|--output-dir|--bootloader-file|--backup-dir|--source-tree|--image|--shared-sd-root|--retro-go-root|--rom|--rom-dir|--config|--timeline|--record-timeline|--bank1|--bank2|--extflash|--sdcard|--symbols|--debug-config|--app-symbols|--gdb|--gwemu-bin)
       _files; return ;;
     --variant) compadd -- flash sd; return ;;
   esac
@@ -1606,12 +1781,15 @@ _gwprov() {
     --format:profile:hardware|--format:perf:hardware) compadd -- text json html pdf; return ;;
     --format:report:render) compadd -- html pdf; return ;;
     --output:profile:list|--output:sdcard:list) compadd -- text json names; return ;;
-    --output:ps:*|--output:deploy:plan|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps) compadd -- text json; return ;;
+    --output:profile:duplicate) compadd -- text json; return ;;
+    --output:ps:*|--output:apply:|--output:deploy:plan|--output:deploy:apply|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps) compadd -- text json; return ;;
     --region:deploy:plan|--region:deploy:apply) compadd -- bank1 bank2 frogfs littlefs extflash sd; return ;;
     --programmer:deploy:apply|--programmer:debug:python|--programmer:profile:hardware|--programmer:perf:hardware) compadd -- stlink jlink cmsis-dap rpi-gpio; return ;;
     --target:debug:python) compadd -- gwemu hardware; return ;;
     --target:filesystem:*|--target:fs:*) compadd -- flash/ext sdcard sd; return ;;
     --filesystem:filesystem:create|--filesystem:fs:create) compadd -- frogfs littlefs lfs fatfs sdcard sd; return ;;
+    --icount:gwemu:start|--icount:gwemu:run) compadd -- 0 1 2 3 4 5 6 7 8 9 10; return ;;
+    --timing-mode:gwemu:start|--timing-mode:gwemu:run) compadd -- default baseline experimental-m7; return ;;
     --bank:retro-go:build|--bank:gwemu:run) compadd -- 1 2; return ;;
     --oc-level:retro-go:config) compadd -- 0 1 2 3; return ;;
     --filesystem:media:inventory) compadd -- frogfs littlefs fatfs; return ;;
@@ -1628,6 +1806,7 @@ _gwprov() {
       ps) candidates="--help -h --output --no-pager --profile" ;;
       completion) candidates="bash zsh" ;;
       adapters) candidates="list add remove rm" ;;
+      device) candidates="recover" ;;
       projects|project) candidates="list versions info install stage-local" ;;
       tree) candidates="--format --no-pager" ;;
       debug) candidates="python" ;;
@@ -1638,10 +1817,11 @@ _gwprov() {
       sdcard|sd) candidates="list ls add remove rm create compose" ;;
       input) candidates="tap" ;;
       report) candidates="render" ;;
-      profile) candidates="create list show" ;;
+      profile) candidates="create duplicate list show" ;;
       perf) candidates="hardware" ;;
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       show) candidates="adapters devices projects profile perf sdcard" ;;
+      config) candidates="show" ;;
       set) candidates="active profile sdcard" ;;
       *) candidates="" ;;
     esac
@@ -1657,6 +1837,8 @@ _gwprov() {
       stage-local) _files; return ;;
       *) candidates="" ;;
     esac
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == config && "$cur" != -* ]]; then
+    candidates="show"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == active && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == profile && "$cur" != -* ]]; then
@@ -1664,6 +1846,8 @@ _gwprov() {
   elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == sdcard && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_sdcard_names)} clear none"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == show && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_profile_names)}"
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == duplicate && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_profile_names)}"
   elif (( CURRENT == 4 )) && [[ ( ${words[2]} == sdcard || ${words[2]} == sd ) && ( ${words[3]} == remove || ${words[3]} == rm ) && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_sdcard_names)}"
@@ -1674,8 +1858,9 @@ _gwprov() {
   else
     case "$context" in
       ps:*) candidates="--output --no-pager --profile" ;;
+      config:show) candidates="--output" ;;
       deploy:plan) candidates="--profile --region --output" ;;
-      deploy:apply) candidates="--profile --probe-id --programmer --remote-url --remote-origin --region" ;;
+      deploy:apply) candidates="--profile --probe-id --programmer --remote-url --remote-origin --region --output" ;;
       projects:list|project:list) candidates="--firmware-repo --output" ;;
       projects:versions|project:versions) candidates="--output" ;;
       projects:info|project:info) candidates="--version --output" ;;
@@ -1687,15 +1872,15 @@ _gwprov() {
       retro-go:install) candidates="--repo --version --variant --output" ;;
       retro-go:build) candidates="--path --make-target --bank --extflash-part-mb --extflash-offset-mb --jobs --makevar --clean --docker --quiet --dry-run" ;;
       retro-go:config) candidates="--output --rom --menu-timeout --oc-level --selected-tab --cursor --browse-subpath" ;;
-      gwemu:start) candidates="--profile --gdb-port --audio --headless --timeline --record-timeline" ;;
+      gwemu:start) candidates="--profile --gdb-port --audio --headless --timeline --record-timeline --timing-mode --icount --rtc-epoch --gwemu-bin" ;;
       gwemu:stop) candidates="--profile --pid --timeout" ;;
       gwemu:pause|gwemu:resume) candidates="--profile --pid" ;;
       gwemu:ps) candidates="--output --no-pager" ;;
       gwemu:screenshot) candidates="--profile --pid --output" ;;
-      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --stall-threshold --rebase --debug-config --output --format --top" ;;
+      gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --progress-interval --stall-threshold --rebase --debug-config --output --format --top" ;;
       gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes --value --ring --debug-config" ;;
       gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --value --ring --interval --stall-after --duration --output --debug-config" ;;
-      gwemu:run) candidates="--profile --gdb-port --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --record-timeline --icount --headless --audio --keep-temp --stdio-gdb" ;;
+      gwemu:run) candidates="--profile --gdb-port --shared-sd-root --bank1 --bank2 --extflash --sdcard --bank --timeline --record-timeline --icount --timing-mode --rtc-epoch --gwemu-bin --headless --audio --keep-temp --stdio-gdb" ;;
       gwemu:debug) candidates="--profile --gdb-port --headless --symbols --gdb --audio --no-break-on-fault --unpause-homebrew --app-symbols --detach-after-app-entry --keep-running --timeline --record-timeline" ;;
       debug:python) candidates="--target --host --port --openocd-port --probe-id --programmer --remote-url --remote-origin --qmp-socket --profile --symbols --debug-config" ;;
       ofw:patch) candidates="--source-tree --backup-dir --output-dir" ;;
@@ -1709,9 +1894,10 @@ _gwprov() {
       sdcard:compose|sd:compose) candidates="--content-dir --core --core-name --rom --rom-dir --config" ;;
       input:tap) candidates="--repeat --tap-ms --gap-ms" ;;
       report:render) candidates="--input --output --format" ;;
-      profile:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --duration --interval --output --format --top" ;;
-      perf:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --duration --interval --output --format --top" ;;
+      profile:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
+      perf:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
       profile:create) candidates="--stock --content --backup-dir --locked --model --output-dir --name --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file" ;;
+      profile:duplicate) candidates="--output-dir --output" ;;
       profile:list) candidates="--output --no-pager" ;;
       profile:show) candidates="--shared-sd-root" ;;
       *) candidates="" ;;
@@ -1816,7 +2002,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.help_categories = (
         ("Overview and selection", ("show", "set", "ps")),
         ("All devices and adapters", ("devices", "adapters")),
-        ("Selected-device controls", ("apply", "gwemu", "input", "deploy", "perf")),
+        ("Selected-device controls", ("apply", "device", "gwemu", "input", "deploy", "perf", "config")),
         ("Profiles and storage", ("profile", "filesystem", "media", "sdcard")),
         ("Project catalog", ("projects",)),
         ("File workflows not yet device-scoped", ("retro-go", "ofw")),
@@ -1850,6 +2036,16 @@ def build_parser() -> argparse.ArgumentParser:
     devices.add_argument("--output", choices=("text", "json"), default="text")
     devices.add_argument("--ids-only", action="store_true", help=argparse.SUPPRESS)
     devices.set_defaults(handler=_devices_command)
+    device = commands.add_parser("device", help="inspect or recover the active physical device")
+    device_commands = device.add_subparsers(dest="device_command", required=True)
+    device_recover = device_commands.add_parser(
+        "recover", help="recover a quiescent gnwmanager RAM service and boot bank 1")
+    device_recover.set_defaults(handler=_device_recover)
+    device_config = commands.add_parser("config", help="inspect configuration stored on the active device")
+    config_commands = device_config.add_subparsers(dest="device_config_command", required=True)
+    config_show = config_commands.add_parser("show", help="read and decode Retro-Go's current /CONFIG")
+    config_show.add_argument("--output", choices=("text", "json"), default="text")
+    config_show.set_defaults(handler=_device_config)
     set_command = commands.add_parser("set", help="choose the device focused by device commands")
     set_commands = set_command.add_subparsers(dest="set_command", required=True)
     active = set_commands.add_parser("active", help="show or select the active device")
@@ -1890,6 +2086,8 @@ def build_parser() -> argparse.ArgumentParser:
     sdcard_compose.add_argument("--config")
     sdcard_compose.set_defaults(handler=_sd_compose)
     apply = commands.add_parser("apply", help="apply the assigned profile to the active device")
+    apply.add_argument("--output", choices=("text", "json"), default="text",
+                       help="show live progress or emit a machine-readable result")
     apply.set_defaults(handler=_apply_parser)
     ps = commands.add_parser("ps", help="show live GWemu and hardware state")
     ps.add_argument("--output", choices=("text", "json"), default="text")
@@ -1911,6 +2109,8 @@ def build_parser() -> argparse.ArgumentParser:
                               help="select one local OpenOCD adapter explicitly")
     deploy_target.add_argument("--remote-url", help="use one gnwmanager serve URL")
     deploy_apply.add_argument("--remote-origin", help="Origin required by the selected remote server")
+    deploy_apply.add_argument("--output", choices=("text", "json"), default="text",
+                              help="show live progress or emit a machine-readable result")
     deploy_apply.add_argument("--region", action="append", choices=("bank1", "bank2", "frogfs", "littlefs", "extflash", "sd"),
                               help="region to deploy; repeatable, defaults to all profile regions")
     deploy_apply.set_defaults(handler=_deploy_apply)
@@ -2037,6 +2237,11 @@ def build_parser() -> argparse.ArgumentParser:
     start_inputs.add_argument("--timeline", help="replay inputs on GWemu guest time")
     start_inputs.add_argument("--record-timeline", metavar="FILE.tl",
                               help="record GUI inputs on guest time; requires a new file")
+    start.add_argument("--timing-mode", choices=("default", "baseline", "experimental-m7"), default="default",
+                       help="baseline: coherent one-instruction/one-cycle DWT; experimental, not hardware accurate")
+    start.add_argument("--icount", type=int, choices=range(11), help="fixed instruction-count shift; baseline requires 0")
+    start.add_argument("--gwemu-bin", help="explicit GWemu executable; retain a fixed binary for timing cohorts")
+    start.add_argument("--rtc-epoch", type=int, help="repeatable RTC seed as Unix seconds")
     start.set_defaults(handler=_gwemu_start)
 
     stop = gwemu_commands.add_parser("stop", help="gracefully stop a daemon-managed instance")
@@ -2081,7 +2286,9 @@ def build_parser() -> argparse.ArgumentParser:
     profiler.add_argument("--interval", type=float, default=0.02,
                           help="sample interval in wall seconds, with jitter (default: 0.02)")
     profiler.add_argument("--progress-symbol", action="append", metavar="SYMBOL",
-                          help="32-bit progress counter; default: discover common counter names")
+                          help="scalar progress counter (1, 2, 4 or 8 bytes); default: discover common counter names")
+    profiler.add_argument("--progress-interval", type=float, default=1.0,
+                          help="seconds between progress-counter observations; observed halted epochs are excluded")
     profiler.add_argument("--stall-threshold", type=float, default=1.0,
                           help="minimum duration in seconds for reporting a flat progress counter (default: 1.0)")
     profiler.add_argument("--rebase", action="append", default=[], metavar="SECTION=POINTER_SYMBOL",
@@ -2155,7 +2362,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_inputs.add_argument("--timeline", help="replay inputs on GWemu guest time")
     run_inputs.add_argument("--record-timeline", metavar="FILE.tl",
                             help="record GUI inputs on guest time; requires a new file")
-    run.add_argument("--icount", type=int)
+    run.add_argument("--icount", type=int, choices=range(11))
+    run.add_argument("--timing-mode", choices=("default", "baseline", "experimental-m7"), default="default",
+                     help="baseline: coherent one-instruction/one-cycle DWT; experimental, not hardware accurate")
+    run.add_argument("--gwemu-bin", help="explicit GWemu executable; retain a fixed binary for timing cohorts")
+    run.add_argument("--rtc-epoch", type=int, help="repeatable RTC seed as Unix seconds")
     run.add_argument("--headless", action="store_true")
     run.add_argument("--audio", action="store_true")
     run.add_argument("--keep-temp", action="store_true")
@@ -2287,7 +2498,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     profile = commands.add_parser("profile", help="create and manage device profiles")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True,
-                                              metavar="{create,list,show}")
+                                              metavar="{create,duplicate,list,show}")
     create = profile_commands.add_parser("create", help="create a device profile from content or stock media")
     create.add_argument("directory", metavar="NAME_OR_PATH",
                         help="managed profile name, or an explicit output path")
@@ -2315,6 +2526,17 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--bootloader-version", default="v1.0.8", help="release tag or latest")
     create.add_argument("--bootloader-file", help="use a local binary linked at 0x08000000")
     create.set_defaults(handler=_profile_create)
+    duplicate = profile_commands.add_parser(
+        "duplicate", help="copy a profile into an independent working profile")
+    duplicate.add_argument("source", metavar="SOURCE",
+                           help="managed profile name or explicit profile path")
+    duplicate.add_argument("destination", metavar="DESTINATION",
+                           help="new managed profile name or explicit output path")
+    duplicate.add_argument(
+        "--output-dir",
+        help="profile store for the copy (default: GWPROV_PROFILE_DIR or platform data directory)")
+    duplicate.add_argument("--output", choices=("text", "json"), default="text")
+    duplicate.set_defaults(handler=_profile_duplicate)
     profile_list = profile_commands.add_parser("list", help="list profiles in the managed profile store")
     profile_list.add_argument("--output", choices=("text", "json", "names"), default="text",
                               help="table, JSON, or plain names for shell completion")

@@ -99,7 +99,41 @@ def _read_frogfs(image: Path, offset: int, destination: Path) -> None:
             path.write_bytes(data)
 
 
-def _build_frogfs(source: Path, output: Path, work: Path) -> None:
+def _mapped_artifacts(profile_root: Path) -> list[tuple[str, int]]:
+    """Read mapped FrogFS payload declarations from generic profile metadata."""
+    metadata_path = profile_root / "provision.json"
+    if not metadata_path.is_file():
+        return []
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    declarations = []
+    projects = metadata.get("projects", {})
+    if not isinstance(projects, dict):
+        raise ValueError("profile provision.json projects field must be an object")
+    seen = set()
+    for project in projects.values():
+        if not isinstance(project, dict):
+            continue
+        for item in project.get("mapped", []):
+            if not isinstance(item, dict) or "path" not in item or "relocBase" not in item:
+                raise ValueError("mapped FrogFS declarations require path and relocBase")
+            path = _safe_name(item["path"])
+            parts = PurePosixPath(path).parts
+            if not parts or parts[0] not in {"cores", "homebrews"} or ".." in parts:
+                raise ValueError(f"invalid mapped FrogFS path: {path!r}")
+            base = item["relocBase"]
+            base = int(base, 0) if isinstance(base, str) else base
+            if not isinstance(base, int) or not 0 <= base <= 0xFFFFFFFF:
+                raise ValueError(f"invalid mapped FrogFS relocation base for {path}")
+            if path in seen:
+                raise ValueError(f"duplicate mapped FrogFS path: {path}")
+            seen.add(path)
+            declarations.append((path, base))
+    return declarations
+
+
+def _build_frogfs(source: Path, output: Path, work: Path, *,
+                  mapped_artifacts: list[tuple[str, int]] | None = None,
+                  extflash_base: int = 0x90000000, extflash_offset: int = 0) -> None:
     if not any(path.is_file() for path in source.rglob("*")):
         from .vendor.frogfs import format as frog_format
         from .vendor.frogfs.frogfs import djb2_hash, align
@@ -122,12 +156,26 @@ def _build_frogfs(source: Path, output: Path, work: Path) -> None:
     build = work / "build"
     # Collect children so a temporary staging directory name never becomes
     # an unexpected top-level filesystem directory.
-    config.write_text(yaml.safe_dump({"collect": {str(source / "*"): ""}}), encoding="utf-8")
+    config_data = {"collect": {str(source / "*"): ""}}
+    mapped_artifacts = mapped_artifacts or []
+    if mapped_artifacts:
+        config_data["filter"] = {path: ["no compress"] for path, _base in mapped_artifacts}
+    config.write_text(yaml.safe_dump(config_data), encoding="utf-8")
     # mkfrogfs creates its cache directory as a child of build_dir, so the
     # parent must exist before its first Stage 1 directory entry is visited.
     build.mkdir(parents=True, exist_ok=True)
     subprocess.run([sys.executable, str(script), str(config), str(build), str(output)],
                    check=True, cwd=work)
+    if mapped_artifacts:
+        scripts = Path(__file__).parent / "vendor/retrogo_sd/scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        from frogfs_pico8_ro import patch_frogfs_mapped_inplace
+        for logical_path, reloc_base in mapped_artifacts:
+            if not patch_frogfs_mapped_inplace(
+                    output, logical_path=logical_path, reloc_base=reloc_base,
+                    extflash_base=extflash_base, extflash_offset=extflash_offset):
+                raise ValueError(f"could not relocate mapped FrogFS payload: {logical_path}")
 
 
 def _mount_littlefs(image: Path, offset: int, size: int, block_size: int):
@@ -160,6 +208,7 @@ def operate(*, operation: str, target: str, profile: str | None = None,
             image: str | None = None, filesystem: str | None = None,
             offset: int = 0, size: int | None = None, block_size: int = 4096,
             path: str = "/", source: str | None = None,
+            mapped_sources: list[str] | None = None,
             size_mib: int | None = None, force: bool = False) -> int:
     """List, add, or remove a file in a profile/image filesystem."""
     if profile:
@@ -196,6 +245,8 @@ def operate(*, operation: str, target: str, profile: str | None = None,
                 os.replace(created, image_path)
             return 0
         if kind == "frogfs":
+            if profile and target == "flash/ext" and _mapped_artifacts(device.root):
+                raise ValueError("cannot format a FrogFS profile while it declares mapped XiP artifacts")
             if size is None and profile and layout:
                 size = layout["lfs_offset"]
             if size is None: raise ValueError("FrogFS create requires --size")
@@ -289,6 +340,7 @@ def operate(*, operation: str, target: str, profile: str | None = None,
         with tempfile.TemporaryDirectory(prefix=".gwprov-fs-", dir=image_path.parent) as temp:
             work = Path(temp); tree = work / "tree"; tree.mkdir()
             _read_frogfs(image_path, offset, tree)
+            mapped_artifacts = _mapped_artifacts(device.root) if target == "flash/ext" else []
             dest = tree / relative
             if operation == "add":
                 if source_path is None or not source_path.is_file():
@@ -296,9 +348,42 @@ def operate(*, operation: str, target: str, profile: str | None = None,
                 dest.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(source_path, dest)
             elif operation == "delete":
                 if not dest.is_file(): raise ValueError(f"FrogFS file does not exist: {relative}")
+                if relative in {mapped_path for mapped_path, _base in mapped_artifacts}:
+                    raise ValueError("cannot delete a mapped FrogFS artifact while its profile declares it")
                 dest.unlink()
+            supplied_mapped = {}
+            for spec in mapped_sources or []:
+                if "=" not in spec:
+                    raise ValueError("--mapped-source format is FROGFS_PATH=LOCAL_FILE")
+                mapped_path, local_path = spec.split("=", 1)
+                mapped_path = _safe_name(mapped_path)
+                if mapped_path in supplied_mapped:
+                    raise ValueError(f"mapped FrogFS source supplied twice: {mapped_path}")
+                file_path = Path(local_path).expanduser().resolve()
+                if not file_path.is_file():
+                    raise ValueError(f"mapped FrogFS source does not exist: {file_path}")
+                supplied_mapped[mapped_path] = file_path
+            mapped_paths = {mapped_path for mapped_path, _base in mapped_artifacts}
+            if operation == "add" and relative in mapped_paths:
+                if relative in supplied_mapped:
+                    raise ValueError(f"mapped source supplied both as --source and --mapped-source: {relative}")
+                supplied_mapped[relative] = source_path
+            unknown = set(supplied_mapped) - mapped_paths
+            if unknown:
+                raise ValueError("--mapped-source path is not declared by this profile: "
+                                 + ", ".join(sorted(unknown)))
+            missing = mapped_paths - set(supplied_mapped)
+            if missing:
+                raise ValueError("FrogFS rebuild would move mapped payloads; supply each raw mapped sidecar "
+                                 "with --mapped-source PATH=LOCAL_FILE: "
+                                 + ", ".join(sorted(missing)))
+            for mapped_path, local_path in supplied_mapped.items():
+                target_path = tree / _safe_name(mapped_path)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(local_path, target_path)
             built = work / "frogfs.bin"
-            _build_frogfs(tree, built, work)
+            _build_frogfs(tree, built, work, mapped_artifacts=mapped_artifacts,
+                          extflash_offset=offset)
             new_size = built.stat().st_size
             capacity = layout["lfs_offset"] if layout else (size or image_path.stat().st_size - offset)
             if capacity <= 0 or offset < 0 or offset + capacity > image_path.stat().st_size:

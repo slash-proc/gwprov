@@ -995,7 +995,10 @@ metadata, and device state. It never overwrites an existing destination.
 Symlinks and hard links are materialized so writes in an experimental run cannot
 mutate the baseline through a shared file. On Linux filesystems that support it,
 GWProv uses private copy-on-write clones to make large flash images fast and
-space efficient; other hosts receive ordinary independent copies. Use
+space efficient; other hosts receive ordinary independent copies. FrogFS edits
+on profiles with mapped XiP files require a raw source for every mapped file via
+`--mapped-source PATH=FILE`; GWProv then rebuilds and relocates those files from
+their declared bases. Use
 `--output-dir` to place a named copy in a temporary profile store, and retain
 performance reports outside that directory before deleting an experimental
 copy.

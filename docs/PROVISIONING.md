@@ -171,12 +171,21 @@ available as concise dashboard views.
 Filesystem commands accept a managed profile or an explicit image. FrogFS
 changes rebuild the filesystem and update a profile's declared FrogFS size;
 direct images are rebuilt within their existing image or explicitly sized region.
-LittleFS and SD changes are applied in place. `create` formats an empty
-filesystem and requires `--force` when replacing existing data:
+A profile that declares mapped XiP artifacts requires each raw mapped source on
+every FrogFS rebuild because rebuilding can move payloads. GWProv rejects a
+rebuild that omits one, stores mapped payloads uncompressed, and relocates them
+using their declared `relocBase`. LittleFS and SD changes are applied in place.
+`create` formats an empty filesystem and requires `--force` when replacing
+existing data. Formatting a profile that still declares mapped XiP artifacts is
+rejected because it would remove the files while leaving their declarations:
 
 ```bash
 gwprov filesystem ls --profile retro-go-demo --target flash/ext
 gwprov filesystem add assets/title.png --source ./title.png \
+  --profile retro-go-demo --target flash/ext
+# For mapped XiP profiles, supply each raw sidecar source during every rebuild:
+gwprov filesystem add homebrews/app.bin --source ./app.bin \
+  --mapped-source homebrews/app.xip=./app.xip \
   --profile retro-go-demo --target flash/ext
 gwprov filesystem remove assets/old.png --profile retro-go-demo --target flash/ext
 gwprov filesystem create --profile retro-go-demo --target flash/ext \

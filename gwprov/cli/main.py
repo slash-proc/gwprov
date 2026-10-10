@@ -1304,8 +1304,9 @@ def _filesystem(args) -> int:
                    image=image, filesystem=filesystem, offset=args.offset,
                    size=size, block_size=args.block_size,
                    path=getattr(args, "destination", None) or getattr(args, "path", None) or "/",
-                   source=getattr(args, "source", None), size_mib=size_mib,
-                   force=getattr(args, "force", False))
+                   source=getattr(args, "source", None),
+                   mapped_sources=getattr(args, "mapped_source", []),
+                   size_mib=size_mib, force=getattr(args, "force", False))
 
 
 def _media_compare(args) -> int:
@@ -1690,7 +1691,7 @@ _gwprov_complete() {
       ofw:patch) candidates="--source-tree --backup-dir --output-dir" ;;
       media:inventory) candidates="--profile --image --filesystem --offset --size --block-size --shared-sd-root --output" ;;
       filesystem:create|fs:create) candidates="--profile --image --target --filesystem --offset --size --size-mib --block-size --force" ;;
-      filesystem:ls|filesystem:tree|filesystem:add|filesystem:delete|filesystem:del|filesystem:remove|filesystem:rm|fs:ls|fs:tree|fs:add|fs:delete|fs:del|fs:remove|fs:rm) candidates="--profile --image --target --filesystem --offset --size --block-size --source" ;;
+      filesystem:ls|filesystem:tree|filesystem:add|filesystem:delete|filesystem:del|filesystem:remove|filesystem:rm|fs:ls|fs:tree|fs:add|fs:delete|fs:del|fs:remove|fs:rm) candidates="--profile --image --target --filesystem --offset --size --block-size --source --mapped-source" ;;
       input:tap) candidates="--probe-id --programmer --remote-url --remote-origin --repeat --tap-ms --gap-ms" ;;
       media:compare) candidates="--mode" ;;
       media:frogfs|media:littlefs) candidates="--retro-go-root" ;;
@@ -1886,7 +1887,7 @@ _gwprov() {
       ofw:patch) candidates="--source-tree --backup-dir --output-dir" ;;
       media:inventory) candidates="--profile --image --filesystem --offset --size --block-size --shared-sd-root --output" ;;
       filesystem:create|fs:create) candidates="--profile --image --target --filesystem --offset --size --size-mib --block-size --force" ;;
-      filesystem:ls|filesystem:tree|filesystem:add|filesystem:delete|filesystem:del|filesystem:remove|filesystem:rm|fs:ls|fs:tree|fs:add|fs:delete|fs:del|fs:remove|fs:rm) candidates="--profile --image --target --filesystem --offset --size --block-size --source" ;;
+      filesystem:ls|filesystem:tree|filesystem:add|filesystem:delete|filesystem:del|filesystem:remove|filesystem:rm|fs:ls|fs:tree|fs:add|fs:delete|fs:del|fs:remove|fs:rm) candidates="--profile --image --target --filesystem --offset --size --block-size --source --mapped-source" ;;
       input:tap) candidates="--probe-id --programmer --remote-url --remote-origin --repeat --tap-ms --gap-ms" ;;
       media:compare) candidates="--mode" ;;
       media:frogfs|media:littlefs) candidates="--retro-go-root" ;;
@@ -2470,9 +2471,13 @@ def build_parser() -> argparse.ArgumentParser:
     filesystem_target(add_fs)
     add_fs.add_argument("destination", help="destination path inside the filesystem")
     add_fs.add_argument("--source", required=True, help="local file to add")
+    add_fs.add_argument("--mapped-source", action="append", default=[], metavar="PATH=FILE",
+                        help="raw source for a mapped XiP file when rebuilding FrogFS; repeat for each mapped path")
     delete_fs = filesystem_commands.add_parser("delete", aliases=("del", "remove", "rm"), help="remove a file")
     filesystem_target(delete_fs)
     delete_fs.add_argument("path", help="file path inside the filesystem")
+    delete_fs.add_argument("--mapped-source", action="append", default=[], metavar="PATH=FILE",
+                           help="raw source for every retained mapped XiP file when rebuilding FrogFS")
 
     input_group = commands.add_parser("input", help="send controller input to a target")
     input_commands = input_group.add_subparsers(dest="input_command", required=True)

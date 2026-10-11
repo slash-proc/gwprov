@@ -194,11 +194,18 @@ def _read_handle_response(kernel, handle) -> dict:
 class DaemonServer:
     """Serve one-request local IPC connections to a dispatch callback."""
 
+    MAX_CONNECTIONS = 32
+    OVERLOADED_RESPONSE = (json.dumps(
+        {"protocol": PROTOCOL_VERSION, "ok": False,
+         "error": "GWProv daemon is at its request limit; retry shortly"},
+        separators=(",", ":")).encode("utf-8") + b"\n")
+
     def __init__(self, dispatch: Callable[[dict], dict]):
         self.dispatch = dispatch
         self.stopping = threading.Event()
         self.sock: socket.socket | None = None
         self._windows_threads: list[threading.Thread] = []
+        self._connection_slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
 
     def serve(self) -> None:
         if os.name == "nt":
@@ -243,7 +250,15 @@ class DaemonServer:
                     if self.stopping.is_set():
                         break
                     raise
-                thread = threading.Thread(target=self._serve_connection,
+                if not self._connection_slots.acquire(blocking=False):
+                    try:
+                        connection.sendall(self.OVERLOADED_RESPONSE)
+                    except OSError:
+                        pass
+                    finally:
+                        connection.close()
+                    continue
+                thread = threading.Thread(target=self._serve_connection_slot,
                                           args=(connection,), daemon=True)
                 thread.start()
         finally:
@@ -253,6 +268,12 @@ class DaemonServer:
                     path.unlink()
             except FileNotFoundError:
                 pass
+
+    def _serve_connection_slot(self, connection: socket.socket) -> None:
+        try:
+            self._serve_connection(connection)
+        finally:
+            self._connection_slots.release()
 
     def _serve_connection(self, connection: socket.socket) -> None:
         with connection:

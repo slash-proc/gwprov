@@ -460,10 +460,14 @@ class HardwareTarget(Target):
             if self.hard_reset:
                 print("--no-flash --hard-reset: resetting the device, "
                       "leaving flash untouched")
+                from ..hw_lifecycle import (_freeze_h7_watchdogs,
+                                            _restore_h7_watchdogs)
+                watchdog_freezes = _freeze_h7_watchdogs(self.backend)
                 self.backend.reset_and_halt()
                 if self.precise_faults:
                     self._enable_precise_faults()
                 self.backend.resume()
+                _restore_h7_watchdogs(self.backend, watchdog_freezes)
                 self._start_timeline()
                 return
             print("--no-flash: observing the device WITHOUT reset "
@@ -472,11 +476,12 @@ class HardwareTarget(Target):
             return
 
         from ..hw_lifecycle import (assert_application_mode,
-                                    mark_backend_recovery_required)
+                                    mark_backend_recovery_required,
+                                    start_gnwmanager_verified)
         assert_application_mode(self.backend, operation="start a hardware target")
         mark_backend_recovery_required(self.backend, "starting gnwmanager RAM programmer")
         self.gnw = GnW(self.backend)
-        self.gnw.start_gnwmanager()
+        start_gnwmanager_verified(self.backend, self.gnw)
         mark_backend_recovery_required(self.backend, "gnwmanager RAM programmer")
 
         # Flash the bank the image was LINKED for. A bank-2 firmware written to
@@ -546,18 +551,24 @@ class HardwareTarget(Target):
         # device must start from the same state a power cycle gives it.
         if self.hard_reset:
             print("hard reset: resetting the CPU and every peripheral")
+            from ..hw_lifecycle import (_freeze_h7_watchdogs,
+                                        _restore_h7_watchdogs)
+            watchdog_freezes = _freeze_h7_watchdogs(self.backend)
             self.gnw.reset_and_halt()
             if self.precise_faults:
                 self._enable_precise_faults()
             self.backend.resume()
+            _restore_h7_watchdogs(self.backend, watchdog_freezes)
             self._confirm_application_running()
             return
 
         base = 0x08100000 if self.image.intflash_bank == 2 else 0x08000000
-        self.gnw.reset_and_halt()
+        from ..hw_lifecycle import (_reset_and_halt_for_stub,
+                                    _resume_after_stub_transition)
+        watchdog_freezes = _reset_and_halt_for_stub(self.backend, self.gnw)
         self.backend.write_register("msp", self.gnw.read_uint32(base))
         self.backend.write_register("pc", self.gnw.read_uint32(base + 4))
-        self.backend.resume()
+        _resume_after_stub_transition(self.backend, watchdog_freezes)
         self._confirm_application_running()
 
     def _confirm_application_running(self):

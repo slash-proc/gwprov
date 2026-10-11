@@ -12,7 +12,10 @@ import struct
 import sys
 import zlib
 
-from pico8_ro_build_patch import PICO8_CODE_BASE, patch_mapped_bytes
+if __package__:
+    from .pico8_ro_build_patch import PICO8_CODE_BASE, patch_mapped_bytes
+else:  # Support direct script execution from this directory.
+    from pico8_ro_build_patch import PICO8_CODE_BASE, patch_mapped_bytes
 
 FROGFS_MAGIC = 0x474F5246
 

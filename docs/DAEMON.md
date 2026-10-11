@@ -1,12 +1,11 @@
 # GWProv local daemon
 
-GWProv starts one per-user service on demand when a GWemu is launched through
-the CLI or a hardware backend acquires a target lease. The daemon owns managed
-GWemu child processes and their QMP-over-stdio streams. CLI commands from any
-terminal send status, screenshot, and control requests to that same owner.
-Hardware backend processes register and release their existing cross-process
-target leases with the daemon so it can report active operations and stay alive
-for the duration of a session.
+GWProv starts one per-user service on demand when a CLI command needs device
+state or a managed GWemu instance. The daemon owns managed GWemu child processes
+and their QMP-over-stdio streams. It also refreshes local probe and configured
+remote-adapter inventory, keeps device connections while it owns them, and
+polls attached devices every five seconds. CLI commands from any terminal use
+its cached state or ask for a live refresh.
 
 ## Discovery and startup
 
@@ -21,13 +20,17 @@ tables or select a port:
 
 Commands that need the daemon first try that endpoint. If it is absent, they
 serialize startup with a per-user lock, launch the service in the background,
-and wait for its protocol handshake. `gwprov ps` does not start an idle daemon;
-it queries one if present and still inventories external processes and probes.
+register configured adapters, and wait for its protocol handshake. `gwprov ps`
+starts the daemon when needed and returns its current device snapshot; `--live`
+waits for an immediate poll and internal-flash scan. Background polls refresh
+runtime state every five seconds and rescan bank contents at least every 90
+seconds; GWProv hardware sessions invalidate the bank cache when they release
+their lease.
 
-The daemon exits after its last managed VM and active target lease are gone and
-the short idle grace period expires. A lease is released when the backend closes
-or its owning process exits. This lets one daemon serve several terminals while
-work is active without leaving a permanent background service.
+CLI and scripted requests reset a ten-minute idle timer. Periodic device polls
+and registered devices do not. Once no managed GWemu instance or substantial
+hardware operation blocks shutdown, the daemon exits after ten minutes without
+client activity. The next CLI command starts it again.
 
 ## Local authentication and protocol
 
@@ -43,6 +46,24 @@ the CLI and no loopback TCP QMP endpoint. Requests use structured JSON and a
 fixed set of GWProv operations. The QMP bridge allows status, screenshots,
 execution controls, input events, and bounded register/memory reads. It does
 not expose arbitrary QEMU monitor commands.
+
+The daemon's `ping` response reports its package version, source directory,
+and SHA-256 of the Python source files captured when the process started. The
+daemon also checks that identity every five seconds. If the installed source
+changes, it stops accepting new managed VM and target sessions and drains
+automatically while passive device polling continues. A stale daemon that owns
+a managed GWemu waits for that instance to stop. Substantial hardware
+operations can finish normally, or be canceled with
+`gwprov daemon restart --force`. The next CLI request starts the current daemon
+after the old process exits. Older daemons that predate self-monitoring are
+detected by `ping`; a client replaces them when no managed VM, child process, or
+substantial operation lease prevents shutdown.
+
+The source identity includes Python files throughout the package, including
+subpackages. An idle stale daemon exits on its own; a RAM-flasher startup holds
+a process-visible operation lease, so draining waits until that transition
+ends. For an older or unresponsive daemon, GWProv verifies the process and its
+children before replacing it.
 
 This boundary separates different OS users. It does not protect a user's
 session from malicious software running as that same user, which already has
@@ -71,12 +92,39 @@ launch because GDB and QMP cannot both consume the same QEMU stdin/stdout pipe.
 
 ## Hardware sessions
 
-Hardware operations continue to use the selected PyOCD, OpenOCD, or
-gnwmanager-backed backend. Their existing exclusive target leases register an
-operation name, process ID, and target key with the daemon. `gwprov ps` uses
-that lease information to report `busy` and skips concurrent target polling.
-The daemon never polls a leased target itself. Remote gnwmanager servers remain
-separate local sessions, each represented by its own lease.
+The daemon owns each selected PyOCD or remote gnwmanager connection while it is
+polling a device. Local PyOCD and registered remote `gwprov debug python`
+sessions use a daemon proxy: the daemon keeps the same adapter connection,
+serializes debugger calls with its five-second state poll, and continues
+refreshing running and installed firmware between debugger commands. The
+session remains `BUSY` in `gwprov ps`, and an independent heartbeat keeps an
+idle interactive console alive.
+
+Standalone device operations take the process-shared target lease and hand the
+monitor connection off before connecting directly to the adapter. The daemon
+skips target polling during writes, erases, programming, and reset transitions;
+it resumes polling when that lease ends. Explicit OpenOCD debug sessions that
+cannot use the shared PyOCD connection also hold a lease and pause the monitor
+for the session.
+
+The CLI sends lease heartbeats on a separate thread every two seconds, so a
+long flash write does not delay them. Releasing the lease returns the device
+to daemon polling. If the owner process disappears, the operating-system lease
+is released and the daemon resumes polling. If heartbeats stop for twelve
+seconds while the owner process is still alive, the daemon requests
+cancellation, then force-kills an unresponsive owner after a short grace
+period. Monitor handoffs carry per-process tokens, so overlapping clients do
+not resume polling until the last handoff ends; abandoned handoffs expire if a
+client dies before acquiring its lease. BUSY is cleared on lease release while
+the daemon schedules a fresh state read. An explicit `gwprov daemon restart --force` requests immediate
+cancellation of substantial device operations before restart. Failed or
+interrupted writes are surfaced as operation failures; the daemon does not
+assume the device write completed.
+
+If a process exits during a device transition, a durable marker prevents
+background target reads until an operation verifies the device has returned to
+application firmware. A verified idle RAM flasher remains observable through
+passive polling.
 
 ## Repeatable GWemu timing
 

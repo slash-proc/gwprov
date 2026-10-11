@@ -33,6 +33,54 @@ eval "$(gwprov completion bash)"
 # eval "$(gwprov completion zsh)"
 ```
 
+## Quick start: create and flash a profile
+
+Find your stock firmware backup, create a profile, then review and apply it to the
+selected hardware device:
+
+```bash
+gwprov backups search ~/Downloads
+gwprov profile create mario-stock -m
+gwprov set active probe:YOUR_PROBE_ID
+gwprov deploy plan mario-stock
+gwprov deploy apply mario-stock
+```
+
+The profile includes Mario stock firmware and assets. The plan shows the bank
+contents and extflash offsets before writing. For Retro-Go releases, custom
+components, SD-card images, editing profiles, and backup/source management, see
+[Provisioning and profile usage](docs/PROFILES.md).
+
+Projects can be added to a profile and then applied to hardware:
+
+```bash
+gwprov project install doom --profile mario-retro-go
+gwprov deploy plan mario-retro-go
+gwprov deploy apply mario-retro-go
+
+# Preview the detected variant, files, and destinations without writing
+gwprov project install doom --profile mario-retro-go --dry-run
+```
+
+`project install` infers `flash` or `sd` from profile metadata, a device's
+assigned profile, or the target directory. A release that publishes only one
+storage variant also supplies an unambiguous default. Use `--variant` to
+override inference or when the destination supports both.
+
+An offline GWRG release ZIP can be installed the same way:
+
+```bash
+gwprov project install ./doom-v1.2.0.zip --variant flash --profile mario-retro-go
+gwprov deploy apply mario-retro-go
+```
+
+Pass `--device` to install into the active device's assigned profile and write it
+in one prompted operation (`--yes` skips the prompt). Bundle hashes verify the
+included files; they do not authenticate who published the ZIP. More profile
+and bundle examples are in [Provisioning and profile usage](docs/PROFILES.md).
+Use `--dry-run --format json` for a machine-readable install plan; dry runs do
+not contact the device.
+
 `requirements.txt` installs the `dist` and `media` extras from `pyproject.toml`,
 including Wasmtime and LittleFS support. gnwmanager is a package dependency;
 gwprov reuses its release-download bindings. The Retro-Go source build wrapper
@@ -526,6 +574,14 @@ gwprov debug python --target hardware --probe-id PROBE_ID --profile PROFILE
 >>> report["triage"]
 ```
 
+For local PyOCD targets and registered remote adapters, `debug python` uses
+the daemon-owned connection and automatically loads firmware and app symbols
+from a managed profile when its Retro-Go version matches and the firmware ELF
+is unambiguous. Conflicting same-tag profiles are not guessed. With no
+explicit hardware selector, it uses the active device. The console exposes
+`dbg.read_log()` for the Retro-Go log buffer; it reads the buffer without
+resetting the device.
+
 `arm_fault_breakpoints()` uses whichever of `common_fault_handler_c`,
 `HardFault_Handler`, `MemManage_Handler`, `BusFault_Handler`, and
 `UsageFault_Handler` are present in loaded symbols. At a handler-entry stop,
@@ -749,22 +805,22 @@ selected with `--remote-url ws[s]://host:port/gdb`; `--remote-origin` supplies i
 allowed origin when configured. SD deployment is an overlay and does not delete
 files omitted from the profile.
 
-Before starting that RAM programmer, GWProv passively checks VTOR, the
-gnwmanager mailbox status, and DHCSR. VTOR must point into the RAM stub image;
-the mailbox can retain a stale `IDLE` value while application firmware runs.
-An idle mailbox and running core confirm the stub is live only after VTOR has
-identified it.
+Before starting that RAM programmer, GWProv passively checks the stock ITCM
+fingerprint, the RDP option byte, VTOR, the gnwmanager mailbox, and DHCSR. An
+`IDLE` mailbox with a running core confirms the live stub; VTOR is recorded as
+evidence but can still point into a flash bank while the stub is attached. A
+stale `IDLE` mailbox with a halted core does not count as a live stub. Locked
+devices do not get internal-flash scans; unlocked devices can be scanned to
+identify installed banks independently from the runtime selected by VTOR.
 If the RAM service is already resident and idle, `apply` attaches to it and
 synchronizes its mailbox counter before sending work. A resident service that
-is busy or cannot be confirmed idle is left alone. GWProv persists a recovery
-marker in the target lease while using the service. If a command exits before
-verified return to application firmware, `gwprov ps` skips target traffic and
-later hardware operations must recover the marker. Starting a bank after
-deployment clears it once application firmware is verified; without `--start`,
-the RAM flasher remains available and the marker stays set. The
-`gwprov device recover` command starts the RAM flasher if needed or attaches to
-a live idle stub and synchronizes its mailbox counter. It leaves the device
-in Recovery Mode ready for commands; it does not boot bank 1:
+is busy or cannot be confirmed idle is left alone. `gwprov ps` reports `BUSY`
+while a substantial operation owns the target. Otherwise, the daemon continues
+its five-second state poll, including while the verified idle RAM flasher is
+running. Without `--start`, deployment leaves that flasher ready for another
+command. The `gwprov device recover` command starts the RAM flasher if needed
+or attaches to a live idle stub and synchronizes its mailbox counter. It leaves
+the flasher running; it does not boot bank 1:
 
 ```sh
 gwprov device recover
@@ -779,17 +835,22 @@ left alone.
 ## Local and remote device sessions
 
 `gwprov ps` combines GWemu process/application state with locally visible hardware
-probes. A physical row reports `busy` when another GWProv session owns that probe,
-or a detected local OpenOCD, PyOCD, or gnwmanager process may be using it. While busy, `ps`
-does not open the debug session or read target registers; the `Application` value
-is `Unknown` and the row identifies the owner when available. Otherwise it reads
-the Cortex-M halt bit. Without `--profile`, this is read-only and application state
-is `Unknown`. With matching firmware/app ELFs, it briefly halts each running target
-to capture registers, stack, and menu/app state from symbols, resumes it, and
-verifies the final run state. It leaves an already halted target halted.
-Applications may export the writable SRAM string `gwprov_application_state` for
-custom game states. GWProv hardware, deployment, profiling, and remote sessions
-hold process-shared leases for their duration; they release automatically on exit.
+probes. A physical row reports `BUSY` while a substantial operation owns the
+target. Writes and reset transitions suppress polling until their lease ends.
+The daemon continues polling while a verified idle RAM flasher is ready, and
+between calls in local PyOCD Python debug sessions that use the daemon-owned
+adapter connection. If an operation is interrupted before the target's state is
+verified, the daemon pauses target traffic until `gwprov device recover` or a
+verified return to application firmware clears the marker. Other direct
+hardware sessions hand the connection to their owner and pause polling.
+
+Hardware identification checks residual ITCM and the RDP lock state first, then
+uses VTOR, the gnwmanager mailbox, and DHCSR to classify runtime and service
+state. Unlocked internal-flash signatures identify installed banks; VTOR
+identifies the running stock Mario/Zelda, bootloader, or Retro-Go image. The
+five-second daemon poll is passive and does not halt the core to sample PC.
+GWProv hardware, deployment, profiling, and remote sessions hold process-shared
+leases for their duration; they release automatically on exit.
 Install `gwprov[device]` for selected-probe sessions and enumeration.
 
 The text view uses a color-aware, terminal-sized table and pages only when the
@@ -812,12 +873,12 @@ gwprov debug python --target hardware --probe-id PROBE_ID_A --probe-id PROBE_ID_
 ```
 
 The REPL exposes `sessions` and `backends` dictionaries keyed by probe ID, and
-`dbg` aliases the first session. With no `--probe-id`, GWProv preserves
-`gnwmanager`'s OpenOCD autodetection order, which selects one matching programmer.
-Use repeatable `--programmer stlink|jlink|cmsis-dap|rpi-gpio` options to start
-separate OpenOCD sessions for explicit adapter types; `--probe-id` pins individual
-PyOCD probes by unique ID. Deployment and hardware profiling accept the same
-single-target selectors.
+`dbg` aliases the first session. With no explicit hardware selector, GWProv uses
+the active device (`gwprov set active DEVICE`). Use repeatable `--programmer
+stlink|jlink|cmsis-dap|rpi-gpio` options to start separate direct OpenOCD
+sessions for explicit adapter types; `--probe-id` pins individual PyOCD probes
+by unique ID. Deployment and hardware profiling accept the same single-target
+selectors.
 
 Each `gnwmanager serve` endpoint represents one target. Multiple server endpoints
 can be attached in the same Python session:
@@ -880,7 +941,7 @@ gwprov fs create sdcard 128 dev-local
 gwprov retro-go config --output build/CONFIG --rom gb Tetris.gb
 gwprov retro-go build --path references/game-and-watch-retro-go-sd --dry-run
 gwprov media frogfs --retro-go-root references/game-and-watch-retro-go-sd [packer options]
-gwprov ofw patch mario --source-tree ../qemu-gnw --backup-dir backup --output-dir build/ofw [patch options]
+gwprov ofw patch mario --backup-dir backup --output-dir build/ofw [patch options]
 ```
 
 Enable Bash completion in the current shell with `eval "$(gwprov completion bash)"`. In zsh,
@@ -955,20 +1016,9 @@ with `project versions`, `project info`, and `project install`; both `tgb` and
 
 ## Pristine stock profiles
 
-Create stock media from your own hash-valid backup pair. Protection is stored as
-device state in `rdp-state.bin`, independently of the firmware images.
-
-```bash
-gwprov profile create dev-local/profiles/stock-locked --stock \
-  --backup-dir /path/to/ofw-backups --locked
-gwprov profile create dev-local/profiles/stock-unlocked --stock \
-  --backup-dir /path/to/ofw-backups
-```
-
-`--stock` selects pristine stock profile creation within the normal profile
-creation command. Repeat `--backup-dir` for multiple backup sources; use
-`--model mario|zelda` to select a device explicitly. Existing profile
-directories are never overwritten.
+Stock profiles use backups discovered by `gwprov backups search`; see
+[Profiles: creation, editing, and deployment](docs/PROFILES.md) for the current
+workflow. Existing profile directories are never overwritten.
 
 ## Named device profiles
 

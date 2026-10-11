@@ -240,7 +240,7 @@ def show_device_config(*, output: str = "text") -> int:
         from rich.text import Text
 
         console = Console()
-        table = Table(title=f"Retro-Go /CONFIG · {device_id}", title_justify="left",
+        table = Table(title=f"Retro-Go /CONFIG for {device_id}", title_justify="left",
                       expand=True)
         table.add_column("SETTING", style="cyan", overflow="fold")
         table.add_column("VALUE", overflow="fold")
@@ -255,7 +255,7 @@ def show_device_config(*, output: str = "text") -> int:
         integrity = Text("CONFIG integrity: ", style="bold")
         integrity.append("valid" if valid else "invalid",
                          style="green" if valid else "red")
-        integrity.append(f" · CRC {checks['stored_crc32']}")
+        integrity.append(f"\nCRC: {checks['stored_crc32']}")
         console.print(integrity)
         console.print(f"Source: {source}", style="dim")
     return 0 if valid else 1

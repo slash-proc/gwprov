@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import sys
 import time
 from dataclasses import asdict
@@ -111,8 +113,77 @@ def _build_retro_go(args) -> int:
 
 def _firmware_install(args) -> int:
     from gwprov.dist.firmware import install_firmware
-    result = install_firmware(args.output, variant=args.variant, repo=args.repo, version=args.version)
+    result = install_firmware(args.output, variant=args.variant, repo=args.repo, version=args.version,
+                              versions_url=getattr(args, "versions_url", None))
     print(f"Installed Retro-Go {result['version']} ({args.variant}) in {args.output}")
+    return 0
+
+
+def _backups(args) -> int:
+    from gwprov import backups
+    from rich.table import Table
+    if args.backup_action == "search":
+        rows = backups.search(args.directory)
+    else:
+        rows = backups.list_backups()
+    if args.output == "json":
+        print(json.dumps({"backups": rows}, indent=2))
+        return 0
+    console = Console()
+    table = Table(title=f"Stock backups ({len(rows)})", expand=True)
+    table.add_column("MODEL", no_wrap=True)
+    table.add_column("BANK 1", overflow="fold")
+    table.add_column("EXTFLASH", overflow="fold")
+    table.add_column("LOCATION", overflow="fold")
+    for row in rows:
+        table.add_row(row["model"].title(), f'{row["bank1Bytes"]:,} bytes',
+                      f'{row["bank0Bytes"]:,} bytes', row["directory"])
+    console.print(table)
+    return 0
+
+
+def _retro_sources(args) -> int:
+    from gwprov import retro_sources
+    action = args.source_action
+    if action in ("list", "ls"):
+        result = retro_sources.list_sources()
+        if args.output == "json":
+            print(json.dumps(result, indent=2))
+            return 0
+        for row in result["sources"]:
+            print(("* " if row["default"] else "  ") + row["id"])
+        return 0
+    if action == "add":
+        result = retro_sources.add_source(args.source)
+    elif action == "remove":
+        result = retro_sources.remove_source(args.source)
+    else:
+        result = retro_sources.set_default(args.source)
+    if getattr(args, "output", "text") == "json":
+        print(json.dumps(result, indent=2))
+    elif action == "default":
+        print(f"Default Retro-Go source: {result['default']}")
+    else:
+        verb = "added" if action == "add" else "removed"
+        print(f"Retro-Go source {verb}: {result['id']}")
+    return 0
+
+
+def _retro_release_list(args) -> int:
+    from gwprov import retro_sources
+    from rich.table import Table
+    rows = retro_sources.list_releases(args.source)
+    key = "version" if args.sort == "version" else "source"
+    rows.sort(key=lambda row: str(row.get(key, "")).casefold(), reverse=args.reverse)
+    if args.output == "json":
+        print(json.dumps({"releases": rows}, indent=2))
+        return 0
+    table = Table(title=f"Retro-Go releases ({len(rows)})", expand=True)
+    table.add_column("SOURCE", overflow="fold")
+    table.add_column("VERSION", no_wrap=True)
+    for row in rows:
+        table.add_row(row["source"], row["version"])
+    Console().print(table)
     return 0
 
 
@@ -130,21 +201,177 @@ def _profile_create(args) -> int:
 
     destination = profile_destination(args.directory, output_dir=args.output_dir)
     destination_label = profile_reference(destination, profile_dir=args.output_dir)
-    if args.stock:
-        if not args.backup_dir:
-            raise ValueError("--stock requires at least one --backup-dir")
+    model = "mario" if args.mario else "zelda" if args.zelda else None
+    if model:
+        from gwprov.backups import list_backups
         from gwprov.stock import create_stock_profile
-        result = create_stock_profile(destination, backup_dirs=args.backup_dir,
-                                      locked=args.locked, model=args.model or "auto",
-                                      extflash_mib=args.extflash_mib or 64)
-        print(f"Created stock {result['model']} profile: {destination_label}; locked={result['locked']}")
+        backups = list_backups(model)
+        if not backups:
+            raise ValueError(f"no discovered {model.title()} backup pair; run `gwprov backups search DIRECTORY`")
+        result = create_stock_profile(destination,
+                                      backup_dirs=[row["directory"] for row in backups],
+                                      model=model, extflash_mib=args.extflash_mib or 64)
+        if args.patched or args.bootloader:
+            # Apply the stock transformation before adding Retro-Go's bank 2
+            # image. Stock-only profiles start with an explicit erased bank 2
+            # map entry, which would otherwise overlap the incoming firmware
+            # and abort profile creation before the patch step was reached.
+            from gwprov.vendor.qemu_gnw import cfw_images
+            import hashlib, shutil, yaml
+            out = destination / ".patch-output"
+            backup_dir = Path(backups[0]["directory"])
+            cfw_images.main([model, "--backup-dir", str(backup_dir),
+                             "--output-dir", str(out), "--extflash-mib",
+                             str(args.extflash_mib or 64),
+                             *( [] if args.bootloader else ["--no-bootloader"] )])
+            bank1 = (out / f"{model}-bank1-patched.bin").read_bytes()
+            patched_extflash = (out / f"{model}-extflash-patched.bin").read_bytes()
+            original_extflash = backup_dir / f"flash_backup_{model}.bin"
+            asset_size = original_extflash.stat().st_size
+            if len(bank1) != 256 * 1024 or len(patched_extflash) < asset_size:
+                raise ValueError("stock patch output has an unexpected flash-image size")
+            bank1_components = []
+            sd_bootloader_info = None
+            if args.bootloader:
+                if args.bootloader_file:
+                    raise ValueError(
+                        "--bootloader-file is linked at 0x08000000; use "
+                        "--sd-bootloader-file for the Game+Left bootloader at 0x08032000")
+                from gwprov.bootloader import resolve_sd_bootloader
+                cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+                sd_bootloader, sd_bootloader_info = resolve_sd_bootloader(
+                    cache=cache_home / "gwprov", repo=args.bootloader_repo,
+                    version=args.bootloader_version, local=args.sd_bootloader_file)
+                bootloader_offset = 0x32000
+                if len(bank1) < 0x40000 or any(byte != 0xFF for byte in bank1[bootloader_offset:0x40000]):
+                    raise ValueError(
+                        "patched bank 1 does not leave the 0x08032000 bootloader region erased")
+                prefix = bank1[:bootloader_offset]
+                prefix_path = destination / "blobs" / "stock-bank1-patched.bin"
+                bootloader_path = destination / "blobs" / "sd-bootloader.bin"
+                prefix_path.write_bytes(prefix)
+                bootloader_path.write_bytes(sd_bootloader)
+                bank1_components = [
+                    {"name": f"Stock {model.title()} (+patch)",
+                     "file": prefix_path.relative_to(destination).as_posix(),
+                     "offset": 0, "size": len(prefix),
+                     "sha256": hashlib.sha256(prefix).hexdigest()},
+                    {"name": f"SD bootloader ({sd_bootloader_info.get('version') or 'local'})",
+                     "file": bootloader_path.relative_to(destination).as_posix(),
+                     "offset": bootloader_offset, "size": len(sd_bootloader),
+                     "sha256": sd_bootloader_info["sha256"]},
+                ]
+                bank1 = prefix + sd_bootloader + b"\xff" * (
+                    256 * 1024 - bootloader_offset - len(sd_bootloader))
+            else:
+                if args.sd_bootloader_file:
+                    raise ValueError("--sd-bootloader-file requires --bootloader/-b")
+                if args.bootloader_file:
+                    raise ValueError(
+                        "--bootloader-file is for content-based profiles; it is not used by stock patch profiles")
+                bank1_components = [{
+                    "name": f"Stock {model.title()} (+patch)",
+                    "file": "blobs/stock-bank1.bin", "offset": 0,
+                    "size": len(bank1), "sha256": hashlib.sha256(bank1).hexdigest()}]
+            # The patcher pads external flash to the selected chip capacity.
+            # Keep only the stock asset range in the component map so later
+            # Retro-Go extflash components can be mapped at non-overlapping offsets.
+            bank0 = patched_extflash[:asset_size]
+            (destination / "bank1.bin").write_bytes(bank1)
+            (destination / "extflash.bin").write_bytes(
+                bank0 + b"\xff" * (args.extflash_mib * 1024 * 1024 - len(bank0)))
+            if not args.bootloader:
+                (destination / "blobs" / "stock-bank1.bin").write_bytes(bank1)
+            (destination / "blobs" / "stock-assets.bin").write_bytes(bank0)
+            flash_map_path = destination / "flash-map.yaml"
+            flash_map = yaml.safe_load(flash_map_path.read_text())
+            flash_map["bank1"] = bank1_components
+            flash_map["bank0"] = [{"name": f"{model.title()} Assets",
+                                  "file": "blobs/stock-assets.bin", "offset": 0,
+                                  "size": len(bank0),
+                                  "sha256": hashlib.sha256(bank0).hexdigest()}]
+            flash_map_path.write_text(yaml.safe_dump(flash_map, sort_keys=False))
+            provision_path = destination / "provision.json"
+            provision = json.loads(provision_path.read_text())
+            provision["patch"] = {"applied": True, "bootloader": bool(args.bootloader)}
+            if sd_bootloader_info is not None:
+                provision["patch"]["sdBootloader"] = sd_bootloader_info
+            provision_path.write_text(json.dumps(provision, indent=2) + "\n")
+            shutil.rmtree(out)
+        if args.retro_go:
+            import tempfile
+            from gwprov.retro_sources import resolve_release
+            from gwprov.dist.firmware import install_firmware
+            from gwprov.provision import create_profile
+            from gwprov.profiles import edit_profile_blob
+            import yaml, shutil
+            source, tag = resolve_release(args.retro_go)
+            with tempfile.TemporaryDirectory(prefix="gwprov-retro-profile-") as work:
+                content = Path(work) / "content"
+                install_firmware(content, variant="flash", repo=source["repo"], version=tag,
+                                 versions_url=source["versionsUrl"])
+                assembled = Path(work) / "assembled"
+                create_profile(assembled, content=content, littlefs_mib=args.littlefs_mib,
+                               extflash_mib=args.extflash_mib)
+                mapping = yaml.safe_load((assembled / "flash-map.yaml").read_text())
+                # A stock profile's erased-bank placeholder is a real mapped
+                # component. Remove it before placing Retro-Go at bank 2.
+                stock_map_path = destination / "flash-map.yaml"
+                stock_map = yaml.safe_load(stock_map_path.read_text())
+                erased = next((item for item in stock_map.get("bank2", [])
+                               if item.get("name") == "Erased (0xFF)"), None)
+                if erased:
+                    edit_profile_blob(destination, action="remove", bank="bank2",
+                                      name=erased["name"])
+                for bank in ("bank2", "bank0"):
+                    for item in mapping.get(bank, []):
+                        blob = assembled / item["file"]
+                        copied = destination / "blobs" / f"retro-{bank}-{blob.name}"
+                        copied.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(blob, copied)
+                        edit_profile_blob(destination, action="add", bank=bank,
+                                          name=item["name"], source=copied,
+                                          offset=item["offset"])
+                assembled_provision = json.loads((assembled / "provision.json").read_text())
+                assembled_debug = assembled / "debug"
+                if assembled_debug.is_dir():
+                    shutil.copytree(assembled_debug, destination / "debug", dirs_exist_ok=True)
+                stock_provision_path = destination / "provision.json"
+                stock_provision = json.loads(stock_provision_path.read_text())
+                stock_provision["retroGo"] = {
+                    "firmware": assembled_provision.get("firmware", {}),
+                    "debugSymbols": assembled_provision.get("debugSymbols"),
+                }
+                stock_provision["projects"] = {
+                    **stock_provision.get("projects", {}),
+                    **assembled_provision.get("projects", {}),
+                }
+                stock_provision["projectSymbols"] = assembled_provision.get("projectSymbols", [])
+                stock_provision["layout"] = {
+                    **stock_provision.get("layout", {}),
+                    **assembled_provision.get("layout", {}),
+                }
+                stock_provision_path.write_text(json.dumps(stock_provision, indent=2) + "\n")
+        print(f"Created {result['model'].title()} profile: {destination_label}")
         return 0
-    if not args.content:
-        raise ValueError("profile create requires --content, or use --stock with --backup-dir")
-    if args.backup_dir or args.locked or args.model is not None:
-        raise ValueError("--backup-dir, --locked, and --model require --stock")
+    content_root = args.content
+    if args.retro_go:
+        if content_root:
+            raise ValueError("--retro-go and --content are mutually exclusive")
+        import tempfile
+        from gwprov.retro_sources import resolve_release
+        from gwprov.dist.firmware import install_firmware
+        source, tag = resolve_release(args.retro_go)
+        temporary = tempfile.TemporaryDirectory(prefix="gwprov-profile-content-")
+        content_root = str(Path(temporary.name) / "content")
+        install_firmware(content_root, variant="flash", repo=source["repo"], version=tag,
+                         versions_url=source["versionsUrl"])
+    if not content_root:
+        raise ValueError("profile create requires -m/--mario, -z/--zelda, --retro-go SOURCE:VERSION, or --content DIR")
+    if args.patched or args.bootloader:
+        raise ValueError("--patched and --bootloader require a Mario or Zelda stock profile")
     from gwprov.provision import create_profile
-    report = create_profile(destination, content=args.content, name=args.name,
+    report = create_profile(destination, content=content_root, name=args.name,
                             littlefs_mib=args.littlefs_mib, extflash_mib=args.extflash_mib,
                             sd_size_mib=args.sd_size_mib, sd_label=args.sd_label,
                             bootloader_repo=args.bootloader_repo,
@@ -158,6 +385,8 @@ def _profile_create(args) -> int:
               f"LittleFS {report['layout']['littlefsBytes']} bytes; "
               f"{report['layout']['extflashBytes'] // (1024 * 1024)} MiB extflash")
     print(f"Boot with: gwprov gwemu run --profile {destination_label}")
+    if args.retro_go:
+        temporary.cleanup()
     return 0
 
 
@@ -175,6 +404,27 @@ def _profile_duplicate(args) -> int:
         console.print(f"  [dim]To[/]    [bold cyan]{destination}[/]")
         console.print(f"  [dim]Files[/] {result['files']}")
         console.print(f"\nRun it with [bold]gwprov gwemu run --profile {destination}[/]")
+    return 0
+
+
+def _profile_blob(args) -> int:
+    from gwprov.profiles import edit_profile_blob, profile_reference
+
+    result = edit_profile_blob(args.profile, action=args.action, bank=args.bank,
+                               name=args.name, source=getattr(args, "file", None),
+                               offset=getattr(args, "offset", None),
+                               replace=getattr(args, "replace", False))
+    if args.output == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        console = Console()
+        label = profile_reference(result["profile"])
+        if result["action"] == "removed":
+            console.print(f"[green]Removed[/] {result['name']} from {label} ({result['bank']})")
+        else:
+            console.print(f"[green]{result['action'].title()}[/] {result['name']} ({result['bank']}) "
+                          f"at 0x{result['offset']:X} ({_human_size(result['size'])})")
+            console.print(f"  Profile: {label}")
     return 0
 
 
@@ -196,14 +446,14 @@ def _profile_list(args) -> int:
         console.print("Create one with [bold]gwprov profile create NAME --content DIR[/].")
         return 0
     from rich.table import Table
-    table = Table(title=f"[bold bright_cyan]Device profiles[/] [dim]· {len(rows)}",
+    table = Table(title=f"[bold bright_cyan]Device profiles ({len(rows)})[/]",
                   title_justify="left", expand=True, show_lines=False)
     table.add_column("NAME", style="bold cyan", no_wrap=True)
     table.add_column("STATE", no_wrap=True)
     table.add_column("DEVICE / FIRMWARE", overflow="fold")
     table.add_column("LOCATION", overflow="fold")
     for row in rows:
-        details = " · ".join(value for value in (row["model"], row["firmware"]) if value) or "—"
+        details = ", ".join(value for value in (row["model"], row["firmware"]) if value) or "—"
         state = {
             "ready": "[bold green]Ready[/]",
             "incomplete": "[bold yellow]Incomplete[/]",
@@ -439,7 +689,8 @@ def _debug_gwemu(args) -> int:
 
 def _ps(args) -> int:
     from gwprov.devices import show_devices
-    return show_devices(output=args.output, profile=args.profile, no_pager=args.no_pager)
+    return show_devices(output=args.output, profile=args.profile, refresh=args.refresh,
+                        no_pager=args.no_pager)
 
 
 def _device_config(args) -> int:
@@ -457,7 +708,8 @@ def _device_recover(args) -> int:
         from gwprov.backends import SelectedPyOCDBackend
         backend = SelectedPyOCDBackend(device_id.removeprefix("probe:"),
                                        operation="gwprov device recover", lease_wait=0,
-                                       allow_recovery_marker=True)
+                                       allow_recovery_marker=True,
+                                       resume_on_disconnect=False)
     elif device_id.startswith("remote:"):
         from gwprov.backends import WebSocketBackend
         backend = WebSocketBackend(device_id.removeprefix("remote:"),
@@ -694,12 +946,13 @@ def _apply_assigned(args) -> int:
     write_rows = deployment_write_summary(str(profile.root), hardware_plan)
     operation = [
         f"Profile: {profile_reference(profile.root)}",
-        f"Target: Hardware · {device_id}",
+        f"Target: Hardware ({device_id})",
         (f"After writing: start bank {args.bank} reset vector" if args.start
          else "After writing: leave the RAM flasher running"),
     ]
     if card is not None:
-        operation.append(f"SD card: {card['name']} · {card['path']} (existing files are retained; matching files are replaced)")
+        operation.extend((f"SD card: {card['name']}", f"SD card path: {card['path']}",
+                          "SD card action: retain existing files and replace matching files"))
     _confirm_apply(args, assume_yes, operation, writes=write_rows)
     if card is not None:
         from gwprov.deploy import overlay_sd_directory
@@ -788,8 +1041,8 @@ def _apply_plan_renderable(details: list[str], writes: list[dict], width: int):
                 table.append(str(row["target"]), style="bold bright_cyan")
                 table.append("\n  ")
                 table.append(str(row["content"]))
-                table.append(" · ")
-                table.append(_human_size(row["bytes"]) if row["bytes"] is not None else "device read",
+                table.append("\n  Size: ", style="dim")
+                table.append(_human_size(row["bytes"]) if row["bytes"] is not None else "read from device",
                              style="dim")
         renderables.extend([Text("Planned writes", style="bold"), table])
     return Panel(Group(*renderables), title="Apply plan", border_style="bright_cyan",
@@ -889,7 +1142,7 @@ def _show(args) -> int:
         rows = device_rows()
         active = get_active()
         if args.output == "json":
-            print(json.dumps([{**{k: row.get(k) for k in ("id", "kind", "name", "status", "application",
+            print(json.dumps([{**{k: row.get(k) for k in ("id", "kind", "name", "status", "application", "installed",
                                                               "assignedProfile", "sdCard")},
                                "active": row["id"] == active} for row in rows], indent=2))
             return 0
@@ -898,13 +1151,15 @@ def _show(args) -> int:
             return 0
         table = Table(title="Devices", title_justify="left", expand=True)
         table.add_column("", width=1, no_wrap=True)
-        for name in ("DEVICE", "TYPE", "STATE", "APPLICATION", "PROFILE", "SD CARD"):
+        for name in ("DEVICE", "TYPE", "STATE", "RUNNING", "INSTALLED", "PROFILE", "SD CARD"):
             table.add_column(name, overflow="fold")
         for row in rows:
-            state = Text(str(row["status"]).upper(), style={"running": "green", "halted": "yellow",
+            state = Text(str(row["status"]).upper(), style={"running": "green", "ready": "green",
+                         "halted": "yellow", "recovery": "yellow",
                          "busy": "cyan", "unknown": "red"}.get(row["status"], "white"))
             table.add_row(Text("●" if row["id"] == active else "", style="bold cyan"),
                           row["id"], row["kind"], state, row.get("application", "Unknown"),
+                          row.get("installed", "Unknown"),
                           row.get("assignedProfile", ""), row.get("sdCard", ""))
         Console().print(table)
         if active:
@@ -1012,6 +1267,82 @@ def _show(args) -> int:
         print(f"  Perf          {len(_performance_report_paths())} saved report(s)")
         print(f"  Active        {get_active() or 'not set'}")
         print("Use `gwprov show devices|adapters|projects|profile|perf|sdcard` for an overview.")
+    return 0
+
+
+def _daemon_restart(args) -> int:
+    from gwprov.daemon_ipc import request
+    from gwprov.daemon import (ensure_running, _stop_stale_daemon,
+                               _daemon_identity, _pid_exists)
+    try:
+        ping = request({"op": "ping", "clientIdentity": _daemon_identity()}, timeout=1.0)
+    except (OSError, RuntimeError, ValueError):
+        ping = None
+    if ping is None:
+        ensure_running(timeout=args.timeout)
+        print("GWProv daemon started")
+        return 0
+
+    stale = bool(ping.get("reloadRequired"))
+    if stale:
+        if int(ping.get("activeVMs", 0)):
+            raise RuntimeError("daemon owns active GWemu instances; stop them before restarting it")
+        from gwprov.target_leases import active_lease_owners, operation_blocks_drain
+        blocking_owners = [owner for owner in active_lease_owners()
+                           if operation_blocks_drain(owner)]
+        cancelled = []
+        if blocking_owners and not args.force:
+            raise RuntimeError(
+                f"stale daemon has {len(blocking_owners)} substantial device operation(s); "
+                "wait for them or use `gwprov daemon restart --force` to cancel them")
+        if args.force:
+            for owner in blocking_owners:
+                pid = owner.get("pid")
+                if isinstance(pid, int) and pid > 1 and _pid_exists(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        cancelled.append(pid)
+                    except ProcessLookupError:
+                        pass
+            grace = time.monotonic() + 2.0
+            while time.monotonic() < grace and any(_pid_exists(pid) for pid in cancelled):
+                time.sleep(0.05)
+            for pid in cancelled:
+                if _pid_exists(pid) and os.name != "nt":
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            deadline_cancel = time.monotonic() + 1.0
+            while time.monotonic() < deadline_cancel and any(_pid_exists(pid) for pid in cancelled):
+                time.sleep(0.05)
+            if any(_pid_exists(pid) for pid in cancelled):
+                raise RuntimeError("could not cancel every stale device operation owner")
+        _stop_stale_daemon(int(ping.get("daemonPid", 0)),
+                           timeout=min(args.timeout, 8.0), force=args.force)
+        result = {"cancelledPids": sorted(set(cancelled))}
+    else:
+        operation = "daemon-force-drain" if args.force else "daemon-drain"
+        result = request({"op": operation}, timeout=3.0)
+    cancelled = result.get("cancelledPids", [])
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        try:
+            request({"op": "hello"}, timeout=0.25)
+        except (OSError, RuntimeError, ValueError):
+            break
+        time.sleep(0.05)
+    else:
+        if args.force:
+            raise RuntimeError("daemon is still draining; a device owner did not exit after cancellation")
+        raise RuntimeError(
+            f"daemon is draining with {result.get('blockingLeases', 0)} substantial device operation(s); "
+            "use `gwprov daemon restart --force` to cancel them")
+    ensure_running(timeout=args.timeout)
+    if cancelled:
+        print(f"GWProv daemon restarted; canceled process(es): {', '.join(map(str, cancelled))}")
+    else:
+        print("GWProv daemon restarted")
     return 0
 
 
@@ -1131,7 +1462,7 @@ def _device_extflash_renderable(summary: dict, width: int):
 
     detail = Text(f"Detected capacity: {_human_size(summary['size'])}")
     if summary.get("model"):
-        detail.append(f" · {summary['model']} device", style="dim")
+        detail.append(f"\nDevice model: {summary['model']}", style="dim")
     if width >= 92:
         table = Table(box=box.SIMPLE, expand=True, padding=(0, 1), show_header=True,
                       header_style="bold")
@@ -1149,7 +1480,7 @@ def _device_extflash_renderable(summary: dict, width: int):
             table.append(row["target"], style="bold bright_cyan")
             table.append("\n  ")
             table.append(row["content"])
-            table.append(" · ")
+            table.append("\n  Size: ", style="dim")
             table.append(_human_size(row["bytes"]), style="dim")
     return Panel(Group(detail, Text("Current extflash contents", style="bold"), table),
                  title="Read from device", border_style="bright_cyan",
@@ -1193,24 +1524,55 @@ def _profile_hardware(args) -> int:
     from gwprov.hw_profile import profile_hardware
     probe_id, programmer, remote_url = args.probe_id, args.programmer, args.remote_url
     remote_origin = args.remote_origin
+    target_row = None
     if not any((probe_id, programmer, remote_url)):
         from gwprov.active_device import get_active
         from gwprov.devices import device_rows
         selected_id = get_active()
-        row = next((item for item in device_rows() if item["id"] == selected_id), None) if selected_id else None
-        if row is None:
+        target_row = next((item for item in device_rows()
+                           if item["id"] == selected_id), None) if selected_id else None
+        if target_row is None:
             raise ValueError("select a physical device with `gwprov set active DEVICE` or specify a target")
-        if row.get("probeId"):
-            probe_id = row["probeId"]
-        elif row["id"].startswith("remote:"):
-            remote_url = row["id"].removeprefix("remote:")
+        if target_row.get("probeId"):
+            probe_id = target_row["probeId"]
+        elif target_row["id"].startswith("remote:"):
+            remote_url = target_row["id"].removeprefix("remote:")
             from gwprov.active_device import get_active_origin
             remote_origin = remote_origin or get_active_origin()
         else:
             raise ValueError("active device is not a hardware target")
+    elif probe_id or remote_url:
+        from gwprov.devices import device_rows
+        target_id = f"probe:{probe_id}" if probe_id else f"remote:{remote_url}"
+        target_row = next((item for item in device_rows()
+                           if item["id"] == target_id), None)
+    elif programmer:
+        from gwprov.devices import device_rows
+        from gwprov.target_leases import adapter_for_probe
+        matches = [item for item in device_rows()
+                   if item.get("kind") == "hardware"
+                   and str(item.get("id", "")).startswith("probe:")
+                   and adapter_for_probe(f"{item.get('vendor', '')} {item.get('name', '')}")
+                   == programmer]
+        if len(matches) == 1:
+            target_row = matches[0]
+
+    profile = args.profile
+    if target_row and not profile:
+        import re
+        from gwprov.debug_symbols import retro_go_profile_symbols
+        match = re.search(r"Retro-Go\s+(?:SD\s+)?(v[\w.+-]+)",
+                          target_row.get("installed", ""), re.IGNORECASE)
+        matched = retro_go_profile_symbols(match.group(1)) if match else None
+        if matched:
+            firmware_elf, _ = matched
+            profile = str(firmware_elf.parents[1])
+            import sys
+            print(f"Using exact Retro-Go {match.group(1)} symbols from profile "
+                  f"{firmware_elf.parents[1].name}", file=sys.stderr)
     return profile_hardware(probe_id=probe_id, programmer=programmer,
                             remote_url=remote_url,
-                            remote_origin=remote_origin, profile=args.profile,
+                            remote_origin=remote_origin, profile=profile,
                             symbols=args.symbols, duration=args.duration,
                             interval=args.interval, output=args.output,
                             output_format=args.format, top=args.top,
@@ -1272,26 +1634,83 @@ def _debug_python(args) -> int:
     programmers = list(args.programmer)
     remote_urls = list(args.remote_url)
     remote_origins = list(args.remote_origin)
-    if args.target == "hardware" and not any((probe_ids, programmers, remote_urls)):
+    detected_retro_go = None
+    active_row = None
+    target = args.target
+    if args.device:
+        if any((probe_ids, programmers, remote_urls)):
+            raise ValueError("use either the positional device or --probe-id/--programmer/--remote-url")
+        from gwprov.devices import device_rows
+        rows = device_rows()
+        exact_id = [item for item in rows if item["id"].casefold() == args.device.casefold()]
+        exact_name = [item for item in rows if item.get("name", "").casefold() == args.device.casefold()]
+        matches = exact_id or exact_name
+        if not matches:
+            raise ValueError(f"device {args.device!r} is not currently available; use `gwprov devices` to list devices")
+        if len(matches) > 1:
+            choices = ", ".join(item["id"] for item in matches)
+            raise ValueError(f"device name {args.device!r} is ambiguous; select one by ID: {choices}")
+        active_row = matches[0]
+        inferred_target = "gwemu" if active_row.get("kind") == "gwemu" else "hardware"
+        if target and target != inferred_target:
+            raise ValueError(f"device {args.device!r} is a {inferred_target} target, not {target}")
+        target = inferred_target
+    elif target is None:
         from gwprov.active_device import get_active
         from gwprov.devices import device_rows
         selected_id = get_active()
-        row = next((item for item in device_rows() if item["id"] == selected_id), None) if selected_id else None
-        if row is None:
-            raise ValueError("select a physical device with `gwprov set active DEVICE` or specify a target")
-        if row.get("probeId"):
-            probe_ids.append(row["probeId"])
-        elif row["id"].startswith("remote:"):
-            remote_urls.append(row["id"].removeprefix("remote:"))
+        active_row = next((item for item in device_rows() if item["id"] == selected_id), None) if selected_id else None
+        if active_row is None:
+            raise ValueError("select a device with `gwprov set active DEVICE` or provide a device name")
+        target = "gwemu" if active_row.get("kind") == "gwemu" else "hardware"
+
+    if target == "hardware" and not any((probe_ids, programmers, remote_urls)):
+        if active_row is None:
+            from gwprov.active_device import get_active
+            from gwprov.devices import device_rows
+            selected_id = get_active()
+            active_row = next((item for item in device_rows() if item["id"] == selected_id), None) if selected_id else None
+        if active_row is None:
+            raise ValueError("select a physical device with `gwprov set active DEVICE` or provide a device name")
+        if active_row.get("probeId"):
+            probe_ids.append(active_row["probeId"])
+        elif active_row["id"].startswith("remote:"):
+            remote_urls.append(active_row["id"].removeprefix("remote:"))
             from gwprov.active_device import get_active_origin
             origin = get_active_origin()
             if origin:
                 remote_origins.append(origin)
         else:
             raise ValueError("active device is not a hardware target")
-    if args.target == "gwemu" and qmp_socket is None and not profile:
+        import re
+        match = re.search(r"Retro-Go\s+(?:SD\s+)?(v[\w.+-]+)", active_row.get("installed", ""), re.IGNORECASE)
+        if match:
+            detected_retro_go = match.group(1)
+            if not profile:
+                # Use symbols already present in a managed profile for the exact
+                # scanned firmware version. Never substitute symbols from another
+                # Retro-Go release when there is no exact match.
+                from gwprov.debug_symbols import retro_go_profile_symbols
+                matched = retro_go_profile_symbols(detected_retro_go)
+                if matched:
+                    firmware_elf, app_elfs = matched
+                    matched_symbols = [str(firmware_elf), *(str(path) for path in app_elfs)]
+                    symbol_paths.extend(path for path in matched_symbols
+                                        if path not in symbol_paths)
+                    print(f"Using installed Retro-Go {detected_retro_go} symbols from profile "
+                          f"{firmware_elf.parents[1].name}")
+    if target == "gwemu" and qmp_socket is None and not profile:
         from gwprov.active_device import get_active
-        if get_active():
+        if active_row and active_row.get("kind") == "gwemu":
+            from gwprov.gwemu_manager import instances
+            vm = next((item for item in instances()
+                       if str(item.get("pid")) == str(active_row.get("pid"))), None)
+            if vm:
+                qmp_socket = vm.get("qmpSocket")
+                profile = vm.get("profile") or active_row.get("assignedProfile")
+        active_id = get_active()
+        selected_is_active = (active_row is None or active_row.get("id") == active_id)
+        if qmp_socket is None and profile is None and active_id and selected_is_active:
             selected = _active_gwemu()
             qmp_socket = selected.get("qmpSocket")
             profile = selected.get("profile")
@@ -1306,19 +1725,20 @@ def _debug_python(args) -> int:
         symbol_paths.insert(0, str(firmware_symbols))
         app_symbols = sorted((firmware_symbols.parent / "apps").rglob("*.elf"))
         symbol_paths[1:1] = [str(path) for path in app_symbols]
-        if args.target == "gwemu" and qmp_socket is None:
+        if target == "gwemu" and qmp_socket is None:
             from gwprov.gwemu_manager import instances
             matches = [row for row in instances() if row.get("profile") == str(profile_root)]
             if len(matches) == 1:
                 qmp_socket = matches[0].get("qmpSocket")
             elif len(matches) > 1:
                 raise ValueError("profile has multiple GWemu instances; select a QMP handle explicitly")
-    return python_shell(target=args.target, host=args.host, port=args.port,
+    return python_shell(target=target, host=args.host, port=args.port,
                         openocd_port=args.openocd_port, probe_ids=probe_ids,
                         programmers=programmers, remote_urls=remote_urls,
                         remote_origins=remote_origins,
                         symbols=symbol_paths,
-                        qmp_socket=qmp_socket, debug_config=args.debug_config)
+                        qmp_socket=qmp_socket, debug_config=args.debug_config,
+                        retro_go_version=detected_retro_go)
 
 
 def _ofw_patch(args) -> int:
@@ -1326,9 +1746,10 @@ def _ofw_patch(args) -> int:
 
     forwarded = [
         args.game,
-        "--source-tree", args.source_tree,
         "--backup-dir", args.backup_dir,
         "--output-dir", args.output_dir,
+        "--extflash-mib", str(args.extflash_mib),
+        *( ["--no-bootloader"] if args.no_bootloader else [] ),
         *args.forwarded,
     ]
     cfw_images.main(forwarded)
@@ -1607,27 +2028,570 @@ def _project_info(args) -> int:
     return 0
 
 
+def _infer_project_variant_from_directory(directory: str | Path | None) -> str | None:
+    if not directory:
+        return None
+    root = Path(directory).expanduser()
+    metadata = root / ".gwprov-firmware.json"
+    if metadata.is_file():
+        try:
+            value = json.loads(metadata.read_text(encoding="utf-8")).get("variant")
+        except (OSError, ValueError, AttributeError):
+            value = None
+        if value in {"flash", "sd"}:
+            return value
+    if root.name.casefold() in {"flash", "sd"}:
+        return root.name.casefold()
+    present = {name for name in ("flash", "sd") if (root / name).is_dir()}
+    if len(present) == 1:
+        return present.pop()
+    project_markers = []
+    for name in ("flash", "sd"):
+        marker = root / name / ".gwprov-projects.json"
+        if marker.is_file():
+            project_markers.append(name)
+    if len(project_markers) == 1:
+        return project_markers[0]
+    return None
+
+
+def _infer_project_variant_from_profile(profile_root: str | Path) -> str:
+    root = Path(profile_root)
+    provision_path = root / "provision.json"
+    provision = {}
+    if provision_path.is_file():
+        try:
+            provision = json.loads(provision_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"cannot read profile provisioning metadata: {provision_path}: {error}") from error
+        if not isinstance(provision, dict):
+            raise ValueError(f"invalid profile provisioning metadata: {provision_path}")
+    candidates = [provision.get("variant")]
+    retro = provision.get("retroGo")
+    if isinstance(retro, dict) and isinstance(retro.get("firmware"), dict):
+        candidates.append(retro["firmware"].get("variant"))
+    firmware = provision.get("firmware")
+    if isinstance(firmware, dict):
+        candidates.append(firmware.get("variant"))
+    declared = {value for value in candidates if value in {"flash", "sd"}}
+    if len(declared) > 1:
+        raise ValueError(f"profile has conflicting project variants: {', '.join(sorted(declared))}")
+    if declared:
+        return declared.pop()
+    try:
+        from gwprov.profiles import DeviceProfile
+        profile = DeviceProfile.load(root)
+    except (OSError, RuntimeError, ValueError):
+        profile = None
+    if profile and profile.sd_mode in {"bundled", "shared"}:
+        return "sd"
+    layout = provision.get("layout", {})
+    if isinstance(layout, dict) and (layout.get("frogfsBytes") or layout.get("littlefsBytes")):
+        return "flash"
+    # Profiles without an SD image target flash by convention. Explicit project
+    # storage metadata still rejects this choice if the release is SD-only.
+    return "flash"
+
+
+def _retain_profile_mapped_sources(profile_root: Path, staged_frogfs: Path,
+                                  ownership: dict, prior_projects: dict) -> dict[str, str]:
+    """Keep the original mapped bytes needed to recompose a profile's FrogFS."""
+    new_keys = tuple(ownership)
+    project_records = dict(prior_projects)
+    project_records.update(ownership)
+    sources: dict[str, str] = {}
+    for key, project in project_records.items():
+        if not isinstance(project, dict):
+            continue
+        for index, mapped in enumerate(project.get("mapped", [])):
+            if not isinstance(mapped, dict) or not isinstance(mapped.get("path"), str):
+                raise ValueError(f"invalid mapped XiP metadata in project {key!r}")
+            relative = Path(mapped["path"])
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                raise ValueError(f"invalid mapped XiP path in project {key!r}: {relative}")
+            raw_source = mapped.get("source")
+            if raw_source:
+                source = (profile_root / raw_source).resolve()
+                if profile_root.resolve() not in source.parents or not source.is_file():
+                    raise ValueError(f"mapped XiP source is missing from profile {profile_root.name}: {raw_source}")
+            else:
+                source = staged_frogfs / relative
+                if not source.is_file():
+                    source = None
+                    from gwprov.profiles import DeviceProfile
+                    profile = DeviceProfile.load(profile_root)
+                    metadata_path = profile_root / "provision.json"
+                    profile_metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
+                    layout = profile_metadata.get("layout", {})
+                    offset = int(layout.get("frogfsOffset", -1))
+                    size = int(layout.get("frogfsBytes", 0))
+                    raw_base = mapped.get("relocBase")
+                    try:
+                        reloc_base = int(raw_base, 0) if isinstance(raw_base, str) else int(raw_base)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"mapped XiP path {relative} has no valid relocBase") from exc
+                    if offset < 0 or size <= 0 or not profile.extflash.is_file():
+                        raise ValueError(f"profile has no readable FrogFS image for mapped XiP path {relative}")
+                    from gwprov.vendor.retrogo_sd.scripts.frogfs_pico8_ro import (
+                        find_uncompressed_file_payload, patch_mapped_bytes)
+                    extflash = profile.extflash.read_bytes()
+                    image = extflash[offset:offset + size]
+                    found = find_uncompressed_file_payload(image, relative.as_posix())
+                    if not found:
+                        raise ValueError(f"mapped XiP payload is missing or compressed in FrogFS: {relative}")
+                    payload_offset, payload_size = found
+                    target_address = 0x90000000 + offset + payload_offset
+                    relocated = image[payload_offset:payload_offset + payload_size]
+                    raw, _count = patch_mapped_bytes(relocated, reloc_base,
+                                                     target_address)
+                import hashlib
+                identity = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+                stored = Path("blobs/project-mapped") / identity / f"{index}-{relative.name}"
+                destination = profile_root / stored
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+                if source is not None:
+                    shutil.copyfile(source, destination)
+                else:
+                    destination.write_bytes(raw)
+                mapped["source"] = stored.as_posix()
+                source = destination
+            if relative.as_posix() in sources:
+                raise ValueError(f"multiple projects map the same FrogFS path: {relative}")
+            sources[relative.as_posix()] = str(source)
+    for key in new_keys:
+        ownership[key] = project_records[key]
+    return sources
+
+
 def _project_install(args) -> int:
     from gwprov.dist import install_project
     from gwprov.dist.project import _project_reference
 
-    name, versions_url = _project_reference(args.repo)
-    result = install_project(
-        name,
-        output=args.output,
-        variant=args.variant,
-        versions_url=versions_url,
-        target_id=args.target,
-        tag=args.version,
-        input_files=args.input,
-        input_dirs=args.input_dir,
-        firmware_files=args.firmware,
-        firmware_dirs=args.firmware_dir,
-        game_files=args.game,
-        game_dirs=args.game_dir,
-        dry_run=args.dry_run,
-    )
-    print(json.dumps(result, indent=2))
+    bundle_path = None
+    candidate = Path(args.repo).expanduser()
+    if candidate.suffix.casefold() == ".zip":
+        if not candidate.is_file():
+            raise ValueError(f"project bundle ZIP does not exist: {candidate}")
+        bundle_path = str(candidate.resolve())
+        name, versions_url = str(candidate), None
+    else:
+        name, versions_url = _project_reference(args.repo)
+    output = args.output
+    install_root = None
+    profile_root = None
+    target_device = None
+    target_card = None
+    assigned_card_name = None
+    profile_name = args.profile
+    variant_hint = None
+    if args.device:
+        from gwprov.active_device import get_active
+        from gwprov.device_assignments import get_assignment
+        device_id = get_active() if args.device == "active" else args.device
+        if not device_id:
+            raise ValueError("no active device; select one with `gwprov set active DEVICE`")
+        if args.dry_run:
+            # A plan must stay offline: do not start the daemon or open a debug
+            # session just to decorate the destination with live device data.
+            target_device = {"id": device_id, "kind": "hardware", "name": device_id}
+        else:
+            from gwprov.devices import device_rows
+            target_device = next((row for row in device_rows() if row["id"] == device_id), None)
+            if target_device is None:
+                raise ValueError(f"device {device_id!r} is not currently available")
+            if target_device.get("kind") != "hardware":
+                raise ValueError("project --device currently requires a physical hardware target")
+        assignment = get_assignment(device_id)
+        profile_name = assignment.get("profile")
+        assigned_card_name = assignment.get("sdcard")
+        if not profile_name:
+            raise ValueError(f"device {device_id} has no assigned profile; use `gwprov set profile PROFILE`")
+    if args.start and target_device is None:
+        raise ValueError("--start applies only to a direct flash project install with --device")
+    if args.start and args.variant == "sd":
+        raise ValueError("--start cannot be used with --variant sd")
+    if profile_name:
+        from gwprov.profiles import resolve_profile_path
+        profile_root = resolve_profile_path(profile_name)
+        variant_hint = _infer_project_variant_from_profile(profile_root)
+        if args.dry_run:
+            # install_project needs a destination for planning, but its dry-run
+            # path never creates it. Avoid even a temporary filesystem change.
+            output = str(profile_root / ".gwprov-project-preview")
+        else:
+            # Stage first so validation and downloads finish before changing the profile.
+            import tempfile
+            install_root = tempfile.TemporaryDirectory(prefix="gwprov-project-")
+            output = str(Path(install_root.name) / "content")
+    else:
+        variant_hint = _infer_project_variant_from_directory(output)
+    install_options = dict(
+        output=output, variant=args.variant, versions_url=versions_url,
+        variant_hint=variant_hint,
+        target_id=args.target, tag=args.version, input_files=args.input,
+        input_dirs=args.input_dir, firmware_files=args.firmware,
+        firmware_dirs=args.firmware_dir, game_files=args.game,
+        game_dirs=args.game_dir, bundle_path=bundle_path, dry_run=args.dry_run)
+    if args.format == "json":
+        from contextlib import redirect_stdout
+        with redirect_stdout(sys.stderr):
+            result = install_project(name, **install_options)
+    else:
+        result = install_project(name, **install_options)
+    variant = result["variant"]
+    if profile_root is not None and result.get("requiresAbi"):
+        provision_path = profile_root / "provision.json"
+        profile_metadata = json.loads(provision_path.read_text()) if provision_path.is_file() else {}
+        firmware = profile_metadata.get("firmware", {})
+        firmware = firmware.get("firmware", {}) if isinstance(firmware, dict) else {}
+        available = firmware.get("providesAbi") if isinstance(firmware, dict) else None
+        required = result["requiresAbi"]
+        if (not isinstance(required, dict)
+                or not isinstance(available, dict)
+                or available.get("version") != required.get("version")
+                or available.get("size", 0) < required.get("minSize", 0)):
+            required_version = required.get("version", "unknown") if isinstance(required, dict) else "unknown"
+            required_size = required.get("minSize", 0) if isinstance(required, dict) else 0
+            raise ValueError(
+                f"project requires Retro-Go ABI {required_version} "
+                f"with at least {required_size} bytes; "
+                "the profile's installed firmware ABI is missing or incompatible")
+    if args.start and (target_device is None or variant != "flash"):
+        raise ValueError("--start applies only to a direct flash project install with --device")
+    if target_device is not None and variant == "sd":
+        from gwprov.sd_cards import list_cards
+        target_card = next((item for item in list_cards()
+                            if item.get("name") == assigned_card_name), None) if assigned_card_name else None
+        if target_card is None:
+            raise ValueError(f"device {target_device['id']} has no registered SD card assignment; use `gwprov set sdcard CARD`")
+    if args.dry_run and profile_root is not None and variant == "sd":
+        from gwprov.profiles import DeviceProfile
+        profile = DeviceProfile.load(profile_root)
+        if profile.sd_mode != "bundled" or profile.resolved_sd is None:
+            if install_root is not None:
+                install_root.cleanup()
+            raise ValueError("installing an SD project to a profile requires a bundled SD image")
+    if args.dry_run:
+        from pathlib import PurePosixPath
+
+        planned = result.get("plannedFiles", [])
+        if profile_root is not None:
+            destination = {"kind": "profile", "profile": profile_name,
+                           "path": str(profile_root.resolve())}
+            if target_device is not None:
+                destination["device"] = target_device["id"]
+                destination["deviceName"] = target_device.get("name", target_device["id"])
+            if target_card is not None:
+                destination["sdCard"] = {"name": target_card["name"], "path": target_card["path"]}
+            for item in planned:
+                rel = PurePosixPath(item["path"])
+                if variant == "sd":
+                    item["destination"] = f"profile SD image/{rel}"
+                    if target_card is not None:
+                        item["deviceDestination"] = str(Path(target_card["path"]) / Path(*rel.parts))
+                else:
+                    partition = rel.parts[0] if rel.parts else "FrogFS"
+                    label = "LittleFS" if partition == "littlefs" else "FrogFS"
+                    item["destination"] = f"{label}/{PurePosixPath(*rel.parts[1:])}"
+        else:
+            output_root = Path(args.output).expanduser().resolve()
+            destination = {"kind": "directory", "path": str(output_root)}
+            for item in planned:
+                item["destination"] = str(output_root / variant / item["path"])
+        result["destination"] = destination
+        result["plannedFiles"] = planned
+        result["fileCount"] = len(planned)
+        result["totalBytes"] = sum(item.get("bytes", 0) for item in planned)
+        if result.get("mappedArtifacts"):
+            payload_sizes = {item["path"].removeprefix("frogfs/"): item["bytes"]
+                             for item in planned if item["path"].startswith("frogfs/")}
+            frogfs_offset = 16 * 1024 * 1024
+            if profile_root is not None:
+                provision_path = profile_root / "provision.json"
+                profile_metadata = json.loads(provision_path.read_text()) if provision_path.is_file() else {}
+                layout = profile_metadata.get("layout", {})
+                if isinstance(layout, dict) and layout.get("frogfsOffset") is not None:
+                    frogfs_offset = int(layout["frogfsOffset"])
+            for item in result["mappedArtifacts"]:
+                base = item["relocBase"]
+                if isinstance(base, str):
+                    base = int(base, 0)
+                item["relocBase"] = base
+                if variant == "flash":
+                    item["payloadBytes"] = payload_sizes.get(item["path"])
+                    item["placement"] = "FrogFS, uncompressed"
+                    item["relocation"] = {
+                        "method": "for each aligned 32-bit word, add the runtime-minus-link-time delta when its Thumb-bit-cleared value points inside the linked payload; preserve the Thumb bit",
+                        "pointerRange": f"[0x{base:08X}, 0x{base + item['payloadBytes']:08X}); Thumb bit ignored for range check and preserved in adjustment"
+                        if item["payloadBytes"] is not None else None,
+                        "runtimeAddressFormula": f"0x90000000 + 0x{frogfs_offset:X} + mapped payload offset",
+                        "deltaFormula": f"runtime address - 0x{base:08X}",
+                        "runtimeAddress": None,
+                        "patchCount": None,
+                    }
+                else:
+                    item["placement"] = "SD card; runtime relocation uses relocBase"
+                    item["relocation"] = {
+                        "method": "runtime relocation by the SD loader",
+                        "runtimeAddressFormula": None,
+                        "deltaFormula": None,
+                        "patchCount": None,
+                    }
+        if target_device is not None:
+            result["plannedOperation"] = (
+                "update the assigned profile and deploy its Extflash regions to the device"
+                if variant == "flash" else
+                "update the assigned profile SD image and overlay files onto the registered SD card"
+            )
+        if install_root is not None:
+            install_root.cleanup()
+        if args.format == "json":
+            _print_structured(result, "json")
+        else:
+            from rich import box
+            from rich.table import Table
+            from rich.text import Text
+
+            console = Console()
+            summary = Table(title="Project install plan", show_header=False, box=None, pad_edge=False)
+            summary.add_column("Field", style="dim")
+            summary.add_column("Value", overflow="fold")
+            summary.add_row("Project", str(result.get('repo')))
+            summary.add_row("Version", str(result.get('tag') or 'Local bundle'))
+            summary.add_row("Target", str(result.get("target", "unknown")))
+            summary.add_row("Variant", str(variant))
+            summary.add_row("Destination", str(destination.get("path")))
+            if result.get("plannedOperation"):
+                summary.add_row("Device action", result["plannedOperation"])
+            if destination.get("device"):
+                summary.add_row("Device", str(destination.get("deviceName")))
+            if destination.get("sdCard"):
+                summary.add_row("SD card", str(destination['sdCard']['name']))
+                summary.add_row("SD card path", str(destination['sdCard']['path']))
+            summary.add_row("Files", str(len(planned)))
+            summary.add_row("Total size", _human_size(result['totalBytes']))
+            console.print(summary)
+            if console.width < 100:
+                from rich.console import Group
+
+                entries = []
+                for item in planned:
+                    entry = Table.grid(padding=(0, 1), expand=True)
+                    entry.add_column(style="dim", no_wrap=True)
+                    entry.add_column(overflow="fold")
+                    entry.add_row("File", Text(item["path"], style="bold"))
+                    entry.add_row("Install to", Text(item["destination"]))
+                    if target_card is not None:
+                        entry.add_row("SD card path", Text(item.get("deviceDestination", "")))
+                    entry.add_row("Size", _human_size(item["bytes"]))
+                    entries.append(entry)
+                console.print(Group(Text("Planned files", style="bold"), *entries))
+            else:
+                files = Table(title="Planned files", expand=True, show_lines=False)
+                files.add_column("FILE", overflow="fold")
+                files.add_column("INSTALLS TO", overflow="fold")
+                if target_card is not None:
+                    files.add_column("SD CARD PATH", overflow="fold")
+                files.add_column("SIZE", justify="right", no_wrap=True)
+                for item in planned:
+                    row = [Text(item["path"]), Text(item["destination"])]
+                    if target_card is not None:
+                        row.append(Text(item.get("deviceDestination", "")))
+                    row.append(_human_size(item["bytes"]))
+                    files.add_row(*row)
+                console.print(files)
+            for mapped in result.get("mappedArtifacts", []):
+                if variant == "flash":
+                    console.print(
+                        f"[cyan]Mapped XiP:[/] {mapped['path']} is relocated from "
+                        f"0x{mapped['relocBase']:08X} to its FrogFS address in extflash.")
+                else:
+                    console.print(
+                        f"[cyan]Mapped XiP:[/] {mapped['path']} is stored on the SD card "
+                        "and relocated by the SD loader.")
+            if result.get("bundle"):
+                console.print("[dim]Local bundle. Publisher identity is not authenticated.[/dim]")
+        return 0
+    if profile_root is not None:
+        import shutil
+        from gwprov.filesystem import operate
+        from gwprov.profiles import DeviceProfile
+
+        staged = Path(output)
+        profile = DeviceProfile.load(profile_root)
+        if variant == "sd" and (profile.sd_mode != "bundled" or profile.resolved_sd is None):
+            raise ValueError("installing an SD project to a profile requires a bundled SD image")
+        staged_flash = staged / variant
+        provision_path = profile_root / "provision.json"
+        ownership_path = staged_flash / ".gwprov-projects.json"
+        ownership = json.loads(ownership_path.read_text()) if ownership_path.is_file() else {}
+        before = json.loads(provision_path.read_text()) if provision_path.is_file() else {}
+        prior_projects_all = before.get("projects", {})
+        new_identities = {
+            (metadata.get("project"), metadata.get("target"))
+            for metadata in ownership.values()
+            if isinstance(metadata, dict) and metadata.get("project") and metadata.get("target")
+        }
+        replaced_projects = {
+            key: metadata for key, metadata in prior_projects_all.items()
+            if isinstance(metadata, dict)
+            and (metadata.get("project"), metadata.get("target")) in new_identities
+        }
+        prior_projects = {
+            key: metadata for key, metadata in prior_projects_all.items()
+            if key not in replaced_projects
+        }
+        replacement_files = {
+            path
+            for metadata in replaced_projects.values()
+            for path in metadata.get("files", [])
+            if isinstance(path, str)
+        }
+        replacement_files.difference_update(
+            path
+            for metadata in ownership.values() if isinstance(metadata, dict)
+            for path in metadata.get("files", [])
+            if isinstance(path, str)
+        )
+        partitions = ((staged_flash / "frogfs", "frogfs"),
+                      (staged_flash / "littlefs", "littlefs")) if variant == "flash" else ((staged / "sd", "fatfs"),)
+        if target_device is not None:
+            staged_files = [file_path for root, _ in partitions if root.is_dir()
+                            for file_path in root.rglob("*") if file_path.is_file()]
+            writes = [{"target": f"Profile {variant}: {file_path.relative_to(staged).as_posix()}",
+                       "content": "Project file", "bytes": file_path.stat().st_size}
+                      for file_path in sorted(staged_files)]
+            _confirm_apply(args, bool(args.yes), [
+                f"Project: {result.get('repo')}",
+                f"Version: {result.get('tag')}",
+                f"Profile: {profile_root.name}",
+                f"Target: {target_device.get('name', target_device['id'])}",
+                ("Action: update profile files and write its extflash regions"
+                 if variant == "flash" else
+                 "Action: update profile files and overlay its SD image onto the assigned card"),
+            ], writes=writes)
+        mapped_sources = {}
+        if variant == "flash":
+            staged_frogfs = staged_flash / "frogfs"
+            staged_frogfs_files = any(staged_frogfs.rglob("*")) if staged_frogfs.is_dir() else False
+            has_new_mapped = any(project.get("mapped") for project in ownership.values()
+                                 if isinstance(project, dict))
+            has_prior_mapped = any(project.get("mapped") for project in prior_projects.values()
+                                   if isinstance(project, dict))
+            if has_new_mapped or (has_prior_mapped and staged_frogfs_files):
+                mapped_sources = _retain_profile_mapped_sources(
+                    profile_root, staged_frogfs, ownership, prior_projects)
+                provision = dict(before)
+                provision["projects"] = dict(prior_projects)
+                provision["projects"].update(ownership)
+                provision_path.write_text(json.dumps(provision, indent=2) + "\n")
+        # Remove stale files from a previous registration of the same project
+        # before adding its replacement. This also lets bundle repo identities
+        # replace an earlier local-project identity without duplicate XiP claims.
+        for old_path in sorted(replacement_files):
+            partition, separator, relative = old_path.partition("/")
+            if not separator or not relative:
+                continue
+            filesystem = {"frogfs": "frogfs", "littlefs": "littlefs", "sd": "fatfs"}.get(partition)
+            if filesystem is None or partition not in {name for _root, name in partitions}:
+                continue
+            target = "sd" if filesystem == "fatfs" else "flash/ext"
+            sidecars = [f"{path}={source}" for path, source in mapped_sources.items()] if filesystem == "frogfs" else []
+            operate(operation="delete", target=target, profile=str(profile_root),
+                    filesystem=filesystem, path=relative, mapped_sources=sidecars)
+
+        for root, filesystem in partitions:
+            if not root.is_dir():
+                continue
+            files = sorted(p for p in root.rglob("*") if p.is_file())
+            mapped_paths = set(mapped_sources) if filesystem == "frogfs" else set()
+            seeded_mapped = False
+            for file_path in files:
+                rel = file_path.relative_to(root).as_posix()
+                is_mapped_file = rel in mapped_paths
+                if is_mapped_file and seeded_mapped:
+                    # The first FrogFS rebuild seeds every mapped payload from
+                    # its retained raw sidecar; do not add those files twice.
+                    continue
+                target = "flash/ext" if filesystem != "fatfs" else "sd"
+                fs_option = filesystem if filesystem != "fatfs" else "fatfs"
+                sidecars = [f"{path}={source}" for path, source in mapped_sources.items()
+                            if not (is_mapped_file and path == rel)] if filesystem == "frogfs" else []
+                operate(operation="add", target=target, profile=str(profile_root),
+                        filesystem=fs_option, path=rel, source=str(file_path),
+                        mapped_sources=sidecars)
+                if filesystem == "frogfs" and mapped_paths:
+                    seeded_mapped = True
+        # Filesystem operations may update the FrogFS size in provision.json.
+        # Merge project provenance after those operations so that layout update survives.
+        provision = json.loads(provision_path.read_text()) if provision_path.is_file() else before
+        project_records = provision.setdefault("projects", {})
+        for key, metadata in ownership.items():
+            project_records[key] = metadata
+            for symbol in metadata.get("symbols", []):
+                source = staged / "debug" / symbol
+                if source.is_file():
+                    destination = profile_root / "debug" / symbol
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, destination)
+        provision_path.write_text(json.dumps(provision, indent=2) + "\n")
+        if target_device is not None:
+            if variant == "flash":
+                from gwprov.deploy import apply_deployment, deployment_plan
+                selected_regions = {"extflash", "frogfs", "littlefs"}
+                plan = deployment_plan(str(profile_root))
+                regions = [row["region"] for row in plan["regions"]
+                           if row["region"] in selected_regions]
+                if not regions:
+                    raise ValueError("profile has no deployable extflash project regions")
+                device_id = target_device["id"]
+                remote_url = device_id.removeprefix("remote:") if device_id.startswith("remote:") else None
+                progress, finish = _deployment_progress_display(args.format)
+                try:
+                    deployed = apply_deployment(
+                        str(profile_root), probe_id=target_device.get("probeId"),
+                        remote_url=remote_url,
+                        remote_origin=target_device.get("remoteOrigin"),
+                        regions=regions, start=args.start, bank=args.bank,
+                        progress=progress)
+                finally:
+                    if finish:
+                        finish()
+                result["deployment"] = deployed
+            else:
+                from gwprov.deploy import overlay_sd_tree
+                count = overlay_sd_tree(staged / "sd", Path(target_card["path"]))
+                result["sdcard"] = {"name": target_card["name"], "path": target_card["path"],
+                                    "filesWritten": count, "mode": "overlay"}
+        install_root.cleanup()
+        result["profile"] = str(profile_root)
+        result["installed"] = True
+    else:
+        result["output"] = str(Path(args.output).expanduser().resolve())
+    if target_device is not None:
+        result["device"] = target_device["id"]
+    if args.format == "json":
+        _print_structured(result, "json")
+    else:
+        from rich.table import Table
+        table = Table(title="Project install", show_header=False, box=None, pad_edge=False)
+        table.add_column("Field", style="dim")
+        table.add_column("Value", overflow="fold")
+        table.add_row("Project", str(result.get('repo')))
+        table.add_row("Version", str(result.get('tag') or 'Local bundle'))
+        table.add_row("Target", str(result.get("target", "unknown")))
+        table.add_row("Variant", str(result.get("variant", "unknown")))
+        table.add_row("Files", str(len(result.get("files", []))))
+        table.add_row("Installed to", str(result.get("profile") or args.output))
+        if result.get("bundle"):
+            table.add_row("Source", "Local bundle; publisher identity not authenticated")
+        if result.get("deployment"):
+            table.add_row("Device", str(target_device.get("name", result.get("device", "write complete"))))
+        if result.get("sdcard"):
+            table.add_row("SD card", str(result['sdcard']['name']))
+            table.add_row("Files overlaid", str(result['sdcard']['filesWritten']))
+        Console().print(table)
     return 0
 
 
@@ -1643,6 +2607,13 @@ def _completion_bash(args) -> int:
 _gwprov_profile_names() { gwprov profile list --output names 2>/dev/null; }
 _gwprov_device_names() { gwprov devices --ids-only 2>/dev/null; }
 _gwprov_sdcard_names() { gwprov sdcard list --output names 2>/dev/null; }
+_gwprov_probe_names() {
+  _gwprov_device_names | python3 -c 'import sys; print("\\n".join(x.strip() for x in sys.stdin if x.startswith("probe:")))'
+}
+_gwprov_retro_releases() {
+  gwprov retro-go list --output json 2>/dev/null |
+    python3 -c 'import json,sys; print("\\n".join(x["name"] for x in json.load(sys.stdin).get("releases", [])))' 2>/dev/null
+}
 _gwprov_complete_profiles() {
   local token="$1" prefix="" value="$1"
   if [[ "$token" == *=* ]]; then prefix="${token%%=*}="; value="${token#*=}"; fi
@@ -1692,7 +2663,8 @@ _gwprov_complete() {
   extra_candidates=""
   case "$cur" in
     --profile=*) _gwprov_complete_profiles "$cur"; return ;;
-    --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*|--gwemu-bin=*)
+    --device=*) COMPREPLY=( $(compgen -W "active $(_gwprov_device_names)" -- "${cur#*=}") ); return ;;
+    --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--sd-bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*|--gwemu-bin=*)
       _gwprov_complete_dirs "$cur"
       return
       ;;
@@ -1706,6 +2678,7 @@ _gwprov_complete() {
       case "$context" in
         tree:*) format_values="tree names" ;;
         gwemu:profile) format_values="text json" ;;
+        projects:install|project:install) format_values="text json" ;;
         profile:hardware|perf:hardware) format_values="text json html pdf" ;;
         report:render) format_values="html pdf" ;;
         *) format_values="" ;;
@@ -1718,8 +2691,8 @@ _gwprov_complete() {
       local output_values
       case "$context" in
         apply:|deploy:plan|deploy:apply) output_values="text json yaml" ;;
-        ps:*|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps) output_values="text json" ;;
-        profile:list|sdcard:list) output_values="text json names" ;;
+        ps:*|projects:list|project:list|projects:ls|project:ls|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|adapters:ls|gwemu:ps) output_values="text json" ;;
+        profile:list|profile:ls|sdcard:list|sdcard:ls) output_values="text json names" ;;
         profile:duplicate) output_values="text json" ;;
         *) output_values="" ;;
       esac
@@ -1737,15 +2710,25 @@ _gwprov_complete() {
     return
   fi
   if [[ "$prev" == "--profile" ]]; then _gwprov_complete_profiles "$cur"; return; fi
+  if [[ "$prev" == "--device" ]]; then
+    candidates=$(_gwprov_device_names)
+    COMPREPLY=( $(compgen -W "$candidates active" -- "$cur") )
+    return
+  fi
+  if [[ "$prev" == "--probe-id" ]]; then
+    candidates=$(_gwprov_probe_names)
+    COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
+    return
+  fi
   case "$prev:$context" in
     --format:tree:*) candidates="tree names" ;;
     --format:gwemu:profile) candidates="text json" ;;
     --format:profile:hardware|--format:perf:hardware) candidates="text json html pdf" ;;
     --format:report:render) candidates="html pdf" ;;
     --output:apply:|--output:deploy:plan|--output:deploy:apply|-o:apply:|-o:deploy:plan|-o:deploy:apply) candidates="text json yaml" ;;
-    --output:ps:*|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps)
+    --output:ps:*|--output:projects:list|--output:project:list|--output:projects:ls|--output:project:ls|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps)
       candidates="text json" ;;
-    --output:profile:list|--output:sdcard:list) candidates="text json names" ;;
+    --output:profile:list|--output:profile:ls|--output:sdcard:list|--output:sdcard:ls) candidates="text json names" ;;
     --output:profile:duplicate) candidates="text json" ;;
     --region:deploy:plan|--region:deploy:apply) candidates="bank1 bank2 frogfs littlefs extflash sd" ;;
     --programmer:deploy:apply|--programmer:debug:python|--programmer:profile:hardware|--programmer:perf:hardware)
@@ -1759,6 +2742,7 @@ _gwprov_complete() {
     --bank:retro-go:build|--bank:gwemu:run) candidates="1 2" ;;
     --bank:deploy:apply) candidates="1 2" ;;
     --bank:apply) candidates="1 2" ;;
+    --bank:projects:install|--bank:project:install) candidates="1 2" ;;
     --oc-level:retro-go:config) candidates="0 1 2 3" ;;
     --filesystem:media:inventory) candidates="frogfs littlefs fatfs" ;;
     --mode:media:compare) candidates="contents image" ;;
@@ -1770,7 +2754,12 @@ _gwprov_complete() {
     COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
     return
   fi
-  if [[ "$prev" == "--input" || "$prev" == "--input-dir" || "$prev" == "--firmware" || "$prev" == "--bios" || "$prev" == "--firmware-dir" || "$prev" == "--bios-dir" || "$prev" == "--game" || "$prev" == "--game-dir" || "$prev" == "--content" || "$prev" == "--source" || "$prev" == "--profile" || "$prev" == "--output" || "$prev" == "--output-dir" || "$prev" == "--bootloader-file" || "$prev" == "--backup-dir" || "$prev" == "--source-tree" || "$prev" == "--image" || "$prev" == "--shared-sd-root" || "$prev" == "--retro-go-root" || "$prev" == "--rom" || "$prev" == "--rom-dir" || "$prev" == "--config" || "$prev" == "--timeline" || "$prev" == "--record-timeline" || "$prev" == "--bank1" || "$prev" == "--bank2" || "$prev" == "--extflash" || "$prev" == "--sdcard" || "$prev" == "--symbols" || "$prev" == "--debug-config" || "$prev" == "--app-symbols" || "$prev" == "--gdb" || "$prev" == "--gwemu-bin" ]]; then
+  if [[ "$prev" == "-r" || "$prev" == "--retro-go" ]]; then
+    candidates=$(_gwprov_retro_releases)
+    COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
+    return
+  fi
+  if [[ "$prev" == "--input" || "$prev" == "--input-dir" || "$prev" == "--firmware" || "$prev" == "--bios" || "$prev" == "--firmware-dir" || "$prev" == "--bios-dir" || "$prev" == "--game" || "$prev" == "--game-dir" || "$prev" == "--content" || "$prev" == "--source" || "$prev" == "--profile" || "$prev" == "--output" || "$prev" == "--output-dir" || "$prev" == "--bootloader-file" || "$prev" == "--sd-bootloader-file" || "$prev" == "--backup-dir" || "$prev" == "--source-tree" || "$prev" == "--image" || "$prev" == "--shared-sd-root" || "$prev" == "--retro-go-root" || "$prev" == "--rom" || "$prev" == "--rom-dir" || "$prev" == "--config" || "$prev" == "--timeline" || "$prev" == "--record-timeline" || "$prev" == "--bank1" || "$prev" == "--bank2" || "$prev" == "--extflash" || "$prev" == "--sdcard" || "$prev" == "--symbols" || "$prev" == "--debug-config" || "$prev" == "--app-symbols" || "$prev" == "--gdb" || "$prev" == "--gwemu-bin" ]]; then
     _gwprov_complete_dirs "$cur"
     return
   fi
@@ -1785,19 +2774,21 @@ _gwprov_complete() {
       ps) candidates="--help -h --output --no-pager --profile" ;;
       apply) candidates="--help -h -y --yes -f --force --start --bank -o --output" ;;
       completion) candidates="bash zsh" ;;
-      adapters) candidates="list add remove rm" ;;
+      adapters) candidates="list ls add remove rm" ;;
       device) candidates="recover" ;;
-      projects|project) candidates="list versions info install stage-local" ;;
+      projects|project) candidates="list ls versions info install stage-local" ;;
+      backups) candidates="search list ls" ;;
       tree) candidates="--format --no-pager" ;;
       debug) candidates="python" ;;
-      retro-go) candidates="install build config" ;;
+      retro-go) candidates="list ls source install build config" ;;
+      retro-go:source) candidates="add remove list ls default" ;;
       gwemu) candidates="start stop pause resume ps screenshot profile diagnose watch run debug" ;;
       ofw) candidates="patch" ;;
       media) candidates="frogfs littlefs inventory compare" ;;
       sdcard|sd) candidates="list ls add remove rm create compose" ;;
       input) candidates="tap" ;;
       report) candidates="render" ;;
-      profile) candidates="create duplicate list show" ;;
+      profile) candidates="create duplicate edit list ls show" ;;
         perf) candidates="hardware" ;;
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       *) candidates="" ;;
@@ -1810,7 +2801,14 @@ _gwprov_complete() {
     return
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == projects || "${COMP_WORDS[1]-}" == project ]] && [[ "$cur" != -* ]]; then
     case "${COMP_WORDS[2]-}" in
-      list|versions|info|install) candidates=$(_gwprov_project_names) ;;
+      list|ls|versions|info) candidates=$(_gwprov_project_names) ;;
+      install)
+        if [[ "$cur" == */* || "$cur" == ~* || "$cur" == *.zip ]]; then
+          _gwprov_complete_dirs "$cur"
+          return
+        fi
+        candidates=$(_gwprov_project_names)
+        ;;
       stage-local)
         COMPREPLY=()
         while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -f -- "$cur")
@@ -1818,6 +2816,14 @@ _gwprov_complete() {
         ;;
       *) candidates="" ;;
     esac
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == debug && "${COMP_WORDS[2]-}" == python && "$cur" != -* ]]; then
+    candidates=$(_gwprov_device_names)
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "$cur" != -* ]]; then
+    candidates="$(_gwprov_profile_names)"
+  elif (( COMP_CWORD == 4 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "$cur" != -* ]]; then
+    candidates="add remove"
+  elif (( COMP_CWORD == 5 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "${COMP_WORDS[4]-}" == add && "$cur" != -* ]]; then
+    candidates="bank1 bank2 bank0 extflash"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == config && "$cur" != -* ]]; then
     candidates="show"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == active && "$cur" != -* ]]; then
@@ -1845,12 +2851,12 @@ _gwprov_complete() {
       config:show) candidates="--output" ;;
       deploy:plan) candidates="--region -o --output" ;;
       deploy:apply) candidates="--probe-id --programmer --remote-url --remote-origin --region --start --bank -o --output" ;;
-      projects:list|project:list) candidates="--firmware-repo --output" ;;
+      projects:list|project:list|projects:ls|project:ls) candidates="--firmware-repo --output" ;;
       projects:versions|project:versions) candidates="--output" ;;
       projects:info|project:info) candidates="--version --output" ;;
-      projects:install|project:install) candidates="--version --target --variant --output --input --input-dir --firmware --firmware-dir --bios --bios-dir --game --game-dir --dry-run" ;;
+      projects:install|project:install) candidates="--version --target --variant --output --profile --device --input --input-dir --firmware --firmware-dir --bios --bios-dir --game --game-dir --dry-run --format --yes --start --bank" ;;
       projects:stage-local|project:stage-local) candidates="--output" ;;
-      adapters:list) candidates="--output" ;;
+      adapters:list|adapters:ls) candidates="--output" ;;
       adapters:add) candidates="--origin" ;;
       tree:*) candidates="--format --no-pager" ;;
       retro-go:install) candidates="--repo --version --variant --output" ;;
@@ -1880,9 +2886,9 @@ _gwprov_complete() {
       report:render) candidates="--input --output --format" ;;
       profile:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
       perf:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
-      profile:create) candidates="--stock --content --backup-dir --locked --model --output-dir --name --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file" ;;
+      profile:create) candidates="-m --mario -z --zelda -p --patched -b --bootloader -r --retro-go --content --output-dir --name --littlefs --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file --sd-bootloader-file" ;;
       profile:duplicate) candidates="--output-dir --output" ;;
-      profile:list) candidates="--output --no-pager" ;;
+      profile:list|profile:ls) candidates="--output --no-pager" ;;
       profile:show) candidates="--shared-sd-root" ;;
       completion) candidates="bash zsh" ;;
       *) candidates="" ;;
@@ -1904,6 +2910,13 @@ _gwprov_project_names() {
 _gwprov_profile_names() { gwprov profile list --output names 2>/dev/null }
 _gwprov_device_names() { gwprov devices --ids-only 2>/dev/null }
 _gwprov_sdcard_names() { gwprov sdcard list --output names 2>/dev/null }
+_gwprov_probe_names() {
+  print -r -- "${(M)${(@f)$(_gwprov_device_names)}:#probe:*}"
+}
+_gwprov_retro_releases() {
+  gwprov retro-go list --output json 2>/dev/null |
+    python3 -c 'import json,sys; print("\n".join(x["name"] for x in json.load(sys.stdin).get("releases", [])))' 2>/dev/null
+}
 _gwprov_profile_complete() {
   if [[ "$1" == */* || "$1" == ~* ]]; then
     _files -/
@@ -1924,7 +2937,7 @@ _gwprov() {
       IPREFIX=$prefix PREFIX=$pathpart _gwprov_profile_complete "$pathpart"
       return
       ;;
-    --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*|--symbols=*|--debug-config=*|--app-symbols=*|--gdb=*|--gwemu-bin=*)
+    --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--sd-bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*|--symbols=*|--debug-config=*|--app-symbols=*|--gdb=*|--gwemu-bin=*)
       prefix=${cur%%=*}=; pathpart=${cur#*=}
       IPREFIX=$prefix PREFIX=$pathpart _files
       return
@@ -1934,6 +2947,7 @@ _gwprov() {
       case "$context" in
         tree:*) compadd -- "${cur%%=*}=tree" "${cur%%=*}=names" ;;
         gwemu:profile) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" ;;
+        projects:install|project:install) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" ;;
         profile:hardware|perf:hardware) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=html" "${cur%%=*}=pdf" ;;
         report:render) compadd -- "${cur%%=*}=html" "${cur%%=*}=pdf" ;;
       esac
@@ -1941,11 +2955,11 @@ _gwprov() {
       ;;
     --output=*)
       case "$context" in
-        profile:list|sdcard:list) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=names"; return ;;
+        profile:list|profile:ls|sdcard:list|sdcard:ls) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=names"; return ;;
         profile:duplicate) compadd -- "${cur%%=*}=text" "${cur%%=*}=json"; return ;;
         apply:|deploy:plan|deploy:apply)
           compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=yaml"; return ;;
-        ps:*|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps)
+        ps:*|projects:list|project:list|projects:ls|project:ls|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|adapters:ls|gwemu:ps)
           compadd -- "${cur%%=*}=text" "${cur%%=*}=json"; return ;;
       esac
       prefix=${cur%%=*}=; pathpart=${cur#*=}; IPREFIX=$prefix PREFIX=$pathpart _files; return
@@ -1953,7 +2967,10 @@ _gwprov() {
   esac
   case "$prev" in
     --profile) _gwprov_profile_complete "$cur"; return ;;
-    --input|--input-dir|--firmware|--bios|--firmware-dir|--bios-dir|--game|--game-dir|--content|--source|--profile|--output|-o|--output-dir|--bootloader-file|--backup-dir|--source-tree|--image|--shared-sd-root|--retro-go-root|--rom|--rom-dir|--config|--timeline|--record-timeline|--bank1|--bank2|--extflash|--sdcard|--symbols|--debug-config|--app-symbols|--gdb|--gwemu-bin)
+    --device) compadd -- active "${(@f)$(_gwprov_device_names)}"; return ;;
+    --probe-id) compadd -- "${(@f)$(_gwprov_probe_names)}"; return ;;
+    -r|--retro-go) compadd -- "${(@f)$(_gwprov_retro_releases)}"; return ;;
+    --input|--input-dir|--firmware|--bios|--firmware-dir|--bios-dir|--game|--game-dir|--content|--source|--profile|--output|-o|--output-dir|--bootloader-file|--sd-bootloader-file|--backup-dir|--source-tree|--image|--shared-sd-root|--retro-go-root|--rom|--rom-dir|--config|--timeline|--record-timeline|--bank1|--bank2|--extflash|--sdcard|--symbols|--debug-config|--app-symbols|--gdb|--gwemu-bin)
       _files; return ;;
     --variant) compadd -- flash sd; return ;;
   esac
@@ -1962,10 +2979,10 @@ _gwprov() {
     --format:gwemu:profile) compadd -- text json; return ;;
     --format:profile:hardware|--format:perf:hardware) compadd -- text json html pdf; return ;;
     --format:report:render) compadd -- html pdf; return ;;
-    --output:profile:list|--output:sdcard:list) compadd -- text json names; return ;;
+    --output:profile:list|--output:profile:ls|--output:sdcard:list|--output:sdcard:ls) compadd -- text json names; return ;;
     --output:profile:duplicate) compadd -- text json; return ;;
     --output:apply:|--output:deploy:plan|--output:deploy:apply|-o:apply:|-o:deploy:plan|-o:deploy:apply) compadd -- text json yaml; return ;;
-    --output:ps:*|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps) compadd -- text json; return ;;
+    --output:ps:*|--output:projects:list|--output:project:list|--output:projects:ls|--output:project:ls|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps) compadd -- text json; return ;;
     --region:deploy:plan|--region:deploy:apply) compadd -- bank1 bank2 frogfs littlefs extflash sd; return ;;
     --programmer:deploy:apply|--programmer:debug:python|--programmer:profile:hardware|--programmer:perf:hardware) compadd -- stlink jlink cmsis-dap rpi-gpio; return ;;
     --target:debug:python) compadd -- gwemu hardware; return ;;
@@ -1976,6 +2993,7 @@ _gwprov() {
     --bank:retro-go:build|--bank:gwemu:run) compadd -- 1 2; return ;;
     --bank:deploy:apply) compadd -- 1 2; return ;;
     --bank:apply) compadd -- 1 2; return ;;
+    --bank:projects:install|--bank:project:install) compadd -- 1 2; return ;;
     --oc-level:retro-go:config) compadd -- 0 1 2 3; return ;;
     --filesystem:media:inventory) compadd -- frogfs littlefs fatfs; return ;;
     --mode:media:compare) compadd -- contents image; return ;;
@@ -1990,19 +3008,21 @@ _gwprov() {
       deploy) candidates="plan apply" ;;
       ps) candidates="--help -h --output --no-pager --profile" ;;
       completion) candidates="bash zsh" ;;
-      adapters) candidates="list add remove rm" ;;
+      adapters) candidates="list ls add remove rm" ;;
       device) candidates="recover" ;;
-      projects|project) candidates="list versions info install stage-local" ;;
+      projects|project) candidates="list ls versions info install stage-local" ;;
+      backups) candidates="search list ls" ;;
       tree) candidates="--format --no-pager" ;;
       debug) candidates="python" ;;
-      retro-go) candidates="install build config" ;;
+      retro-go) candidates="list ls source install build config" ;;
+      retro-go:source) candidates="add remove list ls default" ;;
       gwemu) candidates="start stop pause resume ps screenshot profile diagnose watch run debug" ;;
       ofw) candidates="patch" ;;
       media) candidates="frogfs littlefs inventory compare" ;;
       sdcard|sd) candidates="list ls add remove rm create compose" ;;
       input) candidates="tap" ;;
       report) candidates="render" ;;
-      profile) candidates="create duplicate list show" ;;
+      profile) candidates="create duplicate edit list ls show" ;;
       perf) candidates="hardware" ;;
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       show) candidates="adapters devices projects profile perf sdcard" ;;
@@ -2018,10 +3038,25 @@ _gwprov() {
     return
   elif (( CURRENT == 4 )) && [[ ${words[2]} == projects || ${words[2]} == project ]] && [[ "$cur" != -* ]]; then
     case ${words[3]} in
-      list|versions|info|install) candidates="$( _gwprov_project_names )" ;;
+      list|ls|versions|info) candidates="$( _gwprov_project_names )" ;;
+      install)
+        if [[ "$cur" == */* || "$cur" == ~* || "$cur" == *.zip ]]; then
+          _files -g '*.zip'
+          return
+        fi
+        candidates="$( _gwprov_project_names )"
+        ;;
       stage-local) _files; return ;;
       *) candidates="" ;;
     esac
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == debug && ${words[3]} == python && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_device_names)}"
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == edit && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_profile_names)}"
+  elif (( CURRENT == 5 )) && [[ ${words[2]} == profile && ${words[3]} == edit && "$cur" != -* ]]; then
+    candidates="add remove"
+  elif (( CURRENT == 6 )) && [[ ${words[2]} == profile && ${words[3]} == edit && ${words[5]} == add && "$cur" != -* ]]; then
+    candidates="bank1 bank2 bank0 extflash"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == config && "$cur" != -* ]]; then
     candidates="show"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == active && "$cur" != -* ]]; then
@@ -2049,12 +3084,12 @@ _gwprov() {
       deploy:plan) candidates="--region -o --output" ;;
       deploy:apply) candidates="--probe-id --programmer --remote-url --remote-origin --region --start --bank -o --output" ;;
       apply) candidates="--help -h -y --yes -f --force --start --bank -o --output" ;;
-      projects:list|project:list) candidates="--firmware-repo --output" ;;
+      projects:list|project:list|projects:ls|project:ls) candidates="--firmware-repo --output" ;;
       projects:versions|project:versions) candidates="--output" ;;
       projects:info|project:info) candidates="--version --output" ;;
-      projects:install|project:install) candidates="--version --target --variant --output --input --input-dir --firmware --firmware-dir --bios --bios-dir --game --game-dir --dry-run" ;;
+      projects:install|project:install) candidates="--version --target --variant --output --profile --device --input --input-dir --firmware --firmware-dir --bios --bios-dir --game --game-dir --dry-run --format --yes --start --bank" ;;
       projects:stage-local|project:stage-local) candidates="--output" ;;
-      adapters:list) candidates="--output" ;;
+      adapters:list|adapters:ls) candidates="--output" ;;
       adapters:add) candidates="--origin" ;;
       tree:*) candidates="--format --no-pager" ;;
       retro-go:install) candidates="--repo --version --variant --output" ;;
@@ -2084,9 +3119,9 @@ _gwprov() {
       report:render) candidates="--input --output --format" ;;
       profile:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
       perf:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
-      profile:create) candidates="--stock --content --backup-dir --locked --model --output-dir --name --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file" ;;
+      profile:create) candidates="-m --mario -z --zelda -p --patched -b --bootloader -r --retro-go --content --output-dir --name --littlefs --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file --sd-bootloader-file" ;;
       profile:duplicate) candidates="--output-dir --output" ;;
-      profile:list) candidates="--output --no-pager" ;;
+      profile:list|profile:ls) candidates="--output --no-pager" ;;
       profile:show) candidates="--shared-sd-root" ;;
       *) candidates="" ;;
     esac
@@ -2195,11 +3230,20 @@ def build_parser() -> argparse.ArgumentParser:
         ("Project catalog", ("projects",)),
         ("File workflows not yet device-scoped", ("retro-go", "ofw")),
         ("Debugging and reports", ("debug", "report")),
-        ("Help and shell integration", ("tree", "completion")),
+        ("Help and shell integration", ("tree", "completion", "daemon")),
     )
     commands = parser.add_subparsers(dest="command", required=True,
                                      metavar="COMMAND",
                                      parser_class=GWProvArgumentParser)
+    daemon = commands.add_parser("daemon", help="inspect and restart the per-user service")
+    daemon_commands = daemon.add_subparsers(dest="daemon_command", required=True)
+    daemon_restart = daemon_commands.add_parser(
+        "restart", help="drain and restart the daemon")
+    daemon_restart.add_argument("--force", action="store_true",
+                                help="cancel active substantial device operations")
+    daemon_restart.add_argument("--timeout", type=float, default=30.0,
+                                help="seconds to wait for the restart (default: 30)")
+    daemon_restart.set_defaults(handler=_daemon_restart)
     show = commands.add_parser("show", help="overview of GWProv resources")
     show.add_argument("section", nargs="?", choices=("adapters", "devices", "projects", "profile", "perf", "sdcard"))
     show.add_argument("--output", choices=("text", "json"), default="text")
@@ -2209,7 +3253,7 @@ def build_parser() -> argparse.ArgumentParser:
     adapters = commands.add_parser("adapters", help="list and manage hardware adapters")
     adapters.set_defaults(handler=_adapters_list, output="text")
     adapter_commands = adapters.add_subparsers(dest="adapter_command")
-    adapter_list = adapter_commands.add_parser("list", help="list local and registered adapters")
+    adapter_list = adapter_commands.add_parser("list", aliases=("ls",), help="list local and registered adapters")
     adapter_list.add_argument("--output", choices=("text", "json"), default="text")
     adapter_list.set_defaults(handler=_adapters_list)
     adapter_add = adapter_commands.add_parser("add", help="register a remote gnwmanager adapter")
@@ -2290,6 +3334,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--output", choices=("text", "json"), default="text")
     ps.add_argument("--no-pager", action="store_true", help="write directly to the terminal")
     ps.add_argument("--profile", help="load firmware/app symbols for physical Application state")
+    ps.add_argument("--live", "--refresh", dest="refresh", action="store_true",
+                    help="force a live runtime and internal-flash scan")
     ps.set_defaults(handler=_ps)
     deploy = commands.add_parser("deploy", help="plan and apply firmware or filesystem writes")
     deploy_commands = deploy.add_subparsers(dest="deploy_command", required=True)
@@ -2331,19 +3377,23 @@ def build_parser() -> argparse.ArgumentParser:
     debug_tools = commands.add_parser("debug", help="attach a Python debugger to hardware or GWemu")
     debug_commands = debug_tools.add_subparsers(dest="debug_command", required=True)
     python_debug = debug_commands.add_parser(
-        "python", help="attach a persistent Python console to GWemu or hardware")
-    python_debug.add_argument("--target", choices=("gwemu", "hardware"), required=True)
+        "python", help="attach a persistent Python console to a selected device",
+        description="Attach a Python console to a named device or the active device. The target kind is inferred from the selected device.",
+        epilog="Examples:\n  gwprov debug python\n  gwprov debug python probe:290077000E0000513751594E\n  gwprov debug python 'GWemu pid 12345'\n  gwprov debug python --target hardware --probe-id 290077000E0000513751594E")
+    python_debug.add_argument("device", nargs="?", help="device name or ID; defaults to the active device")
+    python_debug.add_argument("--target", choices=("gwemu", "hardware"),
+                              help="target kind when using an explicit backend or the active device")
     python_debug.add_argument("--host", default="127.0.0.1")
     python_debug.add_argument("--port", type=int, default=1234,
                               help="GWemu GDB port (default: 1234)")
     python_debug.add_argument("--openocd-port", type=int, default=6666)
     python_debug.add_argument("--probe-id", action="append", default=[],
-                              help="select a local PyOCD probe by unique ID (repeatable)")
+                              help="select a local PyOCD probe by unique ID (repeatable; defaults to the active device)")
     python_debug.add_argument("--programmer", action="append", default=[],
                               choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"),
                               help="start an explicit OpenOCD adapter session (repeatable by type)")
     python_debug.add_argument("--remote-url", action="append", default=[],
-                              help="connect to one gnwmanager serve URL; repeat for independent servers")
+                              help="connect through the daemon to one gnwmanager serve URL; repeat for independent servers")
     python_debug.add_argument("--remote-origin", action="append", default=[],
                               help="Origin header for the corresponding remote URL (repeatable)")
     python_debug.add_argument("--qmp-socket", help="GWProv-managed QMP handle; normally discovered from --profile")
@@ -2356,7 +3406,7 @@ def build_parser() -> argparse.ArgumentParser:
     project = commands.add_parser("projects", aliases=("project",),
                                   help="inspect and stage GWRG-distributed projects")
     project_commands = project.add_subparsers(dest="project_command", required=True)
-    project_list = project_commands.add_parser("list", help="list curated cores and homebrew projects")
+    project_list = project_commands.add_parser("list", aliases=("ls",), help="list curated cores and homebrew projects")
     project_list.add_argument("name", nargs="?", help="optional project name or owner/name filter")
     project_list.add_argument("--firmware-repo", default="sylverb/game-and-watch-retro-go-sd",
                               help="firmware repository that publishes projects.json")
@@ -2371,13 +3421,25 @@ def build_parser() -> argparse.ArgumentParser:
     info.add_argument("--version", help="published tag; defaults to newest")
     info.add_argument("--output", choices=("text", "json"), default="text")
     info.set_defaults(handler=_project_info)
-    install = project_commands.add_parser("install", help="verify and stage a project release")
-    install.add_argument("repo", help="curated project name or arbitrary owner/repo")
+    install = project_commands.add_parser(
+        "install", help="verify a release or bundle ZIP and install it into content, a profile, or a device",
+        description=("Install a GWRG project from the network or an offline ZIP.\n"
+                     "Variant is inferred from the destination or project release.\n"
+                     "ZIP hashes verify integrity, not publisher identity.\n"
+                     "See docs/PROFILES.md for the bundle format and examples.\n\n"
+                     "Examples:\n"
+                     "  gwprov project install doom --profile demo\n"
+                     "  gwprov project install ./doom.zip --device --yes"))
+    install.add_argument("repo", help="curated project, owner/repo, or path to a GWRG bundle ZIP")
     install.add_argument("--version", help="published tag; defaults to newest")
     install.add_argument("--target", help="target id when the manifest publishes more than one")
-    install.add_argument("--variant", choices=("flash", "sd"), required=True,
-                         help="provisioning variant to stage")
-    install.add_argument("--output", required=True, help="staging root directory")
+    install.add_argument("--variant", choices=("flash", "sd"),
+                         help="override inferred destination/release variant")
+    install_target = install.add_mutually_exclusive_group(required=True)
+    install_target.add_argument("--output", help="staging root directory")
+    install_target.add_argument("--profile", help="install into a managed profile for a later apply")
+    install_target.add_argument("--device", nargs="?", const="active", metavar="DEVICE",
+                                help="install to a physical device with an assigned profile; defaults to the active device")
     install.add_argument("--input", action="append", default=[], metavar="SLOT=FILE",
                          help="converter input file; repeat for multiple files")
     install.add_argument("--input-dir", action="append", default=[], metavar="SLOT=DIR|DIR",
@@ -2390,17 +3452,57 @@ def build_parser() -> argparse.ArgumentParser:
                          help="stage a game file and evaluate requiredFor firmware")
     install.add_argument("--game-dir", action="append", default=[], metavar="SYSTEM=DIR",
                          help="stage files from a system game directory")
-    install.add_argument("--dry-run", action="store_true", help="resolve, verify and plan without writing")
+    install.add_argument("--dry-run", action="store_true",
+                         help="show detected variant, files and destinations without writing or contacting a device")
+    install.add_argument("--format", choices=("text", "json"), default="text",
+                         help="result format (default: text)")
+    install.add_argument("-y", "--yes", action="store_true",
+                         help="skip confirmation when installing directly to a device")
+    install.add_argument("--start", action="store_true",
+                         help="start the selected bank after a flash project install")
+    install.add_argument("--bank", type=int, choices=(1, 2), default=1,
+                         help="bank to start with --start (default: 1)")
     install.set_defaults(handler=_project_install)
     stage_local = project_commands.add_parser("stage-local", help="stage an unpublished local build into content")
     stage_local.add_argument("manifest", help="local JSON manifest describing sources and destinations")
     stage_local.add_argument("--output", required=True, help="content root populated by retro-go install")
     stage_local.set_defaults(handler=_project_stage_local)
 
-    retro_go = commands.add_parser("retro-go", help="install, build, and configure Retro-Go")
+    backups = commands.add_parser("backups", help="discover and list verified stock firmware backups")
+    backup_commands = backups.add_subparsers(dest="backup_action", required=True)
+    backup_search = backup_commands.add_parser("search", help="recursively find stock backup pairs")
+    backup_search.add_argument("directory", nargs="?", default=".", help="search root (default: current directory)")
+    backup_search.add_argument("--output", choices=("text", "json"), default="text")
+    backup_search.set_defaults(handler=_backups)
+    backup_list = backup_commands.add_parser("list", aliases=("ls",), help="list discovered backup pairs")
+    backup_list.add_argument("--output", choices=("text", "json"), default="text")
+    backup_list.set_defaults(handler=_backups)
+
+    retro_go = commands.add_parser("retro-go", help="manage Retro-Go releases and file workflows")
     retro_commands = retro_go.add_subparsers(dest="retro_command", required=True)
+    release_list = retro_commands.add_parser("list", aliases=("ls",), help="list available releases from registered sources")
+    release_list.add_argument("source", nargs="?", help="limit to one registered source")
+    release_list.add_argument("--sort", choices=("source", "version"), default="version")
+    release_list.add_argument("--reverse", action="store_true")
+    release_list.add_argument("--output", choices=("text", "json"), default="text")
+    release_list.set_defaults(handler=_retro_release_list)
+    retro_source = retro_commands.add_parser("source", help="manage release index sources")
+    source_commands = retro_source.add_subparsers(dest="source_action", required=True)
+    source_add = source_commands.add_parser("add", help="register a GitHub repository or versions.json URL")
+    source_add.add_argument("source")
+    source_add.set_defaults(handler=_retro_sources)
+    source_remove = source_commands.add_parser("remove", help="remove a registered source")
+    source_remove.add_argument("source")
+    source_remove.set_defaults(handler=_retro_sources)
+    source_list = source_commands.add_parser("list", aliases=("ls",), help="list registered sources")
+    source_list.add_argument("--output", choices=("text", "json"), default="text")
+    source_list.set_defaults(handler=_retro_sources)
+    source_default = source_commands.add_parser("default", help="show or select the default source")
+    source_default.add_argument("source", nargs="?")
+    source_default.set_defaults(handler=_retro_sources)
     firmware_install = retro_commands.add_parser("install", help="download verified release firmware and content")
     firmware_install.add_argument("--repo", default="sylverb/game-and-watch-retro-go-sd")
+    firmware_install.add_argument("--versions-url", help=argparse.SUPPRESS)
     firmware_install.add_argument("--version")
     firmware_install.add_argument("--variant", choices=("flash", "sd"), required=True)
     firmware_install.add_argument("--output", required=True, help="content staging root shared with project install")
@@ -2605,9 +3707,10 @@ def build_parser() -> argparse.ArgumentParser:
     ofw_commands = ofw.add_subparsers(dest="ofw_command", required=True)
     patch = ofw_commands.add_parser("patch", help="build patched stock banks using gnwmanager's offline patch pipeline")
     patch.add_argument("game", choices=("mario", "zelda"))
-    patch.add_argument("--source-tree", required=True, help="qemu-gnw checkout")
     patch.add_argument("--backup-dir", required=True, help="directory of stock internal and external backups")
     patch.add_argument("--output-dir", required=True)
+    patch.add_argument("--extflash-mib", type=int, choices=(64, 128, 256), default=64)
+    patch.add_argument("--no-bootloader", action="store_true")
     patch.set_defaults(handler=_ofw_patch)
 
     media = commands.add_parser("media", help="inspect and build Retro-Go filesystems")
@@ -2707,24 +3810,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     profile = commands.add_parser("profile", help="create and manage device profiles")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True,
-                                              metavar="{create,duplicate,list,show}")
+                                              metavar="{create,duplicate,edit,list,ls,show}")
     create = profile_commands.add_parser("create", help="create a device profile from content or stock media")
     create.add_argument("directory", metavar="NAME_OR_PATH",
                         help="managed profile name, or an explicit output path")
     create.add_argument("--output-dir",
                         help="profile store for this creation (default: GWPROV_PROFILE_DIR or XDG data home)")
-    source = create.add_mutually_exclusive_group()
-    source.add_argument("--stock", action="store_true",
-                        help="create pristine stock media from hash-valid backups")
-    source.add_argument("--content", help="root populated by retro-go install and project install")
-    create.add_argument("--backup-dir", action="append", default=[],
-                        help="stock backup directory (repeatable; required with --stock)")
-    create.add_argument("--locked", action="store_true",
-                        help="initialize device RDP state as locked (requires --stock)")
-    create.add_argument("--model", choices=("auto", "mario", "zelda"),
-                        help="stock device model (requires --stock; default: auto)")
+    model_group = create.add_mutually_exclusive_group()
+    model_group.add_argument("-m", "--mario", action="store_true", help="include Mario stock firmware and assets")
+    model_group.add_argument("-z", "--zelda", action="store_true", help="include Zelda stock firmware and assets")
+    create.add_argument("-p", "--patched", action="store_true", help="apply the standard stock firmware patch")
+    create.add_argument("-b", "--bootloader", action="store_true",
+                        help="include the SD bootloader used by Game+Left at 0x08032000")
+    create.add_argument("--content", help="staged content root populated by Retro-Go/project install")
+    create.add_argument("-r", "--retro-go", metavar="SOURCE:VERSION",
+                        help="add an exact release listed by `gwprov retro-go list`")
     create.add_argument("--name")
-    create.add_argument("--littlefs-mib", type=int, default=2)
+    create.add_argument("--littlefs", "--littlefs-mib", dest="littlefs_mib", type=int, default=2, metavar="SIZE_MB")
     create.add_argument("--sd-size-mib", type=int, default=128,
                         help="capacity of the bundled FAT32 image for SD firmware (default: 128)")
     create.add_argument("--sd-label", default="RETROGO",
@@ -2734,6 +3836,8 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--bootloader-repo", default="sylverb/game-and-watch-bootloader")
     create.add_argument("--bootloader-version", default="v1.0.8", help="release tag or latest")
     create.add_argument("--bootloader-file", help="use a local binary linked at 0x08000000")
+    create.add_argument("--sd-bootloader-file",
+                        help="use a local SD bootloader linked at 0x08032000 (requires -b)")
     create.set_defaults(handler=_profile_create)
     duplicate = profile_commands.add_parser(
         "duplicate", help="copy a profile into an independent working profile")
@@ -2746,7 +3850,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="profile store for the copy (default: GWPROV_PROFILE_DIR or platform data directory)")
     duplicate.add_argument("--output", choices=("text", "json"), default="text")
     duplicate.set_defaults(handler=_profile_duplicate)
-    profile_list = profile_commands.add_parser("list", help="list profiles in the managed profile store")
+    edit = profile_commands.add_parser("edit", help="change a profile's mapped flash components")
+    edit.add_argument("profile", metavar="PROFILE", help="managed profile name or profile path")
+    edit_commands = edit.add_subparsers(dest="action", required=True, metavar="{add,remove}")
+    blob_add = edit_commands.add_parser("add", help="add or replace one component")
+    blob_add.add_argument("bank", choices=("bank1", "bank2", "bank0", "extflash"),
+                          help="internal bank1/bank2 or external flash bank0/extflash")
+    blob_add.add_argument("name", help="display name used in apply summaries")
+    blob_add.add_argument("file", help="source blob file")
+    blob_add.add_argument("--offset", required=True, type=lambda value: int(value, 0),
+                          help="offset within the selected bank (decimal or 0x-prefixed)")
+    blob_add.add_argument("--replace", action="store_true",
+                          help="replace an existing blob with the same name in that bank")
+    blob_add.add_argument("-o", "--output", choices=("text", "json"), default="text")
+    blob_add.set_defaults(handler=_profile_blob, action="add")
+    blob_remove = edit_commands.add_parser("remove", help="remove a mapped component")
+    blob_remove.add_argument("bank", choices=("bank1", "bank2", "bank0", "extflash"))
+    blob_remove.add_argument("name", help="display name of the component to remove")
+    blob_remove.add_argument("-o", "--output", choices=("text", "json"), default="text")
+    blob_remove.set_defaults(handler=_profile_blob, action="remove")
+    profile_list = profile_commands.add_parser("list", aliases=("ls",), help="list profiles in the managed profile store")
     profile_list.add_argument("--output", choices=("text", "json", "names"), default="text",
                               help="table, JSON, or plain names for shell completion")
     profile_list.add_argument("--no-pager", action="store_true", help="write directly to the terminal")

@@ -476,7 +476,8 @@ def install_project(
     repo: str,
     *,
     output: str | Path,
-    variant: str,
+    variant: str | None = None,
+    variant_hint: str | None = None,
     versions_url: str | None = None,
     target_id: str | None = None,
     tag: str | None = None,
@@ -489,18 +490,26 @@ def install_project(
     bios_dirs: list[str] | None = None,
     game_files: list[str] | None = None,
     game_dirs: list[str] | None = None,
+    bundle_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    if variant not in {"flash", "sd"}:
+    if variant not in {None, "flash", "sd"}:
         raise ValueError("variant must be 'flash' or 'sd'")
     if firmware_files and bios_files or firmware_dirs and bios_dirs:
         raise ValueError("use either firmware arguments or their BIOS aliases, not both")
     bios_files = firmware_files if firmware_files is not None else bios_files
     bios_dirs = firmware_dirs if firmware_dirs is not None else bios_dirs
-    resolved = resolve_project(repo, tag, versions_url=versions_url)
+    bundle_assets = None
+    if bundle_path is not None:
+        from .bundle import import_project_bundle
+        resolved, bundle_assets = import_project_bundle(bundle_path)
+        if tag and resolved.version.get("tag") != tag:
+            raise ValueError(f"project bundle contains {resolved.version.get('tag')!r}, not {tag!r}")
+    else:
+        resolved = resolve_project(repo, tag, versions_url=versions_url)
     manifest = resolved.manifest
     storage = manifest.get("storage")
-    if storage and variant not in storage:
-        raise ValueError(f"project does not publish a {variant} variant (supports: {', '.join(storage)})")
+    supported_storage = ([item for item in storage if item in {"flash", "sd"}]
+                         if isinstance(storage, list) else [])
     targets = manifest.get("targets")
     if not isinstance(targets, list) or not targets:
         raise ValueError("manifest has no targets")
@@ -512,6 +521,26 @@ def install_project(
         raise ValueError("project has multiple targets; select one with --target")
     if not isinstance(target, dict):
         raise ValueError(f"target {target_id!r} is not published")
+    if variant is None:
+        if variant_hint is not None:
+            if variant_hint not in {"flash", "sd"}:
+                raise ValueError(f"cannot infer project variant from destination: {variant_hint!r}")
+            if supported_storage and variant_hint not in supported_storage:
+                raise ValueError(
+                    f"destination indicates {variant_hint}, but this project only publishes "
+                    f"{', '.join(supported_storage)}")
+            variant = variant_hint
+        elif len(set(supported_storage)) == 1:
+            variant = supported_storage[0]
+        else:
+            supported = ", ".join(dict.fromkeys(supported_storage)) or "flash and sd"
+            raise ValueError(
+                f"could not infer project variant (project supports {supported}); "
+                "specify --variant flash or --variant sd")
+    elif supported_storage and variant not in supported_storage:
+        raise ValueError(
+            f"project does not publish a {variant} variant "
+            f"(supports: {', '.join(dict.fromkeys(supported_storage))})")
     kind = target.get("kind")
     if kind not in {"homebrew", "core"}:
         raise ValueError(f"unsupported project target kind {kind!r}")
@@ -540,14 +569,42 @@ def install_project(
         planned.append((relative.relative_to(variant), data, origin))
 
     base = resolved.manifest_url
+
+    def fetch_asset(spec: dict[str, Any], *, url_key: str = "url") -> bytes:
+        if bundle_assets is None:
+            return _fetch_checked(base, spec, url_key=url_key)
+        from urllib.parse import urljoin
+        ref = spec.get(url_key)
+        if not isinstance(ref, str):
+            raise ValueError("project bundle declaration has no URL")
+        url = urljoin(base, ref)
+        data = bundle_assets.get(url)
+        if data is None:
+            raise ValueError(f"project bundle is missing manifest file: {url}")
+        expected_size = spec.get("bytes")
+        expected_hash = spec.get("sha256")
+        filename = spec.get("filename") or spec.get("file") or ref
+        if not isinstance(expected_size, int) or len(data) != expected_size:
+            raise ValueError(f"size mismatch for {filename}: expected {expected_size}, got {len(data)}")
+        if not isinstance(expected_hash, str) or hashlib.sha256(data).hexdigest().lower() != expected_hash.lower():
+            raise ValueError(f"SHA-256 mismatch for {filename}")
+        return data
+
     for artifact in target.get("artifacts", []):
         filename = _plain_name(artifact.get("filename", ""))
-        data = _fetch_checked(base, artifact)
+        data = fetch_asset(artifact)
         is_mapped = artifact.get("mapped") is True
         add(_target_dir(target, "artifact") / filename, data, f"artifact:{filename}", mapped=is_mapped)
         if is_mapped:
+            raw_base = artifact.get("relocBase")
+            try:
+                reloc_base = int(raw_base, 0) if isinstance(raw_base, str) else int(raw_base)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"mapped artifact {filename} needs an integer relocBase") from exc
+            if not 0 <= reloc_base <= 0xFFFFFFFF:
+                raise ValueError(f"mapped artifact {filename} relocBase is outside the 32-bit address space")
             mapped_artifacts.append({"path": (_target_dir(target, "artifact") / filename).as_posix(),
-                                     "relocBase": artifact.get("relocBase")})
+                                     "relocBase": reloc_base})
     symbol_specs = target.get("symbols", [])
     if not isinstance(symbol_specs, list):
         raise ValueError("target symbols must be a list")
@@ -556,7 +613,7 @@ def install_project(
         if not isinstance(spec, dict):
             raise ValueError("target symbols entries must be objects")
         filename = _plain_name(spec.get("filename", ""))
-        data = _fetch_checked(base, spec)
+        data = fetch_asset(spec)
         if filename.lower().endswith(".elf") and not data.startswith(b"\x7fELF"):
             raise ValueError(f"published debug symbols are not an ELF file: {filename}")
         relative = _safe_relpath(
@@ -572,7 +629,7 @@ def install_project(
         sid = system.get("id")
         for game in system.get("games", []):
             filename = _plain_name(game.get("filename", ""))
-            data = _fetch_checked(base, game)
+            data = fetch_asset(game)
             add(_target_dir(target, "game", sid) / filename, data, f"game:{sid}/{filename}")
             selected_games.setdefault(sid, []).append((filename, data, f"shipped:{filename}"))
 
@@ -649,7 +706,7 @@ def install_project(
             canonical = bios.get("filename")
             filename = canonical if isinstance(canonical, str) else canonical[0]
             filename = _plain_name(filename)
-            data = _fetch_checked(base, {**bios, "filename": filename})
+            data = fetch_asset({**bios, "filename": filename})
             bios_key = _firmware_directory(system, sid)
             add(Path("bios") / _safe_relpath(bios_key) / filename, data,
                 f"shipped-firmware:{sid}/{filename}", allow_identical=True)
@@ -749,7 +806,7 @@ def install_project(
                 if required_slots:
                     raise ValueError(f"tool {tool_id!r} is required and needs input slot(s): {', '.join(required_slots)}")
             continue
-        wasm = _fetch_checked(base, tool.get("binary", {}), url_key="url")
+        wasm = fetch_asset(tool.get("binary", {}), url_key="url")
         groups = [[item for item in prepared if item["slot"] in {i.get("id") for i in tool.get("inputs", [])}]]
         # runPerFile applies per declared slot. For current schemas each runPerFile tool has one slot.
         per_file_slots = {i.get("id") for i in tool.get("inputs", []) if i.get("runPerFile")}
@@ -800,7 +857,14 @@ def install_project(
     if dry_run:
         return {"repo": resolved.repo, "tag": resolved.version.get("tag"), "target": target.get("id"),
                 "variant": variant, "files": [p.as_posix() for p, _, _ in planned],
-                "symbols": [p.as_posix() for p, _ in symbol_files], "dry_run": True}
+                "plannedFiles": [{"path": path.as_posix(), "bytes": len(data)}
+                                 for path, data, _origin in planned],
+                "mappedArtifacts": mapped_artifacts,
+                "requiresAbi": target.get("requiresAbi"),
+                "symbols": [p.as_posix() for p, _ in symbol_files],
+                "bundle": bundle_path is not None,
+                "provenance": "local bundle; publisher identity not authenticated" if bundle_path is not None else "verified release",
+                "dry_run": True}
 
     # Refuse to overwrite unrelated files. A prior gwprov-owned project install may be upgraded in place.
     marker = root / variant / ".gwprov-projects.json"
@@ -871,4 +935,6 @@ def install_project(
         metadata_path.write_text(json.dumps(ownership, indent=2) + "\n", encoding="utf-8")
     return {"repo": resolved.repo, "tag": resolved.version.get("tag"), "target": target.get("id"),
             "variant": variant, "files": [p.as_posix() for p, _, _ in planned],
-            "symbols": sorted(new_symbol_paths), "dry_run": False}
+            "symbols": sorted(new_symbol_paths), "bundle": bundle_path is not None,
+            "provenance": "local bundle; publisher identity not authenticated" if bundle_path is not None else "verified release",
+            "dry_run": False}

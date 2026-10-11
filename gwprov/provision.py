@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hashlib
 from pathlib import Path
 import shutil
 import struct
@@ -129,6 +130,7 @@ def create_profile(directory: str | Path, *, content: str | Path,
                 'bank0':[]}
             (instance/'flash-map.yaml').write_text(yaml.safe_dump(flash_map,sort_keys=False),encoding='utf-8')
             project_symbols = _copy_project_symbols(source, projects, instance)
+            _copy_mapped_project_sources(source, projects, instance, variant)
             sd_image = instance / 'sdcard.img'
             from .common.sdcard import create_image, push_tree, QemuSDCardManager
             create_image(str(sd_image), size_mb=sd_size_mib, label=sd_label)
@@ -227,6 +229,7 @@ def create_profile(directory: str | Path, *, content: str | Path,
         (blobs/'frogfs.bin').write_bytes(frogfs)
         shutil.copyfile(work/'littlefs.bin', blobs/'littlefs.bin')
         project_symbols = _copy_project_symbols(source, projects, instance)
+        _copy_mapped_project_sources(source, projects, instance, variant)
         with (instance/'extflash.bin').open('wb') as output:
             for _ in range(chip_mib):
                 output.write(b'\xff'*MIB)
@@ -300,6 +303,30 @@ def _copy_project_symbols(source: Path, projects: dict, instance: Path) -> list[
             shutil.copyfile(symbol, destination)
             copied.append(destination.relative_to(instance).as_posix())
     return sorted(copied)
+
+
+def _copy_mapped_project_sources(source: Path, projects: dict, instance: Path,
+                                variant: str) -> None:
+    """Keep raw XiP sidecars so later profile edits can safely recompose FrogFS."""
+    for project_key, project in projects.items():
+        if not isinstance(project, dict):
+            continue
+        for index, item in enumerate(project.get('mapped', [])):
+            if not isinstance(item, dict) or not isinstance(item.get('path'), str):
+                raise ValueError(f'invalid mapped project entry in {project_key!r}')
+            mapped_path = Path(item['path'])
+            if mapped_path.is_absolute() or '..' in mapped_path.parts:
+                raise ValueError(f'invalid mapped project path: {mapped_path}')
+            content_path = (source / variant / 'frogfs' / mapped_path
+                            if variant == 'flash' else source / variant / mapped_path)
+            if not content_path.is_file():
+                raise ValueError(f'mapped project source is missing: {content_path}')
+            identity = hashlib.sha256(project_key.encode('utf-8')).hexdigest()[:16]
+            relative = Path('blobs/project-mapped') / identity / f'{index}-{mapped_path.name}'
+            destination = instance / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(content_path, destination)
+            item['source'] = relative.as_posix()
 
 
 def _write_profile_config(instance: Path, display_name: str, *, sd_mode: str) -> None:

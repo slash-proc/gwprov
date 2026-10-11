@@ -4,23 +4,8 @@ from __future__ import annotations
 import json
 
 
-def device_rows(profile: str | None = None) -> list[dict]:
+def device_rows(profile: str | None = None, *, refresh: bool = False) -> list[dict]:
     from .gwemu_manager import _application_state, _process_scan_restriction, instances
-    from .backends import SelectedPyOCDBackend, enumerate_local_probes
-    from .target_leases import (DeviceBusyError, adapter_for_probe,
-                                external_local_owner, lease_owner)
-    symbol_paths = []
-    firmware = None
-    app_elfs = []
-    if profile:
-        from .debug_shell import SymbolTable
-        from .profiles import DeviceProfile
-        device = DeviceProfile.load(profile)
-        firmware = device.root / "debug" / "retro-go-debug.elf"
-        if firmware.is_file():
-            symbol_paths.append(firmware)
-        app_elfs = sorted((device.root / "debug" / "apps").rglob("*.elf"))
-        symbol_paths.extend(app_elfs)
 
     rows = []
     from .active_device import get_active
@@ -46,156 +31,33 @@ def device_rows(profile: str | None = None) -> list[dict]:
                      "status": vm["status"], "application": application,
                      "pid": vm["pid"], "display": vm.get("display"),
                      "detail": vm.get("stateDetail") or app_detail})
+    from .daemon import device_snapshot
     try:
-        probes = enumerate_local_probes()
-        probe_error = None
-    except RuntimeError as error:
-        probes = []
-        probe_error = str(error)
-    external_owner = external_local_owner()
-    for probe in probes:
-        adapter = adapter_for_probe(f"{probe['vendor']} {probe['name']}")
-        adapter_lease = lease_owner(f"adapter:{adapter}") if adapter else None
-        matching_external = (external_owner if external_owner and
-                             (adapter is None or external_owner.get("adapter") is None or
-                              external_owner.get("adapter") == adapter) else None)
-        owner = lease_owner(f"probe:{probe['id']}") or adapter_lease or matching_external
-        if owner:
-            pid = owner.get("pid")
-            if owner.get("recovery_required"):
-                if owner.get("lease_active"):
-                    detail = ("Target traffic skipped: "
-                              f"{owner.get('phase', 'hardware operation')} is in progress")
-                else:
-                    detail = ("Target traffic skipped: GWProv previously observed "
-                              f"{owner.get('phase', 'hardware operation')} and requires "
-                              "explicit recovery; run `gwprov device recover`")
-            else:
-                detail = f"Target traffic skipped: {owner.get('operation', 'another session')} owns it"
-            if pid:
-                active_owner = owner.get("lease_active", not owner.get("recovery_required"))
-                detail += (f" (pid {pid})" if active_owner else
-                           f" (last session pid {pid})")
-            rows.append({"id": f"probe:{probe['id']}", "kind": "hardware",
-                         "backend": probe["backend"], "name": probe["name"],
-                         "probeId": probe["id"], "vendor": probe["vendor"],
-                         "status": "busy", "application": "Unknown", "detail": detail,
-                         "busyOwner": owner})
-            continue
-        backend = None
-        application = "Unknown"
-        busy_owner = None
-        try:
-            backend = SelectedPyOCDBackend(probe["id"], operation="gwprov ps", lease_wait=0,
-                                           probe_adapter=adapter)
-            backend.open()
-            dhcsr = backend.read_uint32(0xE000EDF0)
-            status = "halted" if dhcsr & (1 << 17) else "running"
-            target_name = getattr(backend.target, "part_number", None) or probe["name"]
-            detail = "Pass --profile with matching firmware and app symbols to classify application state."
-            if symbol_paths and firmware is not None:
-                was_running = status == "running"
-                halted_by_us = False
-                try:
-                    if was_running:
-                        backend.halt()
-                        after_halt = backend.read_uint32(0xE000EDF0)
-                        if not after_halt & (1 << 17):
-                            raise RuntimeError("target did not enter halted state for symbol snapshot")
-                        halted_by_us = True
-                    symbol_table = SymbolTable()
-                    for elf in symbol_paths:
-                        symbol_table.load(elf)
-                    symbol_table.rebase_from_runtime_pointers(backend.read_memory)
-                    registers = {f"r{index}": backend.read_register(f"r{index}")
-                                 for index in range(13)}
-                    registers.update({name: backend.read_register(name)
-                                      for name in ("sp", "lr", "pc")})
-                    from .gwemu_manager import _application_state_from_target
-                    application = _application_state_from_target(
-                        symbol_table, firmware, app_elfs, backend.read_memory, registers)
-                    detail = ("Symbolized Retro-Go/app state; target was briefly halted and resumed."
-                              if was_running else "Symbolized Retro-Go/app state; target was already halted.")
-                except Exception as error:
-                    detail = f"CPU state read; application state read failed: {error}"
-                finally:
-                    if halted_by_us:
-                        try:
-                            backend.resume()
-                            after = backend.read_uint32(0xE000EDF0)
-                            status = "halted" if after & (1 << 17) else "running"
-                            if status != "running":
-                                detail += " Target did not resume; status reflects the final DHCSR read."
-                        except Exception as error:
-                            status = "unknown"
-                            detail += f" Target resume/state verification failed: {error}"
-        except DeviceBusyError as error:
-            status = "busy"
-            detail = str(error)
-            target_name = probe["name"]
-            busy_owner = error.owner
-        except Exception as error:
-            status = "unknown"
-            detail = f"Probe found, target state could not be read: {error}"
-            target_name = probe["name"]
-        finally:
-            if backend is not None:
-                try:
-                    backend.close()
-                except Exception:
-                    pass
-        row = {"id": f"probe:{probe['id']}", "kind": "hardware", "backend": probe["backend"],
-               "name": target_name, "probeId": probe["id"], "vendor": probe["vendor"],
-               "status": status, "application": application, "detail": detail}
-        if busy_owner:
-            row["busyOwner"] = busy_owner
-        rows.append(row)
-    from .adapters import list_remote
-    remotes = list_remote()
-    remote_by_url = {row["url"]: row for row in remotes}
-    if active_device and active_device.startswith("remote:"):
+        hardware = device_snapshot(refresh=refresh)
+    except (OSError, RuntimeError, ValueError) as error:
+        # The CLI never opens an adapter as an inventory fallback. Report that
+        # the daemon could not provide state instead of racing its connection.
+        hardware = [{"id": "hardware:*", "kind": "hardware", "backend": "GWProv daemon",
+                     "name": "Hardware inventory", "status": "unknown",
+                     "application": "Unknown", "installed": "Unknown",
+                     "detail": f"Daemon state unavailable: {error}"}]
+    rows.extend(hardware)
+    if (active_device and active_device.startswith("remote:")
+            and not any(row.get("id") == active_device for row in hardware)):
         uri = active_device.removeprefix("remote:")
-        remote_by_url.setdefault(uri, {"name": uri.split("/", 3)[2],
-                                       "url": uri, "origin": get_active_origin()})
-    for remote in remote_by_url.values():
-        uri = remote["url"]
-        remote_id = f"remote:{uri}"
-        owner = lease_owner(f"remote:{uri}")
-        if owner:
-            detail = (("gnwmanager RAM service operation is in progress"
-                       if owner.get("lease_active") else
-                       "Previous session left the gnwmanager RAM service active; "
-                       "run `gwprov device recover` after its mailbox is idle")
-                      if owner.get("recovery_required") else
-                      f"Target traffic skipped: {owner.get('operation', 'another session')} owns it")
-            rows.append({"id": remote_id, "kind": "hardware", "backend": "gnwmanager WebSocket",
-                         "name": remote["name"], "status": "busy", "application": "Unknown",
-                         "detail": detail,
-                         "adapterName": remote["name"], "remoteOrigin": remote["origin"]})
-        else:
-            backend = None
-            try:
-                from .backends import WebSocketBackend
-                backend = WebSocketBackend(uri, origin=remote["origin"],
-                                           operation="gwprov device inventory", lease_wait=0)
-                backend.open()
-                dhcsr = backend.read_uint32(0xE000EDF0)
-                status = "halted" if dhcsr & (1 << 17) else "running"
-                detail = "Remote device; pass a matching profile to resolve its Application state."
-            except Exception as error:
-                status = "unknown"
-                detail = f"Remote device state could not be read: {error}"
-            finally:
-                if backend is not None:
-                    try: backend.close()
-                    except Exception: pass
-            rows.append({"id": remote_id, "kind": "hardware", "backend": "gnwmanager WebSocket",
-                         "name": remote["name"], "status": status, "application": "Unknown",
-                         "detail": detail, "adapterName": remote["name"], "remoteOrigin": remote["origin"]})
-    if probe_error:
-        rows.append({"id": "probe:*", "kind": "hardware", "backend": "pyocd",
-                     "name": "Probe inventory", "status": "unknown", "application": "Unknown",
-                     "detail": probe_error})
+        try:
+            from .adapters import list_remote
+            configured = next((row for row in list_remote() if row.get("url") == uri), None)
+        except (OSError, RuntimeError, ValueError):
+            configured = None
+        rows.append({"id": active_device, "kind": "hardware",
+                     "backend": "gnwmanager WebSocket",
+                     "name": configured.get("name") if configured else uri,
+                     "status": "unknown", "application": "Unknown", "installed": "Unknown",
+                     "detail": "Selected remote adapter is not present in the daemon inventory",
+                     "adapterName": configured.get("name") if configured else uri,
+                     "remoteOrigin": (configured.get("origin") if configured
+                                      else get_active_origin())})
     from .device_assignments import assignments
     assigned = assignments()
     for row in rows:
@@ -208,8 +70,9 @@ def device_rows(profile: str | None = None) -> list[dict]:
 
 
 def show_devices(*, output: str = "text", profile: str | None = None,
+                 refresh: bool = False,
                  no_pager: bool = False) -> int:
-    rows = device_rows(profile=profile)
+    rows = device_rows(profile=profile, refresh=refresh)
     if output == "json":
         print(json.dumps(rows, indent=2))
         return 2 if any(row["status"] == "unknown" for row in rows) else 0

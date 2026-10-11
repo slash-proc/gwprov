@@ -122,12 +122,22 @@ stub.
 synchronizes its context counter when already live and idle. It restarts an
 idle but halted or terminal-error stub; it refuses a busy or unreadable
 resident service. Recovery leaves the device in Recovery Mode ready for commands.
-The target lease also keeps a durable recovery marker from the moment the RAM
-service is loaded until return to application firmware is verified. When apply
-leaves the stub running, its recovery marker remains set. If a
-process exits in between, `gwprov ps` skips target reads and later hardware
-commands fail closed until explicit recovery synchronizes with the idle
-flasher. Recovery is refused during `ERASE`, `PROG`, or `HASH`.
+The target lease keeps a durable marker for the RAM service state. `gwprov ps`
+reports `BUSY` while a substantial process holds the target lease; otherwise it
+reports the observed running, halted, or unknown state. The daemon continues
+passive polling while a verified idle flasher is ready. If an operation is
+interrupted before the target state is verified, polling pauses until explicit
+recovery or a verified return to application firmware clears the interruption
+marker. The application column identifies the gnwmanager Recovery stub when
+its live state is confirmed. VTOR, mailbox, DHCSR, and firmware signatures
+distinguish the stub from a transient SRAM application, and identify stock
+Mario/Zelda, bootloader, or Retro-Go version when signatures are readable.
+Recovery is refused during `ERASE`, `PROGRAM`, or `HASH`.
+
+Before starting the RAM service, recovery and deployment read the complete
+gnwmanager firmware image back from SRAM and verify MSP/PC register writes. A
+failed verification leaves the core halted and reports the mismatch instead of
+starting an unverified image.
 
 Assigning a profile is separate from selecting the active device. `gwprov apply`
 uses the active device's saved assignment: for GWemu it starts the assigned
@@ -259,6 +269,22 @@ bank0:
 Every entry records `size` in bytes and the full SHA-256 digest. Apply checks
 both values against the blob before using the map.
 
+Edit a profile's flash components with `profile edit`. Adding copies the input
+file into the profile's `blobs/` directory, records its name, bank-relative
+offset, byte size, and SHA-256 in `flash-map.yaml`, then rebuilds the padded
+bank images used by GWemu. Existing parts with the same name require
+`--replace`; removal names the bank and component shown in the map:
+
+```sh
+gwprov profile edit basic-test add bank0 "Mario Assets" mario-assets.bin --offset 0x0
+gwprov profile edit basic-test add bank1 "Bootloader" bootloader.bin --offset 0 --replace
+gwprov profile edit basic-test remove bank0 "Mario Assets"
+```
+
+`bank0` is external flash; `bank1` and `bank2` are internal flash. Blob ranges
+must fit the existing composed bank image and cannot overlap another mapped
+component. `-o json` provides structured edit results.
+
 GWemu instances use composed bank images, with `0xFF` in gaps between mapped
 blobs. The profile remains the reusable source; each emulator instance gets its
 own composed and mutable images. Bank 1 contains the official `sylverb/game-and-watch-bootloader` base-address
@@ -275,8 +301,8 @@ checksum verification. The cache is
 The bootloader starts valid bank-2 firmware when no updater or diagnostic action
 is selected. This is a
 standalone Retro-Go instance; a stock dual-boot image requires the separate stock
-patch/bootloader provisioning flow. To create a pristine stock device profile,
-use `gwprov profile create PATH --stock --backup-dir BACKUPS`.
+patch/bootloader provisioning flow. Stock profile creation uses the backup registry;
+see [Profiles: creation, editing, and deployment](PROFILES.md).
 
 Profiles are named directory-based device images. Bare names resolve under the
 OS data directory: `%LOCALAPPDATA%\gwprov\profiles` on Windows,

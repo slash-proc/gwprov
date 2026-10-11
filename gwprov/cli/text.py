@@ -12,7 +12,9 @@ from rich.text import Text
 
 _STATE_STYLES = {
     "running": "bold green",
+    "ready": "bold green",
     "halted": "bold yellow",
+    "recovery": "bold yellow",
     "busy": "bold cyan",
     "unknown": "bold red",
 }
@@ -36,11 +38,11 @@ def _connection(row: dict[str, Any]) -> str:
             parts.append(f"GDB :{row['gdbPort']}")
         if row.get("qmpSocket"):
             parts.append("daemon QMP" if str(row["qmpSocket"]).startswith("gwprov://") else "QMP")
-        return " · ".join(parts)
+        return ", ".join(parts)
     parts = [str(value) for value in (row.get("vendor"), row.get("backend")) if value]
     if row.get("probeId"):
         parts.append(str(row["probeId"]))
-    return " · ".join(parts) or "—"
+    return ", ".join(parts) or "—"
 
 
 def _status(value: Any) -> Text:
@@ -52,7 +54,7 @@ def _status(value: Any) -> Text:
 def process_table(rows: list[dict[str, Any]], *, title: str, width: int) -> Table:
     """Build a responsive, color-aware device/process inventory table."""
     table = Table(
-        title=f"[bold bright_cyan]{title}[/] [dim]· {len(rows)}",
+        title=f"[bold bright_cyan]{title} ({len(rows)})[/]",
         title_justify="left",
         box=box.ROUNDED,
         border_style="bright_black",
@@ -66,18 +68,23 @@ def process_table(rows: list[dict[str, Any]], *, title: str, width: int) -> Tabl
     table.add_column("STATE", min_width=11, no_wrap=True)
     if compact:
         table.add_column("DEVICE", min_width=13, overflow="fold")
-        table.add_column("APPLICATION · CONNECTION", min_width=18, overflow="fold")
+        table.add_column("RUNNING / INSTALLED / CONNECTION", min_width=18, overflow="fold")
     else:
         table.add_column("TYPE", min_width=9, max_width=12, style="bright_blue", no_wrap=True)
         table.add_column("DEVICE", min_width=14, overflow="fold")
-        table.add_column("APPLICATION", min_width=14, overflow="fold")
+        table.add_column("RUNNING / INSTALLED", min_width=14, overflow="fold")
         table.add_column("CONNECTION / DETAILS", min_width=18, overflow="fold")
 
     for row in rows:
         kind = "GWemu" if row.get("kind") == "gwemu" or row.get("pid") is not None else "Hardware"
-        application_text = Text(str(row.get("application") or "—"))
-        if application_text.plain.casefold() == "unknown":
-            application_text.stylize("dim")
+        application_text = Text("Running: ")
+        application_text.append(str(row.get("application") or "—"))
+        installed = row.get("installed")
+        if installed:
+            application_text.append("\nInstalled: ")
+            application_text.append(str(installed))
+        if str(row.get("application") or "").casefold() == "unknown":
+            application_text.stylize("dim", 9, len(application_text.plain))
 
         info = row.get("stateDetail") or row.get("applicationDetail") or row.get("detail")
         if info and str(info).startswith("Pass --profile with matching firmware"):
@@ -93,8 +100,7 @@ def process_table(rows: list[dict[str, Any]], *, title: str, width: int) -> Tabl
         if compact:
             device_text = Text(_display_name(row))
             device_text.append(f"\n{kind}", style="bright_blue")
-            details_text = Text("Application: ")
-            details_text.append(application_text)
+            details_text = application_text
             if connection_text.plain != "—":
                 details_text.append("\n")
                 details_text.append(connection_text)

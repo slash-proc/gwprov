@@ -22,8 +22,9 @@ def checked_member(archive: zipfile.ZipFile, spec: dict) -> bytes:
 
 
 def install_firmware(output: str | Path, *, variant: str = 'flash',
-                     repo: str = DEFAULT_CATALOG_REPO, version: str | None = None) -> dict:
-    release = resolve_project(repo, version)
+                     repo: str = DEFAULT_CATALOG_REPO, version: str | None = None,
+                     versions_url: str | None = None) -> dict:
+    release = resolve_project(repo, version, versions_url=versions_url)
     candidates = [build for build in release.manifest.get('builds', [])
                   if build.get('storage') == variant and build.get('bank') == 2]
     if len(candidates) != 1:

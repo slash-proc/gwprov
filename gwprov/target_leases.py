@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
+import threading
 import time
 from pathlib import Path
 
@@ -19,14 +21,36 @@ class DeviceBusyError(RuntimeError):
         super().__init__(f"target {key!r} is busy with {operation}{suffix}")
 
 
-class DeviceRecoveryRequired(DeviceBusyError):
-    """A persistent target-mode marker requires explicit recovery."""
+def operation_is_busy(owner: dict | None) -> bool:
+    """Whether an operation needs exclusive status in `ps` (writes or a debugger)."""
+    if not owner:
+        return False
+    operation = str(owner.get("operation", "")).casefold()
+    return any(word in operation for word in
+               ("deploy", "flash", "erase", "program", "write", "recover",
+                "unlock", "stub start", "debug session", "debug console",
+                "hardware profile"))
 
-    def __init__(self, key: str, owner: dict | None = None):
-        super().__init__(key, owner)
-        phase = self.owner.get("phase", "hardware operation")
-        self.args = (f"target {key!r} is marked for recovery from {phase}; "
-                     "run `gwprov device recover`",)
+
+def operation_suppresses_poll(owner: dict | None) -> bool:
+    """Skip the heartbeat only while an operation is actively writing/resetting."""
+    if not owner:
+        return False
+    operation = str(owner.get("operation", "")).casefold()
+    return any(word in operation for word in
+               ("deploy", "flash", "erase", "program", "write", "recover",
+                "unlock", "stub start"))
+
+
+def operation_blocks_drain(owner: dict | None) -> bool:
+    """Whether a live target operation must finish or be canceled before reload."""
+    if not owner:
+        return False
+    operation = str(owner.get("operation", "")).casefold()
+    return any(word in operation for word in
+               ("deploy", "flash", "erase", "program", "write", "recover",
+                "unlock", "stub start", "debug session", "debug console", "debug python",
+                "hardware profile"))
 
 
 def _lock_dir() -> Path:
@@ -118,23 +142,87 @@ def lease_owner(key: str) -> dict | None:
         os.close(fd)
 
 
+def active_lease_owners() -> list[dict]:
+    """Read all currently held process leases without contacting hardware."""
+    owners = []
+    try:
+        paths = tuple(_lock_dir().glob("*.lock"))
+    except OSError:
+        return owners
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            continue
+        try:
+            if os.name == "nt" and os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            if _lock(fd, blocking=False):
+                _unlock(fd)
+                continue
+            owner = _read_metadata(fd, "unknown target")
+            owner["lease_active"] = True
+            owners.append(owner)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+    return owners
+
+
+def update_device_marker(key: str, *, phase: str | None = None,
+                         flasher_ready: bool = False) -> None:
+    """Persist observed RAM-service state without holding a BUSY operation lease."""
+    path = _path_for(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.name == "nt" and os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        _lock(fd, blocking=True)
+        owner = _read_metadata(fd, key)
+        owner["key"] = key
+        if phase is None:
+            for field in ("recovery_required", "flasher_ready", "phase", "recovery_marked"):
+                owner.pop(field, None)
+        else:
+            owner.update(recovery_required=True, flasher_ready=flasher_ready,
+                         phase=phase, recovery_marked=time.time())
+        _write_metadata(fd, owner)
+        _unlock(fd)
+    finally:
+        os.close(fd)
+
+
 class TargetLease:
     """Exclusive process-shared target lease, held for a backend's lifetime."""
 
     def __init__(self, key: str, operation: str, *, wait: float = 30.0,
-                 allow_recovery_marker: bool = False):
+                 allow_recovery_marker: bool = False,
+                 register_with_daemon: bool = True, owner_pid: int | None = None,
+                 daemon_owned: bool = False):
         if not key:
             raise ValueError("target lease key must not be empty")
         self.key = key
         self.operation = operation
         self.wait = max(0.0, wait)
         self.allow_recovery_marker = allow_recovery_marker
+        self.register_with_daemon = register_with_daemon
+        self.owner_pid = owner_pid
+        self.daemon_owned = daemon_owned
         self.path = _path_for(key)
         self.fd: int | None = None
         self.daemon_token: str | None = None
+        self.monitor_pause_token = secrets.token_hex(16)
         self.owner: dict | None = None
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
 
     def acquire(self) -> "TargetLease":
+        if self.register_with_daemon:
+            from .daemon import pause_device_monitor
+            pause_device_monitor(self.key, self.monitor_pause_token,
+                                 self.owner_pid or os.getpid(), self.wait)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         if os.name == "nt" and os.fstat(fd).st_size == 0:
@@ -143,20 +231,23 @@ class TargetLease:
         while True:
             if _lock(fd, blocking=False):
                 previous = _read_metadata(fd, self.key)
-                if previous.get("recovery_required") and not self.allow_recovery_marker:
-                    _unlock(fd)
-                    os.close(fd)
-                    raise DeviceRecoveryRequired(self.key, previous)
                 self.fd = fd
                 owner = {**previous, "key": self.key, "operation": self.operation,
-                         "pid": os.getpid(), "started": time.time()}
+                         "pid": self.owner_pid or os.getpid(), "started": time.time(),
+                         "daemon_owned": self.daemon_owned}
                 self.owner = owner
                 try:
                     _write_metadata(fd, owner)
-                    token = secrets.token_hex(16)
-                    from .daemon import register_lease
-                    register_lease(token, owner)
-                    self.daemon_token = token
+                    if self.register_with_daemon:
+                        token = secrets.token_hex(16)
+                        from .daemon import register_lease
+                        register_lease(token, owner)
+                        self.daemon_token = token
+                        self._heartbeat_stop.clear()
+                        self._heartbeat_thread = threading.Thread(
+                            target=self._heartbeat_loop, daemon=True,
+                            name=f"gwprov-lease-heartbeat-{os.getpid()}")
+                        self._heartbeat_thread.start()
                 except Exception:
                     self.release()
                     raise
@@ -168,20 +259,31 @@ class TargetLease:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     owner = None
                 os.close(fd)
+                self._resume_monitor()
                 raise DeviceBusyError(self.key, owner)
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
     def mark_recovery_required(self, phase: str) -> None:
         if self.fd is None or self.owner is None:
             raise RuntimeError("target lease must be held before recording its device mode")
+        self.owner.pop("flasher_ready", None)
         self.owner.update(recovery_required=True, phase=phase,
                           recovery_marked=time.time())
+        _write_metadata(self.fd, self.owner)
+
+    def mark_flasher_ready(self) -> None:
+        """Record a verified idle RAM flasher without calling it an active lease."""
+        if self.fd is None or self.owner is None:
+            raise RuntimeError("target lease must be held before recording its device mode")
+        self.owner.update(recovery_required=True, flasher_ready=True,
+                          phase="gnwmanager RAM flasher ready", recovery_marked=time.time())
         _write_metadata(self.fd, self.owner)
 
     def clear_recovery_required(self) -> None:
         if self.fd is None or self.owner is None:
             raise RuntimeError("target lease must be held before clearing device mode")
         self.owner.pop("recovery_required", None)
+        self.owner.pop("flasher_ready", None)
         self.owner.pop("phase", None)
         self.owner.pop("recovery_marked", None)
         _write_metadata(self.fd, self.owner)
@@ -189,6 +291,13 @@ class TargetLease:
     def release(self) -> None:
         fd, self.fd = self.fd, None
         token, self.daemon_token = self.daemon_token, None
+        self._heartbeat_stop.set()
+        heartbeat_thread, self._heartbeat_thread = self._heartbeat_thread, None
+        if heartbeat_thread and heartbeat_thread is not threading.current_thread():
+            # The heartbeat request is independent of the target's write and
+            # bounded by the daemon IPC timeout. Wait for any in-flight request
+            # before releasing the token so it cannot recreate a closed lease.
+            heartbeat_thread.join(timeout=10.0)
         if token:
             from .daemon import release_lease
             release_lease(token)
@@ -197,6 +306,30 @@ class TargetLease:
                 _unlock(fd)
             finally:
                 os.close(fd)
+        if self.register_with_daemon:
+            self._resume_monitor()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(2.0):
+            token = self.daemon_token
+            if not token:
+                return
+            try:
+                from .daemon import heartbeat_lease
+                heartbeat_lease(token, self.owner or {})
+            except (OSError, RuntimeError, ValueError):
+                # The daemon's dead-client watchdog will reclaim the target if
+                # this process disappears; a later heartbeat can re-register
+                # against a daemon that was restarted meanwhile.
+                pass
+            if self._heartbeat_stop.is_set():
+                from .daemon import release_lease
+                release_lease(token)
+                return
+
+    def _resume_monitor(self) -> None:
+        from .daemon import resume_device_monitor
+        resume_device_monitor(self.key, self.monitor_pause_token)
 
     def __enter__(self) -> "TargetLease":
         return self.acquire()
@@ -210,18 +343,44 @@ def external_local_owner() -> dict | None:
     current = os.getpid()
 
     def describe(pid: int, name: str, command: str) -> dict | None:
-        name, command = name.casefold(), command.casefold()
-        if "openocd" in name or "openocd" in command:
+        name = name.casefold().removesuffix(".exe")
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+        executable = Path(argv[0]).name.casefold().removesuffix(".exe") if argv else ""
+
+        # Match the executable or an explicit Python module invocation. A
+        # substring search across the full command line mistakes an ancestor
+        # shell (or this process's script text) for a debug server whenever
+        # its arguments happen to mention "pyocd", "openocd", or
+        # "gnwmanager".
+        def is_module(module: str) -> bool:
+            return any(arg == "-m" and index + 1 < len(argv)
+                       and argv[index + 1] == module
+                       for index, arg in enumerate(argv))
+
+        if name == "openocd" or executable == "openocd":
             adapter = next((item for item in ("stlink", "jlink", "cmsis-dap", "rpi-gpio")
-                            if item in command), None)
+                            if item in argv), None)
             return {"key": "external-openocd", "operation": "external OpenOCD session",
                     "pid": pid, "command": command[:240], "adapter": adapter}
-        if "gnwmanager" in name or "gnwmanager" in command:
+        if name == "gnwmanager" or executable == "gnwmanager" or is_module("gnwmanager"):
+            # `gnwmanager -b gdb ...` is a QEMU GDB-stub client.  It does not
+            # open or own a USB debug probe, so it must not block a physical
+            # PyOCD/OpenOCD session.  Keep unknown and probe-backed manager
+            # processes conservative because they may own the hardware.
+            for index, arg in enumerate(argv):
+                if arg in ("-b", "--backend") and index + 1 < len(argv):
+                    if argv[index + 1] == "gdb":
+                        return None
+                if arg.startswith("--backend=") and arg.partition("=")[2] == "gdb":
+                    return None
             adapter = next((item for item in ("stlink", "jlink", "cmsis-dap", "rpi-gpio")
-                            if item in command), None)
+                            if item in argv), None)
             return {"key": "external-gnwmanager", "operation": "external gnwmanager session",
                     "pid": pid, "command": command[:240], "adapter": adapter}
-        if "pyocd" in name or "pyocd" in command:
+        if name == "pyocd" or executable == "pyocd" or is_module("pyocd"):
             return {"key": "external-pyocd", "operation": "external PyOCD session",
                     "pid": pid, "command": command[:240], "adapter": None}
         return None

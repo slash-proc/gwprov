@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -34,12 +35,18 @@ def _profile_region(profile_name: str, target: str):
     layout = metadata.get("layout", {})
     lfs_size = int(layout.get("littlefsBytes", 0))
     ext_size = int(layout.get("extflashBytes", profile.extflash.stat().st_size))
+    frog_offset = int(layout.get("frogfsOffset", -1))
     frog_size = int(layout.get("frogfsBytes", 0))
     lfs_offset = ext_size - lfs_size
     if lfs_size <= 0 or lfs_offset <= 0:
         raise ValueError("profile has no declared LittleFS region")
-    return profile, profile.extflash, "frogfs", 0, {"lfs_offset": lfs_offset,
-        "lfs_size": lfs_size, "frogfs_size": frog_size, "ext_size": ext_size,
+    if frog_offset < 0 or frog_size <= 0:
+        raise ValueError("profile has no declared FrogFS offset and size")
+    if frog_offset + frog_size > lfs_offset:
+        raise ValueError("declared FrogFS region overlaps LittleFS or exceeds its boundary")
+    return profile, profile.extflash, "frogfs", frog_offset, {"frogfs_offset": frog_offset,
+        "frogfs_size": frog_size, "frogfs_capacity": lfs_offset - frog_offset,
+        "lfs_offset": lfs_offset, "lfs_size": lfs_size, "ext_size": ext_size,
         "block_size": int(metadata.get("firmware", {}).get("littlefsBlockSize", 4096))}
 
 
@@ -131,6 +138,48 @@ def _mapped_artifacts(profile_root: Path) -> list[tuple[str, int]]:
     return declarations
 
 
+def _sync_flash_map_component(profile_root: Path, *, offset: int, data: bytes,
+                              label: str, filename: str) -> None:
+    """Keep hardware component blobs and their YAML hashes aligned with extflash."""
+    map_path = profile_root / "flash-map.yaml"
+    if not map_path.is_file():
+        return
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("updating profile flash-map.yaml requires PyYAML") from exc
+    flash_map = yaml.safe_load(map_path.read_text(encoding="utf-8"))
+    if not isinstance(flash_map, dict):
+        raise ValueError("profile flash-map.yaml must contain a mapping")
+    if "bank0" in flash_map and "extflash" in flash_map:
+        raise ValueError("flash map cannot define both bank0 and its extflash alias")
+    entries = flash_map.setdefault("bank0", flash_map.pop("extflash", []))
+    if not isinstance(entries, list):
+        raise ValueError("flash-map bank0 must be a list")
+    matches = [entry for entry in entries if isinstance(entry, dict)
+               and int(entry.get("offset", -1)) == offset]
+    if len(matches) > 1:
+        raise ValueError(f"flash-map has multiple extflash components at offset 0x{offset:X}")
+    if matches:
+        entry = matches[0]
+        relative = Path(str(entry.get("file", "")))
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise ValueError(f"invalid flash-map component path: {relative}")
+    else:
+        relative = Path("blobs") / filename
+        entry = {"name": label, "file": relative.as_posix(), "offset": offset}
+        entries.append(entry)
+    blob_path = (profile_root / relative).resolve()
+    if profile_root.resolve() not in blob_path.parents:
+        raise ValueError(f"flash-map component path escapes profile: {relative}")
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(data)
+    entry.update({"name": entry.get("name") or label, "file": relative.as_posix(),
+                  "offset": offset, "size": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest()})
+    map_path.write_text(yaml.safe_dump(flash_map, sort_keys=False), encoding="utf-8")
+
+
 def _build_frogfs(source: Path, output: Path, work: Path, *,
                   mapped_artifacts: list[tuple[str, int]] | None = None,
                   extflash_base: int = 0x90000000, extflash_offset: int = 0) -> None:
@@ -219,7 +268,7 @@ def operate(*, operation: str, target: str, profile: str | None = None,
         elif filesystem == "littlefs" and layout:
             kind, offset, size = "littlefs", layout["lfs_offset"], layout["lfs_size"]
         elif filesystem in (None, "frogfs") and layout:
-            kind, offset = "frogfs", 0
+            kind, offset = "frogfs", layout["frogfs_offset"]
         elif filesystem:
             kind = filesystem
     else:
@@ -248,11 +297,11 @@ def operate(*, operation: str, target: str, profile: str | None = None,
             if profile and target == "flash/ext" and _mapped_artifacts(device.root):
                 raise ValueError("cannot format a FrogFS profile while it declares mapped XiP artifacts")
             if size is None and profile and layout:
-                size = layout["lfs_offset"]
+                size = layout["frogfs_capacity"]
             if size is None: raise ValueError("FrogFS create requires --size")
             if size <= 0: raise ValueError("FrogFS size must be positive")
             if profile and layout:
-                capacity = layout["lfs_offset"]
+                capacity = layout["frogfs_capacity"]
                 if size > capacity: raise ValueError(f"FrogFS size exceeds profile capacity ({capacity} bytes)")
             elif not profile and image_path.exists() and offset + size > image_path.stat().st_size:
                 raise ValueError("FrogFS region exceeds the existing image")
@@ -266,8 +315,10 @@ def operate(*, operation: str, target: str, profile: str | None = None,
                 region = built.read_bytes() + b"\xff" * (size - built.stat().st_size)
                 if profile and layout:
                     ext = bytearray(image_path.read_bytes())
-                    ext[:layout["lfs_offset"]] = b"\xff" * layout["lfs_offset"]
-                    ext[:len(region)] = region
+                    start = layout["frogfs_offset"]
+                    end = layout["lfs_offset"]
+                    ext[start:end] = b"\xff" * (end - start)
+                    ext[start:start + len(region)] = region
                     temp_image = work / "extflash.new"; temp_image.write_bytes(ext)
                     bank = bytearray(device.bank2.read_bytes())
                     candidates = [i for i in range(0, len(bank) - 35, 4)
@@ -385,7 +436,7 @@ def operate(*, operation: str, target: str, profile: str | None = None,
             _build_frogfs(tree, built, work, mapped_artifacts=mapped_artifacts,
                           extflash_offset=offset)
             new_size = built.stat().st_size
-            capacity = layout["lfs_offset"] if layout else (size or image_path.stat().st_size - offset)
+            capacity = layout["frogfs_capacity"] if layout else (size or image_path.stat().st_size - offset)
             if capacity <= 0 or offset < 0 or offset + capacity > image_path.stat().st_size:
                 raise ValueError("FrogFS region exceeds the image; specify a valid --offset and --size")
             if new_size > capacity: raise ValueError(f"rebuilt FrogFS needs {new_size} bytes; capacity is {capacity}")
@@ -425,6 +476,9 @@ def operate(*, operation: str, target: str, profile: str | None = None,
                 device.bank2.write_bytes(old_bank)
                 if old_metadata is not None: metadata_path.write_bytes(old_metadata)
                 raise
+            _sync_flash_map_component(device.root, offset=offset,
+                                      data=built.read_bytes(), label="Retro-Go FrogFS",
+                                      filename="frogfs.bin")
             from .profiles import profile_reference
             print(f"Rebuilt FrogFS ({new_size} bytes) in profile {profile_reference(device.root)}")
             return 0
@@ -455,6 +509,10 @@ def operate(*, operation: str, target: str, profile: str | None = None,
             try: fs.unmount()
             except Exception: pass
             stream.close()
+        if profile and target == "flash/ext" and layout and kind == "littlefs":
+            region = image_path.read_bytes()[offset:offset + size]
+            _sync_flash_map_component(device.root, offset=offset, data=region,
+                                      label="Retro-Go LittleFS", filename="littlefs.bin")
         return 0
     if kind in ("fatfs", "sd"):
         if operation == "ls":

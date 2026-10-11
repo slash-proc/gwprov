@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import sys
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 
 PROFILE_DIR_ENV = "GWPROV_PROFILE_DIR"
 _FICLONE = 0x40049409
+MAX_EXTFLASH_BYTES = 256 * 1024 * 1024
 
 
 def profile_directory(override: str | Path | None = None) -> Path:
@@ -150,7 +152,7 @@ def duplicate_profile(source: str | Path, destination: str | Path, *,
     if not source_path.is_dir() or not manifest.is_file():
         raise ValueError(f"profile does not contain profile.toml: {source_path}")
     try:
-        tomllib.loads(manifest.read_text(encoding="utf-8"))
+        profile_config = tomllib.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ValueError(f"profile manifest is invalid: {manifest}: {exc}") from exc
     if source_path == destination_path:
@@ -173,12 +175,160 @@ def duplicate_profile(source: str | Path, destination: str | Path, *,
             shutil.rmtree(destination_path)
         raise
 
+    # Prepared profiles are often immutable snapshots. Their duplicates are
+    # working device images, however, and QEMU opens flash backing stores for
+    # writable shared mappings. Preserve every other file mode, but grant the
+    # owner write access to the media images copied into this profile.
+    flash = profile_config.get("flash", {})
+    for name, fallback in (("bank1", "bank1.bin"), ("bank2", "bank2.bin"),
+                           ("extflash", "extflash.bin")):
+        image = (destination_path / flash.get(name, fallback)).resolve()
+        if destination_path.resolve() not in image.parents:
+            shutil.rmtree(destination_path)
+            raise ValueError(f"profile {name} path escapes its profile directory")
+        if image.is_file():
+            os.chmod(image, image.stat().st_mode | 0o200)
+    sd = profile_config.get("sd", {})
+    if sd.get("mode") == "bundled" and sd.get("image"):
+        image = (destination_path / sd["image"]).resolve()
+        if destination_path.resolve() not in image.parents:
+            shutil.rmtree(destination_path)
+            raise ValueError("profile SD path escapes its profile directory")
+        if image.is_file():
+            os.chmod(image, image.stat().st_mode | 0o200)
+
     files = sum(1 for path in destination_path.rglob("*") if path.is_file())
     return {
         "source": str(source_path),
         "destination": str(destination_path),
         "files": files,
     }
+
+
+def edit_profile_blob(profile_name: str | Path, *, action: str, bank: str,
+                      name: str, source: str | Path | None = None,
+                      offset: int | None = None, replace: bool = False) -> dict[str, Any]:
+    """Add, replace, or remove one mapped component blob and refresh composed images."""
+    import yaml
+
+    root = resolve_profile_path(profile_name)
+    if not (root / "profile.toml").is_file():
+        raise ValueError(f"profile does not contain profile.toml: {root}")
+    if bank == "extflash":
+        bank = "bank0"
+    if bank not in {"bank0", "bank1", "bank2"}:
+        raise ValueError("bank must be bank1, bank2, or bank0/extflash")
+    if action not in {"add", "remove"}:
+        raise ValueError("action must be add or remove")
+    map_path = root / "flash-map.yaml"
+    try:
+        mapping = yaml.safe_load(map_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"cannot read profile flash map: {map_path}: {exc}") from exc
+    if not isinstance(mapping, dict):
+        raise ValueError("profile flash-map.yaml must contain a mapping")
+    if "bank0" in mapping and "extflash" in mapping:
+        raise ValueError("flash map cannot define both bank0 and its extflash alias")
+    if "extflash" in mapping:
+        mapping["bank0"] = mapping.pop("extflash")
+    for key in ("bank1", "bank2", "bank0"):
+        if not isinstance(mapping.get(key, []), list):
+            raise ValueError(f"flash-map {key} must be a list")
+    entries = mapping.setdefault(bank, [])
+    matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("name") == name]
+    if action == "remove":
+        if not matches:
+            raise ValueError(f"no {bank} blob named {name!r} in profile {root.name}")
+        mapping[bank] = [entry for entry in entries if not (isinstance(entry, dict) and entry.get("name") == name)]
+        result = {"action": "removed", "profile": str(root), "bank": bank, "name": name}
+    else:
+        if source is None or offset is None:
+            raise ValueError("adding a blob requires --file and --offset")
+        if matches and not replace:
+            raise ValueError(f"{bank} already has a blob named {name!r}; use --replace to update it")
+        source_path = Path(source).expanduser().resolve()
+        if not source_path.is_file() or source_path.stat().st_size == 0:
+            raise ValueError(f"blob file is missing or empty: {source_path}")
+        data = source_path.read_bytes()
+        size = len(data)
+        if offset < 0 or (bank != "bank0" and offset + size > 256 * 1024):
+            raise ValueError(f"blob range does not fit {bank}")
+        if bank == "bank0" and offset + size > MAX_EXTFLASH_BYTES:
+            raise ValueError("bank0 blob exceeds the 256 MiB extflash address limit")
+        for item in entries:
+            if not isinstance(item, dict) or item.get("name") == name:
+                continue
+            other_start = int(item["offset"])
+            other_end = other_start + int(item["size"])
+            if offset < other_end and other_start < offset + size:
+                raise ValueError(
+                    f"{bank} blob {name!r} range 0x{offset:X}–0x{offset + size:X} "
+                    f"overlaps {item.get('name', 'unnamed')} at "
+                    f"0x{other_start:X}–0x{other_end:X}")
+        blob_dir = root / "blobs"
+        blob_dir.mkdir(exist_ok=True)
+        slug = "".join(c.lower() if c.isalnum() else "-" for c in name).strip("-") or "blob"
+        digest = hashlib.sha256(data).hexdigest()
+        relative = Path("blobs") / f"{bank}-{slug}-{digest[:12]}.bin"
+        destination = (root / relative).resolve()
+        if root not in destination.parents:
+            raise ValueError("blob name produces an invalid profile path")
+        temp = destination.with_suffix(destination.suffix + ".tmp")
+        temp.write_bytes(data)
+        os.replace(temp, destination)
+        entry = {"name": name, "file": relative.as_posix(), "offset": offset,
+                 "size": size, "sha256": digest}
+        mapping[bank] = [item for item in entries if not (isinstance(item, dict) and item.get("name") == name)] + [entry]
+        result = {"action": "replaced" if matches else "added", "profile": str(root),
+                  "bank": bank, **entry}
+    profile = DeviceProfile.load(root)
+    capacities = {"bank1": profile.bank1, "bank2": profile.bank2, "bank0": profile.extflash}
+    for bank_key, image_path in capacities.items():
+        image_capacity = image_path.stat().st_size if image_path.is_file() else 0
+        capacity = min(image_capacity, MAX_EXTFLASH_BYTES) if bank_key == "bank0" else image_capacity
+        for item in mapping.get(bank_key, []):
+            blob = (root / str(item.get("file", ""))).resolve()
+            if root not in blob.parents or not blob.is_file():
+                raise ValueError(f"profile flash-map blob is missing or escapes profile: {item.get('file')}")
+            start, length = int(item["offset"]), blob.stat().st_size
+            if bank_key in {"bank1", "bank2"} and start + length > 256 * 1024:
+                raise ValueError(f"{bank_key} blob {item.get('name')!r} exceeds the 256 KiB bank limit")
+            if start < 0 or length <= 0 or start + length > capacity:
+                raise ValueError(f"{bank_key} blob {item.get('name')!r} exceeds composed image size ({capacity} bytes)")
+            if int(item.get("size", length)) != length:
+                raise ValueError(f"flash-map size mismatch for {item.get('file')}")
+            if hashlib.sha256(blob.read_bytes()).hexdigest() != str(item.get("sha256", "")).casefold():
+                raise ValueError(f"flash-map SHA-256 mismatch for {item.get('file')}")
+    serialized = yaml.safe_dump(mapping, sort_keys=False, allow_unicode=True)
+    temp_map = map_path.with_suffix(".yaml.tmp")
+    temp_map.write_text(serialized, encoding="utf-8")
+    os.replace(temp_map, map_path)
+    # Rebuild the emulator images from the source blobs; unmapped bytes stay erased.
+    for bank_key, image_path in (("bank1", profile.bank1), ("bank2", profile.bank2),
+                                 ("bank0", profile.extflash)):
+        if not image_path.is_file():
+            continue
+        os.chmod(image_path, image_path.stat().st_mode | 0o200)
+        capacity = image_path.stat().st_size
+        with image_path.open("r+b") as image:
+            image.seek(0)
+            remaining = capacity
+            erased = b"\xff" * (1024 * 1024)
+            while remaining:
+                chunk = min(remaining, len(erased))
+                image.write(erased[:chunk])
+                remaining -= chunk
+            for item in mapping.get(bank_key, []):
+                blob = (root / item["file"]).resolve()
+                if root not in blob.parents or not blob.is_file():
+                    raise ValueError(f"profile flash-map blob is missing or escapes profile: {item['file']}")
+                data = blob.read_bytes()
+                start = int(item["offset"])
+                if start < 0 or start + len(data) > capacity:
+                    raise ValueError(f"{bank_key} blob {item['name']!r} exceeds composed image size")
+                image.seek(start)
+                image.write(data)
+    return result
 
 
 @dataclass(frozen=True)

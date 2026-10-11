@@ -54,11 +54,13 @@ Output: backup/qemu-images/<game>-bank1-patched.bin,
         backup/qemu-images/<game>-bank2.bin
 """
 import argparse
+from argparse import Namespace
 import importlib.resources
 import os
 import re
 import sys
 from pathlib import Path
+from gwprov.common.target import BANK_SIZE
 
 
 GNWMANAGER_PATH = os.environ.get("GNWMANAGER_PATH")
@@ -145,12 +147,13 @@ def default_args(game: str) -> Namespace:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("game", choices=sorted(DEVICE_CLASSES))
-    parser.add_argument("--source-tree", type=Path, required=True,
-                        help="qemu-gnw source tree containing the SoC geometry header")
     parser.add_argument("--backup-dir", type=Path, required=True,
                         help="directory containing internal_flash_backup_<game>.bin and flash_backup_<game>.bin")
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="where patched bank and extflash images are written")
+    parser.add_argument("--extflash-mib", type=int, choices=(64, 128, 256), default=64)
+    parser.add_argument("--no-bootloader", action="store_true",
+                        help="use the standard patch layout without bootloader space")
     parser.add_argument("--retro-go-bank2", type=Path, metavar="PATH",
                          help="retro-go firmware/launcher binary, written verbatim as bank2")
     parser.add_argument("--retro-go-extflash", type=Path, metavar="PATH",
@@ -162,10 +165,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     game = args.game
 
-    soc_h = args.source_tree.expanduser().resolve() / "include/hw/arm/gnw_h7b0_soc.h"
-    bank_size = read_define("FLASH_BANK_SIZE", soc_h)
-    extflash_size = read_define("EXTFLASH_SIZE", soc_h)
-    print(f"FLASH_BANK_SIZE={bank_size:#x}  EXTFLASH_SIZE={extflash_size:#x}")
+    bank_size = BANK_SIZE
+    extflash_size = args.extflash_mib * 1024 * 1024
 
     backup_dir = args.backup_dir.expanduser().resolve()
     out_dir = args.output_dir.expanduser().resolve()
@@ -179,10 +180,10 @@ def main(argv=None):
         sys.exit(f"missing {extflash_src}")
 
     cls = DEVICE_CLASSES[game]
-    device = common_prepare(cls, internal_src, extflash_src, bootloader=True)
+    device = common_prepare(cls, internal_src, extflash_src, bootloader=not args.no_bootloader)
     device.args = default_args(game)
 
-    print(f"Running gnwmanager's {game} patch pipeline (bootloader=True, all other flags default)...")
+    print(f"Running gnwmanager's {game} patch pipeline (bootloader={not args.no_bootloader}, other flags default)...")
     internal_remaining_free, compressed_memory_remaining_free = device()
     print(f"  internal free: {internal_remaining_free} bytes, "
           f"compressed_memory free: {compressed_memory_remaining_free} bytes")

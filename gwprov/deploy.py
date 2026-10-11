@@ -46,6 +46,13 @@ def deployment_plan(profile_path: str | Path, regions: Iterable[str] | None = No
         flash_map = yaml.safe_load(flash_map_path.read_text(encoding="utf-8"))
         if not isinstance(flash_map, dict):
             raise ValueError("profile flash-map.yaml must contain a mapping")
+        if "bank0" in flash_map and "extflash" in flash_map:
+            raise ValueError("flash map cannot define both bank0 and its extflash alias")
+        if "extflash" in flash_map:
+            flash_map["bank0"] = flash_map.pop("extflash")
+        extflash_limit = 256 * 1024 * 1024
+        if profile.extflash.is_file():
+            extflash_limit = min(extflash_limit, profile.extflash.stat().st_size)
         for bank_key in ("bank1", "bank2", "bank0"):
             entries = flash_map.get(bank_key, [])
             if not isinstance(entries, list):
@@ -60,6 +67,13 @@ def deployment_plan(profile_path: str | Path, regions: Iterable[str] | None = No
                     raise ValueError(f"profile flash-map blob is missing or escapes profile: {part['file']}")
                 offset, size = int(part["offset"]), path.stat().st_size
                 expected_size = int(part.get("size", size))
+                if bank_key == "bank0":
+                    if (offset == int(layout.get("frogfsOffset", -1))
+                            and expected_size == int(layout.get("frogfsBytes", -1))):
+                        region = "frogfs"
+                    elif (offset == int(layout.get("littlefsOffset", -1))
+                            and expected_size == int(layout.get("littlefsBytes", -1))):
+                        region = "littlefs"
                 digest = _hash_range(path, 0, size)
                 expected_hash = str(part["sha256"]).casefold()
                 if expected_size != size:
@@ -71,14 +85,18 @@ def deployment_plan(profile_path: str | Path, regions: Iterable[str] | None = No
                     raise ValueError(f"flash-map {bank_key} entries need a non-negative offset and non-empty blob")
                 if bank and offset + size > 256 * 1024:
                     raise ValueError(f"flash-map {bank_key} entry exceeds the 256 KiB internal flash bank")
+                if not bank and offset + size > extflash_limit:
+                    raise ValueError(
+                        f"flash-map {bank_key} entry {part['name']!r} ends at 0x{offset + size:X}, "
+                        f"past the profile extflash limit of 0x{extflash_limit:X}")
                 candidates.append({"region": region, "kind": "internal-flash" if bank else "external-flash",
                                    "bank": bank, "offset": offset, "bytes": size,
                                    "path": str(path), "sha256": digest,
                                    "sourceOffset": 0, "content": str(part["name"])})
         for bank_key in ("bank1", "bank2", "bank0"):
-            region = "extflash" if bank_key == "bank0" else bank_key
+            bank_number = 0 if bank_key == "bank0" else int(bank_key[-1])
             ranges = sorted((row["offset"], row["offset"] + row["bytes"])
-                            for row in candidates if row["region"] == region)
+                            for row in candidates if row["bank"] == bank_number)
             for previous, current in zip(ranges, ranges[1:]):
                 if current[0] < previous[1]:
                     raise ValueError(f"flash-map has overlapping writes in {bank_key}")
@@ -116,6 +134,18 @@ def deployment_plan(profile_path: str | Path, regions: Iterable[str] | None = No
                            "bytes": sum(row["bytes"] for row in files), "files": files,
                            "path": str(profile.resolved_sd),
                            "sha256": hashlib.sha256(manifest).hexdigest()})
+
+    extflash_limit = 256 * 1024 * 1024
+    if profile.extflash.is_file():
+        extflash_limit = min(extflash_limit, profile.extflash.stat().st_size)
+    for row in candidates:
+        if row.get("kind") != "external-flash":
+            continue
+        offset, end = int(row.get("offset", 0)), int(row.get("offset", 0)) + int(row["bytes"])
+        if offset < 0 or end > extflash_limit:
+            raise ValueError(
+                f"{row['region']} range 0x{offset:X}–0x{end:X} exceeds the profile extflash limit "
+                f"of 0x{extflash_limit:X}")
 
     selected = set(regions or (row["region"] for row in candidates))
     unknown = selected - {row["region"] for row in candidates}
@@ -165,11 +195,11 @@ def deployment_write_summary(profile_path: str | Path, plan: dict) -> list[dict[
             if region in {"bank1", "bank2"}:
                 bank = int(row["bank"])
                 address = 0x08000000 if bank == 1 else 0x08100000
-                rows.append({"target": f"Bank {bank} · 0x{address + int(row.get('offset', 0)):08x}–0x{address + int(row.get('offset', 0)) + size:08x}",
+                rows.append({"target": f"Bank {bank} (0x{address + int(row.get('offset', 0)):08x}–0x{address + int(row.get('offset', 0)) + size:08x})",
                              "content": content, "bytes": size, "sha256": row.get("sha256")})
             elif region in {"extflash", "frogfs", "littlefs"}:
                 start = 0x90000000 + int(row.get("offset", 0))
-                rows.append({"target": f"Extflash · 0x{start:08x}–0x{start + size:08x}",
+                rows.append({"target": f"Extflash (0x{start:08x}–0x{start + size:08x})",
                              "content": content, "bytes": size, "sha256": row.get("sha256")})
             continue
         if region in {"bank1", "bank2"}:
@@ -184,7 +214,7 @@ def deployment_write_summary(profile_path: str | Path, plan: dict) -> list[dict[
                 content = "Erased (0xFF)" if data and all(byte == 0xFF for byte in data) else "Unknown"
             else:
                 content = "Unknown"
-            rows.append({"target": f"Bank {bank} · 0x{address:08x}–0x{address + size:08x}",
+            rows.append({"target": f"Bank {bank} (0x{address:08x}–0x{address + size:08x})",
                          "content": content, "bytes": size})
         elif region == "extflash":
             if is_stock and stock_model in {"Mario", "Zelda"}:
@@ -193,12 +223,12 @@ def deployment_write_summary(profile_path: str | Path, plan: dict) -> list[dict[
                 content = "Stock Assets (target size read before writing)"
             else:
                 content = "External-flash image (unknown composition)"
-            rows.append({"target": "Extflash · range read from device",
+            rows.append({"target": "Extflash (range read from device)",
                          "content": content, "bytes": None})
         elif region in {"frogfs", "littlefs"}:
             label = "Retro-Go FrogFS" if region == "frogfs" else "Retro-Go LittleFS"
             start = 0x90000000 + int(row.get("offset", 0))
-            rows.append({"target": f"Extflash · 0x{start:08x}–0x{start + size:08x}",
+            rows.append({"target": f"Extflash (0x{start:08x}–0x{start + size:08x})",
                          "content": label, "bytes": size})
         elif region == "sd":
             rows.append({"target": "SD image", "content": "File overlay", "bytes": size})
@@ -404,6 +434,35 @@ def overlay_sd_directory(image: str | Path, destination: str | Path) -> int:
     raise ValueError(f"cannot open a FAT partition in SD image {image}")
 
 
+def overlay_sd_tree(source: str | Path, destination: str | Path) -> int:
+    """Copy project files into a registered mounted card, retaining unrelated files."""
+    source_root = Path(source).expanduser().resolve()
+    destination_root = Path(destination).expanduser().resolve()
+    if not source_root.is_dir():
+        raise ValueError(f"project SD content directory is unavailable: {source_root}")
+    if not destination_root.is_dir():
+        raise ValueError(f"registered SD-card mount is unavailable: {destination_root}")
+    files = sorted((item for item in source_root.rglob("*") if item.is_file()),
+                   key=lambda item: item.as_posix().casefold())
+    if not files:
+        raise ValueError("project bundle contains no SD files to install")
+    for source_file in files:
+        relative = source_file.relative_to(source_root)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"unsafe project SD path: {relative}")
+        target = destination_root / relative
+        cursor = destination_root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError(f"refusing to follow SD-card symlink: {cursor}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if destination_root not in target.parent.resolve().parents and target.parent.resolve() != destination_root:
+            raise ValueError(f"SD-card path escapes mounted folder: {relative}")
+        shutil.copyfile(source_file, target)
+    return len(files)
+
+
 def apply_deployment(profile_path: str | Path, *, probe_id: str | None = None,
                      programmer: str | None = None, remote_url: str | None = None,
                      remote_origin: str | None = None,
@@ -428,7 +487,8 @@ def apply_deployment(profile_path: str | Path, *, probe_id: str | None = None,
     elif probe_id:
         from .backends import SelectedPyOCDBackend
         backend = SelectedPyOCDBackend(probe_id, operation="gwprov deploy",
-                                      allow_recovery_marker=True)
+                                      allow_recovery_marker=True,
+                                      resume_on_disconnect=False)
     elif programmer:
         from .backends import SelectedOpenOCDBackend
         backend = SelectedOpenOCDBackend(programmer, operation="gwprov deploy",
@@ -453,18 +513,21 @@ def apply_deployment(profile_path: str | Path, *, probe_id: str | None = None,
                                    attach_to_idle_gnwmanager,
                                    clear_backend_recovery_required,
                                    inspect_target_mode,
-                                   mark_backend_recovery_required)
+                                   mark_backend_flasher_ready,
+                                   mark_backend_recovery_required,
+                                   _reset_and_halt_for_stub,
+                                   _resume_after_stub_transition,
+                                   start_gnwmanager_verified)
         gnw = GnW(backend)
         mode = inspect_target_mode(backend)
-        if mode["stubAlive"]:
+        if mode["stubDetected"] and mode["stubAlive"]:
             report("phase", message="Attaching to gnwmanager RAM programmer")
+            mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
             attach_to_idle_gnwmanager(backend, gnw)
-            mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
         elif mode["stubDetected"]:
-            mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
             raise RuntimeError(
-                "Cannot deploy: gnwmanager's RAM service is resident but not confirmed "
-                "idle. Wait for its current operation to finish before retrying."
+                "Cannot deploy: a RAM service is resident but stopped. Check the target "
+                "connection and retry after the service is running."
             )
         else:
             assert_application_mode(backend, operation="start a deployment")
@@ -472,7 +535,7 @@ def apply_deployment(profile_path: str | Path, *, probe_id: str | None = None,
             # target into gnwmanager's RAM service to perform explicit region writes.
             report("phase", message="Starting gnwmanager RAM programmer")
             mark_backend_recovery_required(backend, "starting gnwmanager RAM programmer")
-            gnw.start_gnwmanager()
+            start_gnwmanager_verified(backend, gnw)
             mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
         report("phase", message="Reading device extflash layout")
         extflash = inspect_device_extflash(backend, gnw)
@@ -543,20 +606,29 @@ def apply_deployment(profile_path: str | Path, *, probe_id: str | None = None,
         if start:
             base = 0x08000000 if bank == 1 else 0x08100000
             report("phase", message=f"Starting from bank {bank}")
-            backend.reset_and_halt()
+            watchdog_freezes = _reset_and_halt_for_stub(backend, gnw)
             backend.write_register("msp", backend.read_uint32(base))
             backend.write_register("pc", backend.read_uint32(base + 4))
-            backend.resume()
+            _resume_after_stub_transition(backend, watchdog_freezes)
             state = inspect_target_mode(backend)
             if state["halted"] or state["stubResident"]:
                 raise RuntimeError(
-                    f"deployment wrote the selected regions, but bank {bank} did not leave "
-                    "gnwmanager Recovery Mode; GWProv is holding the target traffic "
-                    "guard. Inspect `gwprov ps` and use `gwprov device recover` "
-                    "when the mailbox is idle."
+                    f"deployment wrote the selected regions, but bank {bank} did not start "
+                    "(target still halted or VTOR remains in SRAM)."
                 )
             clear_backend_recovery_required(backend)
             booted = f"bank{bank}"
+        else:
+            # This branch intentionally leaves the RAM service running. It may
+            # retain a flash VTOR, so use the builder's mailbox + running-core
+            # liveness check for this explicit post-write verification.
+            state = inspect_target_mode(backend)
+            if not state["stubDetected"] or not state["stubAlive"]:
+                raise RuntimeError(
+                    "deployment wrote the selected regions, but the RAM flasher is no "
+                    "longer running and idle"
+                )
+            mark_backend_flasher_ready(backend)
         report("complete", overall_done=overall_done, overall_total=total_bytes,
                booted=booted)
     finally:

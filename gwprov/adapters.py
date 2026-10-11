@@ -64,30 +64,35 @@ def inventory() -> list[dict]:
 
     external = external_local_owner()
     rows = []
+
+    def owner_state(owner: dict | None, available: str) -> str:
+        if owner is None:
+            return available
+        active = owner.get("lease_active", not owner.get("recovery_required"))
+        if active:
+            from .target_leases import operation_is_busy
+            return "busy" if operation_is_busy(owner) else available
+        return available
+
     for probe in enumerate_local_probes():
         adapter_type = adapter_for_probe(f"{probe['vendor']} {probe['name']}") or probe["backend"]
         owner = (lease_owner(f"probe:{probe['id']}")
                  or lease_owner(f"adapter:{adapter_type}"))
-        if owner is None and external and external.get("adapter") in (None, adapter_type):
+        if (external and external.get("adapter") in (None, adapter_type)
+                and (owner is None or (owner.get("flasher_ready")
+                                      and not owner.get("lease_active")))):
             owner = external
-        detail = None
-        if owner:
-            detail = (f"recovery required from {owner.get('phase', 'hardware operation')}; "
-                      "run `gwprov device recover`"
-                      if owner.get("recovery_required") else owner.get("operation"))
+        detail = owner.get("operation") if owner and owner.get("lease_active") else None
         rows.append({"id": f"probe:{probe['id']}", "name": probe["name"],
-                     "adapter": adapter_type, "type": "local", "state": "busy" if owner else "available",
+                     "adapter": adapter_type, "type": "local",
+                     "state": owner_state(owner, "available"),
                      "detail": detail})
     for remote in list_remote():
         device_id = f"remote:{remote['url']}"
         owner = lease_owner(f"remote:{remote['url']}")
-        detail = None
-        if owner:
-            detail = (f"recovery required from {owner.get('phase', 'hardware operation')}; "
-                      "run `gwprov device recover`"
-                      if owner.get("recovery_required") else owner.get("operation"))
+        detail = owner.get("operation") if owner and owner.get("lease_active") else None
         rows.append({"id": device_id, "name": remote["name"], "adapter": "gnwmanager WebSocket",
-                     "type": "remote", "state": "busy" if owner else "registered",
+                     "type": "remote", "state": owner_state(owner, "registered"),
                      "url": remote["url"], "origin": remote["origin"],
                      "detail": detail})
     return sorted(rows, key=lambda row: (row["type"], row["name"].casefold(), row["id"]))

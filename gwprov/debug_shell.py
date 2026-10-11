@@ -746,6 +746,7 @@ class DebugSession:
         if transport == "gwemu" and backend is not None:
             backend._control_audit_socket = qmp_socket
         self.symbols = SymbolTable()
+        self.retro_go_version: str | None = None
 
     def halt(self):
         result = self.backend.halt()
@@ -1122,6 +1123,46 @@ class DebugSession:
 
     def read(self, address: int, size: int = 4) -> bytes:
         return self.backend.read_memory(address, size)
+
+    def read_log(self) -> str:
+        """Read Retro-Go's persistent printf buffer without resetting the target."""
+        buffer = [row for row in self.symbols.nm("logbuf") if row["name"] == "logbuf"]
+        index = [row for row in self.symbols.nm("log_idx") if row["name"] == "log_idx"]
+        if buffer and index:
+            address = buffer[-1]["address"]
+            size = buffer[-1]["size"] or 4096
+            index_address = index[-1]["address"]
+        elif buffer or index:
+            raise RuntimeError(
+                "loaded symbols describe only part of the Retro-Go log buffer; "
+                "load the matching firmware ELF")
+        else:
+            import re
+            version = re.search(r"v?(\d+)", self.retro_go_version or "")
+            if version is None:
+                raise RuntimeError(
+                    "Retro-Go log layout is unknown; load matching firmware symbols "
+                    "or identify the installed Retro-Go version")
+            major = int(version.group(1))
+            address, index_address = ((0x30000008, 0x30000004) if major >= 2
+                                     else (0x20000008, 0x20000004))
+            size = 4096
+        cursor = self.u32(index_address)
+        if cursor > size:
+            raise RuntimeError(f"Retro-Go log index {cursor} exceeds buffer size {size}")
+        length = size if cursor == 0 else cursor
+        aligned = address & ~3
+        prefix = address - aligned
+        total = (prefix + length + 3) & ~3
+        data = self.read(aligned, total)[prefix:prefix + length]
+        if cursor == 0:
+            # The linear log buffer resets its cursor to zero on wrap. Match
+            # gnw-web-builder's prefix decoder so stale bytes after the first
+            # NUL are not presented as current diagnostics.
+            data = data.split(b"\0", 1)[0]
+        text = data.decode("latin1")
+        text = __import__("re").sub(r"[^\t\n\x20-\x7e]+", "\n", text)
+        return "\n".join(line.rstrip() for line in text.splitlines() if line.strip()).strip()
 
     def read_value(self, symbol: str, *, max_bytes: int = 65536):
         """Decode a scalar, struct, or fixed array using ELF types and live bytes.
@@ -1793,7 +1834,8 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
                  symbols: list[str] | None = None, openocd_port: int = 6666,
                  probe_ids: list[str] | None = None, programmers: list[str] | None = None,
                  remote_urls: list[str] | None = None, remote_origins: list[str] | None = None,
-                 qmp_socket: str | None = None, debug_config: str | None = None) -> None:
+                 qmp_socket: str | None = None, debug_config: str | None = None,
+                 retro_go_version: str | None = None) -> None:
     """Attach target sessions and expose them together in one Python REPL."""
     backends = {}
     sessions = {}
@@ -1802,8 +1844,24 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
             raise ValueError("probe/programmer selections apply only to hardware targets")
         backends["gwemu"] = GwemuGDBBackend(host=host, port=port)
     elif target == "hardware":
-        from .backends import (AutoOpenOCDBackend, SelectedOpenOCDBackend,
-                               SelectedPyOCDBackend, WebSocketBackend)
+        if not probe_ids and not programmers and not remote_urls:
+            from .active_device import get_active, get_active_origin
+            active = get_active()
+            if not active:
+                raise ValueError(
+                    "no active hardware device; select one with `gwprov set active DEVICE` "
+                    "or pass --probe-id, --programmer, or --remote-url")
+            if active.startswith("probe:"):
+                probe_ids = [active.removeprefix("probe:")]
+            elif active.startswith("remote:"):
+                remote_urls = [active.removeprefix("remote:")]
+                origin = get_active_origin()
+                remote_origins = [origin] if origin else []
+            else:
+                raise ValueError(
+                    f"active device {active!r} is not a physical hardware target")
+        from .backends import (SelectedOpenOCDBackend, SelectedPyOCDBackend,
+                               WebSocketBackend)
         if len(programmers or []) != len(set(programmers or [])):
             raise ValueError("select each OpenOCD programmer type at most once; use --probe-id for probe IDs")
         for programmer in programmers or []:
@@ -1811,7 +1869,9 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
             backends[key] = SelectedOpenOCDBackend(programmer, operation="gwprov debug session")
         for probe_id in probe_ids or []:
             key = f"probe:{probe_id}"
-            backends[key] = SelectedPyOCDBackend(probe_id, operation="gwprov debug session")
+            backends[key] = SelectedPyOCDBackend(probe_id, operation="gwprov debug session",
+                                                  allow_recovery_marker=True,
+                                                  daemon_proxy=True)
         urls = remote_urls or []
         origins = remote_origins or []
         if origins and len(origins) != len(urls):
@@ -1820,20 +1880,59 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
             key = f"remote:{index + 1}"
             origin = origins[index] if origins else None
             backends[key] = WebSocketBackend(remote_url, origin=origin,
-                                             operation="gwprov remote debug session")
+                                             operation="gwprov remote debug session",
+                                             allow_recovery_marker=True,
+                                             daemon_proxy=True)
         if not backends:
-            backends["hardware"] = AutoOpenOCDBackend(
-                port=openocd_port, operation="gwprov debug session")
+            raise ValueError(
+                "select an active device or pass --probe-id, --programmer, or --remote-url")
     else:
         raise ValueError(f"unknown target {target!r}")
 
     try:
         for key, backend in backends.items():
             backend.open()
+            session_symbols = list(symbols or [])
+            session_version = retro_go_version
+            if target == "hardware":
+                try:
+                    from .hw_lifecycle import identify_runtime
+                    import re
+                    if session_version is None:
+                        runtime = identify_runtime(backend, pc_fallback=True)
+                        version_pattern = re.compile(
+                            r"Retro-Go\s+(?:SD\s+)?(v[\w.+-]+)", re.IGNORECASE)
+                        # A dual-boot profile may have different Retro-Go builds
+                        # in bank 1 and bank 2. Prefer the version identified at
+                        # the active VTOR; use installed-bank metadata only when
+                        # it contains one unambiguous Retro-Go version.
+                        active_match = version_pattern.search(runtime.get("application", ""))
+                        if active_match:
+                            session_version = active_match.group(1)
+                        else:
+                            installed_versions = set(version_pattern.findall(
+                                runtime.get("installed", "")))
+                            if len(installed_versions) == 1:
+                                session_version = installed_versions.pop()
+                    if session_version:
+                        from .debug_symbols import retro_go_profile_symbols
+                        matched = retro_go_profile_symbols(session_version)
+                        if matched:
+                            firmware_elf, app_elfs = matched
+                            matched_symbols = [str(firmware_elf), *(str(path) for path in app_elfs)]
+                            missing_symbols = [path for path in matched_symbols
+                                               if path not in session_symbols]
+                            session_symbols.extend(missing_symbols)
+                            if missing_symbols:
+                                print(f"[{key}] detected Retro-Go {session_version}; "
+                                      f"using symbols from profile {firmware_elf.parents[1].name}")
+                except Exception as error:
+                    print(f"[{key}] installed firmware symbol lookup skipped: {error}")
             session = DebugSession(backend, target,
                                    qmp_socket=qmp_socket if target == "gwemu" else None)
+            session.retro_go_version = session_version
             sessions[key] = session
-            for elf in symbols or []:
+            for elf in session_symbols:
                 count = session.symbols.load(elf)
                 print(f"[{key}] loaded {count} symbols: {Path(elf).expanduser()}")
             if debug_config:
@@ -1846,6 +1945,7 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
         print("Use dbg.regs(), dbg.read(address, size), dbg.u32(address), dbg.halt(),")
         print("  dbg.resume(), dbg.step(), dbg.where(), dbg.traceback(), dbg.addr2line(address)")
         print("  dbg.bp(address), dbg.watchpoint(address, size=4, access='read')")
+        print("  dbg.read_log() reads Retro-Go's persistent log buffer without resetting it")
         print("  dbg.inject_return(return_at, value) or dbg.press_button(return_at, mask)")
         if target == "hardware":
             print("  dbg.arm_fault_breakpoints(), dbg.wait_fault() capture Cortex-M faults")

@@ -72,8 +72,8 @@ def inventory() -> list[dict]:
             owner = external
         detail = None
         if owner:
-            detail = (f"interrupted {owner.get('phase', 'hardware operation')}; "
-                      "run `gwprov device recover` when idle"
+            detail = (f"recovery required from {owner.get('phase', 'hardware operation')}; "
+                      "run `gwprov device recover`"
                       if owner.get("recovery_required") else owner.get("operation"))
         rows.append({"id": f"probe:{probe['id']}", "name": probe["name"],
                      "adapter": adapter_type, "type": "local", "state": "busy" if owner else "available",
@@ -83,8 +83,8 @@ def inventory() -> list[dict]:
         owner = lease_owner(f"remote:{remote['url']}")
         detail = None
         if owner:
-            detail = (f"interrupted {owner.get('phase', 'hardware operation')}; "
-                      "run `gwprov device recover` when idle"
+            detail = (f"recovery required from {owner.get('phase', 'hardware operation')}; "
+                      "run `gwprov device recover`"
                       if owner.get("recovery_required") else owner.get("operation"))
         rows.append({"id": device_id, "name": remote["name"], "adapter": "gnwmanager WebSocket",
                      "type": "remote", "state": "busy" if owner else "registered",

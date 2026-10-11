@@ -218,7 +218,8 @@ class Service:
             from .profiles import DeviceProfile
             profile = str(DeviceProfile.load(profile_value).root)
             if any(vm.profile == profile and vm.process.poll() is None for vm in self.vms.values()):
-                raise ValueError(f"profile already has a managed GWemu instance: {profile}")
+                from .profiles import profile_reference
+                raise ValueError(f"profile {profile_reference(profile)} already has a managed GWemu instance")
             cmd, cwd, env, log_path = profile_launch_spec(
                 profile, headless=headless, audio=audio, timeline=message.get("timeline"),
                 record_timeline=message.get("record_timeline"), gdb_port=gdb_port,

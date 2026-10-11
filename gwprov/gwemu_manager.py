@@ -306,7 +306,8 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
     matches = [row for row in instances() if row["profile"] == root]
     if len(matches) != 1:
         if not matches:
-            raise ValueError(f"no GWemu instance is running for profile {root}")
+            from .profiles import profile_reference
+            raise ValueError(f"no GWemu instance is running for profile {profile_reference(root)}")
         raise ValueError(f"profile has {len(matches)} GWemu instances; select one before diagnosing")
     row = matches[0]
     if not row["gdbPort"]:
@@ -984,7 +985,8 @@ def stop_instance(*, pid: int | None = None, profile: str | None = None,
         process.wait(timeout=timeout)
     except psutil.TimeoutExpired as exc:
         raise RuntimeError(f"GWemu pid {row['pid']} did not exit after QMP quit") from exc
-    print(f"Stopped GWemu pid {row['pid']} ({row['profile']}).")
+    from .profiles import profile_reference
+    print(f"Stopped GWemu pid {row['pid']} ({profile_reference(row['profile'])}).")
     return 0
 
 
@@ -1043,7 +1045,8 @@ def start_instance(profile: str, *, audio: bool = False,
     matches = [row for row in instances() if row["profile"] == str(root)]
     if matches:
         row = matches[0]
-        raise ValueError(f"profile already has GWemu pid {row['pid']} ({row['status']}); "
+        from .profiles import profile_reference
+        raise ValueError(f"profile {profile_reference(root)} already has GWemu pid {row['pid']} ({row['status']}); "
                          "use `gwprov gwemu ps` or `gwprov gwemu stop`")
     if qmp_socket:
         raise ValueError("managed GWemu uses QMP over the private GWProv daemon channel; "

@@ -111,23 +111,30 @@ layout. Hardware inspection takes a target lease and fails while another session
 owns the probe. The command does not write flash or halt the target.
 
 Before a hardware flow loads gnwmanager's RAM service, GWProv reads VTOR,
-mailbox status at `0x24025800`, and DHCSR. It follows gnw-web-builder's
-Recovery Mode signals: `IDLE` plus a running core confirms a live idle stub,
-while an SRAM VTOR identifies a stub that is busy or otherwise not confirmed
-idle. A resident stub blocks another implicit reset/load. Once the mailbox is
-idle, run `gwprov device recover` to reset and boot bank 1. GWProv refuses this
-recovery while the mailbox is busy or unreadable.
+mailbox status at `0x24025800`, and DHCSR. Recovery Mode requires VTOR to
+point into the RAM service; `IDLE` plus a
+running core then confirms that it is live and idle. The mailbox can retain a
+stale `IDLE` value while application firmware runs, so it cannot identify the
+stub by itself. A resident stub blocks an implicit reset/load by flows that
+need to start the service. `gwprov apply` can attach to an already-running idle
+stub.
+`gwprov device recover` starts the RAM flasher when absent, or attaches and
+synchronizes its context counter when already live and idle. It restarts an
+idle but halted or terminal-error stub; it refuses a busy or unreadable
+resident service. Recovery leaves the device in Recovery Mode ready for commands.
 The target lease also keeps a durable recovery marker from the moment the RAM
-service is loaded until return to bank 1 is verified. If a process exits in
-between, `gwprov ps` skips target reads and later hardware commands fail closed
-until the explicit recovery succeeds. Recovery is refused during `ERASE`,
-`PROG`, or `HASH`; it is allowed at `IDLE`, after a terminal service error, or
-during `BOOTING` only before VTOR enters the stub's SRAM range.
+service is loaded until return to application firmware is verified. When apply
+leaves the stub running, its recovery marker remains set. If a
+process exits in between, `gwprov ps` skips target reads and later hardware
+commands fail closed until explicit recovery synchronizes with the idle
+flasher. Recovery is refused during `ERASE`, `PROG`, or `HASH`.
 
 Assigning a profile is separate from selecting the active device. `gwprov apply`
 uses the active device's saved assignment: for GWemu it starts the assigned
 profile and replaces the active VM when its profile differs; for hardware it
-deploys the profile's flash regions. A registered SD card can be associated with
+deploys the profile's flash regions and leaves the RAM flasher running. Pass
+`--start` to `gwprov deploy apply PROFILE` to start bank 1 afterward, or add
+`--bank 2` to start bank 2. A registered SD card can be associated with
 hardware so the profile's FAT files are overlaid onto that mounted folder as
 part of apply.
 
@@ -230,8 +237,31 @@ is refused. LittleFS stays at the top of the selected chip. LittleFS defaults to
 expected by the firmware. Profile directories must be new, so creating an instance
 cannot overwrite a previous test session.
 
-A generated profile contains `bank1.bin`, `bank2.bin`, `extflash.bin`, `profile.toml`,
-`provision.json`, and an isolated GWemu configuration. Bank 1 contains the official `sylverb/game-and-watch-bootloader` base-address
+A profile contains the named component blobs and a `flash-map.yaml`. The map is
+the hardware write plan: `bank1` and `bank2` are internal flash, while `bank0`
+is external flash. Each entry has a display `name`, profile-relative `file`, and
+offset within that bank; the blob's file length is the write length. For example:
+
+```yaml
+bank1:
+  - name: Bootloader
+    file: blobs/bootloader.bin
+    offset: 0
+bank2: []
+bank0:
+  - name: Mario Assets
+    file: blobs/mario-assets.bin
+    offset: 0
+    size: 1048576
+    sha256: "<64-character SHA-256 digest>"
+```
+
+Every entry records `size` in bytes and the full SHA-256 digest. Apply checks
+both values against the blob before using the map.
+
+GWemu instances use composed bank images, with `0xFF` in gaps between mapped
+blobs. The profile remains the reusable source; each emulator instance gets its
+own composed and mutable images. Bank 1 contains the official `sylverb/game-and-watch-bootloader` base-address
 release asset, `gnw_bootloader.bin`, padded to the bank size. Version `v1.0.8`
 is the default. `--bootloader-version latest` resolves the current release; an
 explicit tag reuses its cached binary offline. `--bootloader-repo`

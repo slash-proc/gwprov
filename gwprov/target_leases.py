@@ -20,14 +20,13 @@ class DeviceBusyError(RuntimeError):
 
 
 class DeviceRecoveryRequired(DeviceBusyError):
-    """A previous operation left the target in a mode requiring explicit recovery."""
+    """A persistent target-mode marker requires explicit recovery."""
 
     def __init__(self, key: str, owner: dict | None = None):
-        self.key = key
-        self.owner = owner or {}
+        super().__init__(key, owner)
         phase = self.owner.get("phase", "hardware operation")
-        super().__init__(key, {**self.owner,
-                               "operation": f"interrupted {phase}; run `gwprov device recover`"})
+        self.args = (f"target {key!r} is marked for recovery from {phase}; "
+                     "run `gwprov device recover`",)
 
 
 def _lock_dir() -> Path:
@@ -123,13 +122,13 @@ class TargetLease:
     """Exclusive process-shared target lease, held for a backend's lifetime."""
 
     def __init__(self, key: str, operation: str, *, wait: float = 30.0,
-                 allow_recovery: bool = False):
+                 allow_recovery_marker: bool = False):
         if not key:
             raise ValueError("target lease key must not be empty")
         self.key = key
         self.operation = operation
         self.wait = max(0.0, wait)
-        self.allow_recovery = allow_recovery
+        self.allow_recovery_marker = allow_recovery_marker
         self.path = _path_for(key)
         self.fd: int | None = None
         self.daemon_token: str | None = None
@@ -144,7 +143,7 @@ class TargetLease:
         while True:
             if _lock(fd, blocking=False):
                 previous = _read_metadata(fd, self.key)
-                if previous.get("recovery_required") and not self.allow_recovery:
+                if previous.get("recovery_required") and not self.allow_recovery_marker:
                     _unlock(fd)
                     os.close(fd)
                     raise DeviceRecoveryRequired(self.key, previous)

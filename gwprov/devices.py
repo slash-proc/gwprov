@@ -67,9 +67,9 @@ def device_rows(profile: str | None = None) -> list[dict]:
                     detail = ("Target traffic skipped: "
                               f"{owner.get('phase', 'hardware operation')} is in progress")
                 else:
-                    detail = ("Target traffic skipped: the previous session left the "
-                              f"{owner.get('phase', 'hardware operation')} active; "
-                              "run `gwprov device recover` after it is idle")
+                    detail = ("Target traffic skipped: GWProv previously observed "
+                              f"{owner.get('phase', 'hardware operation')} and requires "
+                              "explicit recovery; run `gwprov device recover`")
             else:
                 detail = f"Target traffic skipped: {owner.get('operation', 'another session')} owns it"
             if pid:

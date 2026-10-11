@@ -59,6 +59,19 @@ def resolve_profile_path(profile: str | Path, *, profile_dir: str | Path | None 
     return (profile_directory(profile_dir) / value).resolve()
 
 
+def profile_reference(profile: str | Path, *, profile_dir: str | Path | None = None) -> str:
+    """Show a managed profile by registry name, otherwise show its full path."""
+    root = resolve_profile_path(profile, profile_dir=profile_dir)
+    managed_root = profile_directory(profile_dir)
+    try:
+        relative = root.relative_to(managed_root)
+    except ValueError:
+        return str(root)
+    if len(relative.parts) == 1:
+        return root.name
+    return str(root)
+
+
 def profile_destination(name_or_path: str | Path, *, output_dir: str | Path | None = None) -> Path:
     """Resolve a create destination; --output-dir requires a single profile name."""
     value = os.fspath(name_or_path)

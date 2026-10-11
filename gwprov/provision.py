@@ -2,18 +2,32 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import shutil
 import struct
 import tempfile
 import zlib
 
+import yaml
+
 MIB = 1024 * 1024
 BANK_SIZE = 256 * 1024
+FROGFS_OFFSET = 16 * MIB
+
+
+def _flash_map_entry(name: str, relative_file: str, offset: int, path: Path) -> dict:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return {'name': name, 'file': relative_file, 'offset': offset,
+            'size': path.stat().st_size, 'sha256': digest.hexdigest()}
 
 
 def patch_layout(firmware: bytes, declaration: dict, *, frogfs_length: int,
-                 extflash_size: int, littlefs_length: int) -> bytes:
+                 extflash_size: int, littlefs_length: int,
+                 frogfs_offset: int = 0) -> bytes:
     if declaration != {'magic': 'GWLB', 'version': 2, 'structSize': 36}:
         raise ValueError(f'unsupported firmware layout declaration: {declaration}')
     candidates = [offset for offset in range(0, len(firmware) - 35, 4)
@@ -23,7 +37,7 @@ def patch_layout(firmware: bytes, declaration: dict, *, frogfs_length: int,
     result = bytearray(firmware)
     offset = candidates[0]
     flags = struct.unpack_from('<I', result, offset + 28)[0] | 15
-    struct.pack_into('<6I', result, offset + 8, 0, frogfs_length, extflash_size,
+    struct.pack_into('<6I', result, offset + 8, frogfs_offset, frogfs_length, extflash_size,
                      0, littlefs_length, flags)
     struct.pack_into('<I', result, offset + 32, zlib.crc32(result[offset:offset+32]))
     return bytes(result)
@@ -105,6 +119,15 @@ def create_profile(directory: str | Path, *, content: str | Path,
             instance.mkdir()
             _write_profile_images(instance, source, metadata, bootloader, firmware,
                                   extflash_bytes=total)
+            blobs = instance/'blobs'; blobs.mkdir()
+            (blobs/'bootloader.bin').write_bytes(bootloader)
+            (blobs/'retro-go-firmware.bin').write_bytes(firmware)
+            flash_map={
+                'bank1':[_flash_map_entry('Bootloader','blobs/bootloader.bin',0,blobs/'bootloader.bin')],
+                'bank2':[_flash_map_entry(f"Retro-Go {metadata['firmware'].get('version', '')}".strip(),
+                                          'blobs/retro-go-firmware.bin',0,blobs/'retro-go-firmware.bin')],
+                'bank0':[]}
+            (instance/'flash-map.yaml').write_text(yaml.safe_dump(flash_map,sort_keys=False),encoding='utf-8')
             project_symbols = _copy_project_symbols(source, projects, instance)
             sd_image = instance / 'sdcard.img'
             from .common.sdcard import create_image, push_tree, QemuSDCardManager
@@ -129,6 +152,8 @@ def create_profile(directory: str | Path, *, content: str | Path,
     from .vendor.retrogo_sd.scripts import gen_frogfs_image, gen_littlefs_image
     total = (extflash_mib or 256) * MIB
     littlefs_size = littlefs_mib * MIB
+    if total <= FROGFS_OFFSET + littlefs_size:
+        raise ValueError('extflash must leave space for FrogFS after the 16 MiB stock-assets area and LittleFS')
     with tempfile.TemporaryDirectory(prefix='.gwprov-profile-', dir=root.parent) as tmp:
         work = Path(tmp)
         frogfs_tree = source / 'flash/frogfs'
@@ -138,7 +163,9 @@ def create_profile(directory: str | Path, *, content: str | Path,
         common = ['--retro-go-root', str(work), '--roms-dir', str(work/'no-extra-roms')]
         frog_args = [*common, '--mkfrogfs', str(Path(__file__).parent/'vendor/frogfs/mkfrogfs.py'),
                      '--sd-content', str(frogfs_tree), '--output', str(work/'frogfs.bin'),
-                     '--build-dir', str(work/'frogfs-build'), '--reserve-size', str(total-littlefs_size),
+                     '--build-dir', str(work/'frogfs-build'),
+                     '--extflash-offset', str(FROGFS_OFFSET),
+                     '--reserve-size', str(total-FROGFS_OFFSET-littlefs_size),
                      '--no-gencovers']
         for item in ('bios', 'covers', 'fonts', 'roms'):
             frog_args.extend(['--include', item])
@@ -181,23 +208,29 @@ def create_profile(directory: str | Path, *, content: str | Path,
         if gen_littlefs_image.main(lfs_args):
             raise ValueError('LittleFS build failed')
         frogfs = (work/'frogfs.bin').read_bytes()
-        chip_mib = select_extflash_mib(len(frogfs) + littlefs_size, extflash_mib)
+        chip_mib = select_extflash_mib(FROGFS_OFFSET + len(frogfs) + littlefs_size, extflash_mib)
         total = chip_mib * MIB
-        if len(frogfs) > total-littlefs_size:
-            raise ValueError(f'content needs {len(frogfs)} bytes; only {total-littlefs_size} fit before LittleFS')
+        if FROGFS_OFFSET + len(frogfs) > total-littlefs_size:
+            raise ValueError(f'content needs {FROGFS_OFFSET + len(frogfs)} bytes; only {total-littlefs_size} fit before LittleFS')
         firmware = patch_layout((source/'firmware/intflash.bin').read_bytes(),
                                 metadata['firmware']['superblock'], frogfs_length=len(frogfs),
-                                extflash_size=total, littlefs_length=littlefs_size)
+                                extflash_size=total, littlefs_length=littlefs_size,
+                                frogfs_offset=FROGFS_OFFSET)
         if len(firmware) > BANK_SIZE:
             raise ValueError('firmware is larger than bank 2')
         instance = work/'instance'
         instance.mkdir()
         _write_profile_images(instance, source, metadata, bootloader, firmware)
+        blobs = instance/'blobs'; blobs.mkdir()
+        (blobs/'bootloader.bin').write_bytes(bootloader)
+        (blobs/'retro-go-firmware.bin').write_bytes(firmware)
+        (blobs/'frogfs.bin').write_bytes(frogfs)
+        shutil.copyfile(work/'littlefs.bin', blobs/'littlefs.bin')
         project_symbols = _copy_project_symbols(source, projects, instance)
         with (instance/'extflash.bin').open('wb') as output:
             for _ in range(chip_mib):
                 output.write(b'\xff'*MIB)
-            output.seek(0)
+            output.seek(FROGFS_OFFSET)
             output.write(frogfs)
             output.seek(total-littlefs_size)
             with (work/'littlefs.bin').open('rb') as packed:
@@ -207,9 +240,18 @@ def create_profile(directory: str | Path, *, content: str | Path,
         report = {'firmware': metadata, 'projects': projects,
                   'debugSymbols': 'debug/retro-go-debug.elf' if metadata.get('debugSymbols') else None,
                   'projectSymbols': project_symbols,
-                  'layout': {'extflashBytes': total, 'frogfsBytes': len(frogfs),
+                  'layout': {'extflashBytes': total, 'frogfsOffset': FROGFS_OFFSET,
+                             'frogfsBytes': len(frogfs),
                              'littlefsOffset': total-littlefs_size, 'littlefsBytes': littlefs_size},
                   'boot': 'official bootloader at 0x08000000', 'bootloader': boot_info}
+        flash_map={
+            'bank1':[_flash_map_entry('Bootloader','blobs/bootloader.bin',0,blobs/'bootloader.bin')],
+            'bank2':[_flash_map_entry(f"Retro-Go {metadata['firmware'].get('version', '')}".strip(),
+                                      'blobs/retro-go-firmware.bin',0,blobs/'retro-go-firmware.bin')],
+            'bank0':[
+                _flash_map_entry('Retro-Go FrogFS','blobs/frogfs.bin',FROGFS_OFFSET,blobs/'frogfs.bin'),
+                _flash_map_entry('Retro-Go LittleFS','blobs/littlefs.bin',total-littlefs_size,blobs/'littlefs.bin')]}
+        (instance/'flash-map.yaml').write_text(yaml.safe_dump(flash_map,sort_keys=False),encoding='utf-8')
         (instance/'provision.json').write_text(json.dumps(report,indent=2)+'\n')
         (instance/'gwemu.toml').write_text('[general]\nshow_welcome = false\n')
         instance.rename(root)

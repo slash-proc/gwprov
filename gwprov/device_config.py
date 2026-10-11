@@ -107,12 +107,12 @@ class _MemoryContext:
 
 
 def _layout(profile_value: str):
-    from .profiles import DeviceProfile
+    from .profiles import DeviceProfile, profile_reference
 
     profile = DeviceProfile.load(profile_value)
     metadata_path = profile.root / "provision.json"
     if not metadata_path.is_file():
-        raise ValueError(f"profile has no provision.json layout: {profile.root}")
+        raise ValueError(f"profile {profile_reference(profile.root)} has no provision.json layout")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     layout = metadata.get("layout", {})
     try:
@@ -213,7 +213,8 @@ def _hardware_blob(device_id: str) -> tuple[bytes, str]:
         blob = _read_littlefs(context, size, block_size)
     finally:
         backend.close()
-    return blob, f"hardware mapped flash using profile layout: {profile.root}"
+    from .profiles import profile_reference
+    return blob, f"hardware mapped flash using profile layout: {profile_reference(profile.root)}"
 
 
 def show_device_config(*, output: str = "text") -> int:

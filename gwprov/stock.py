@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import tempfile
 
+import yaml
+
 MIB = 1024 * 1024
 EXPECTED = {
     "mario": ("efa04c387ad7b40549e15799b471a6e1cd234c76", "eea70bb171afece163fb4b293c5364ddb90637ae"),
@@ -42,8 +44,12 @@ def create_stock_profile(directory, *, backup_dirs, locked=False, model="auto", 
     root.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".gwprov-stock-",dir=root.parent) as temporary:
         instance=Path(temporary)/"instance";instance.mkdir()
+        blobs=instance/"blobs";blobs.mkdir()
         (instance/"bank1.bin").write_bytes(internal.ljust(256*1024,b"\xff"))
         (instance/"bank2.bin").write_bytes(b"\xff"*(256*1024))
+        (blobs/"stock-bank1.bin").write_bytes(internal)
+        (blobs/"erased-bank2.bin").write_bytes(b"\xff" * (256*1024))
+        (blobs/"stock-assets.bin").write_bytes(external)
         with (instance/"extflash.bin").open("wb") as output:
             output.write(external)
             remaining=extflash_mib*MIB-len(external)
@@ -56,6 +62,14 @@ def create_stock_profile(directory, *, backup_dirs, locked=False, model="auto", 
                 "internal_sha256":hashlib.sha256(internal).hexdigest(),
                 "external_sha256":hashlib.sha256(external).hexdigest(),
                 "layout":{"extflashBytes":extflash_mib*MIB}}
+        flash_map={
+            "bank1":[{"name":f"Stock {variant.title()}","file":"blobs/stock-bank1.bin","offset":0,
+                       "size":len(internal),"sha256":hashlib.sha256(internal).hexdigest()}],
+            "bank2":[{"name":"Erased (0xFF)","file":"blobs/erased-bank2.bin","offset":0,
+                       "size":256*1024,"sha256":hashlib.sha256(b"\xff"*(256*1024)).hexdigest()}],
+            "bank0":[{"name":f"{variant.title()} Assets","file":"blobs/stock-assets.bin","offset":0,
+                       "size":len(external),"sha256":hashlib.sha256(external).hexdigest()}]}
+        (instance/"flash-map.yaml").write_text(yaml.safe_dump(flash_map,sort_keys=False),encoding="utf-8")
         (instance/"provision.json").write_text(json.dumps(report,indent=2)+"\n")
         instance.rename(root)
     return report

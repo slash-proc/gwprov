@@ -726,21 +726,23 @@ flash profiles write FrogFS and LittleFS at their declared offsets, while stock
 profiles can write the complete extflash backup. SD deployment copies files
 through `gnwmanager` and overlays the existing card contents. Text deployment
 output reports the active phase and per-region progress to stdout; use
-`--output json` when a script needs one clean machine-readable result.
+`-o json` or `-o yaml` when a script needs one clean machine-readable result.
 
 ```sh
-gwprov deploy plan --profile dev-local/profiles/retro-go-demo
-gwprov deploy apply --profile dev-local/profiles/retro-go-demo --probe-id PROBE_ID
+gwprov deploy plan dev-local/profiles/retro-go-demo
+gwprov deploy apply dev-local/profiles/retro-go-demo --probe-id PROBE_ID
 # Or select one OpenOCD adapter explicitly:
-gwprov deploy apply --profile dev-local/profiles/retro-go-demo --programmer stlink
+gwprov deploy apply dev-local/profiles/retro-go-demo --programmer stlink
 # Keep stdout machine-readable when scripting:
-gwprov deploy apply --profile dev-local/profiles/retro-go-demo --probe-id PROBE_ID --output json
+gwprov deploy apply dev-local/profiles/retro-go-demo --probe-id PROBE_ID -o json
 ```
 
 Apply defaults to all regions present in the profile. Text output shows live
-region and byte progress on stdout while it enters gnwmanager's RAM programmer,
-writes and verifies each selected region, then starts the bank-1 vector. Use
-`--region bank1` or `--region bank2` to select an individual internal bank;
+region and byte progress on stdout while it enters gnwmanager's RAM programmer
+and writes and verifies each selected region. It leaves the RAM flasher running
+by default. Pass `--start` to start firmware afterward, using bank 1 by default
+or `--bank 2` to start bank 2. Use `--region bank1` or `--region bank2` to
+select an individual internal bank;
 repeat `--region` for exact plans. `--output json` emits only the final structured
 result for scripts. A remote server is
 selected with `--remote-url ws[s]://host:port/gdb`; `--remote-origin` supplies its
@@ -748,26 +750,31 @@ allowed origin when configured. SD deployment is an overlay and does not delete
 files omitted from the profile.
 
 Before starting that RAM programmer, GWProv passively checks VTOR, the
-gnwmanager mailbox status, and DHCSR. This follows the web-builder's Recovery
-Mode heuristic: an idle mailbox alone can be stale, so a live idle stub also
-requires the CPU to be running; a non-idle stub is recognized by its SRAM VTOR.
-If the RAM service is already resident, GWProv stops before resetting or
-replacing it. GWProv also persists a recovery marker in the target lease before
-loading the service. If a command exits before verified return to bank 1,
-`gwprov ps` reports the device busy and skips all target traffic; new hardware
-commands are blocked until recovery. Successful deployments boot bank 1 and
-clear the marker. For an interrupted operation, recover after the mailbox
-reports `IDLE` (or a terminal error):
+gnwmanager mailbox status, and DHCSR. VTOR must point into the RAM stub image;
+the mailbox can retain a stale `IDLE` value while application firmware runs.
+An idle mailbox and running core confirm the stub is live only after VTOR has
+identified it.
+If the RAM service is already resident and idle, `apply` attaches to it and
+synchronizes its mailbox counter before sending work. A resident service that
+is busy or cannot be confirmed idle is left alone. GWProv persists a recovery
+marker in the target lease while using the service. If a command exits before
+verified return to application firmware, `gwprov ps` skips target traffic and
+later hardware operations must recover the marker. Starting a bank after
+deployment clears it once application firmware is verified; without `--start`,
+the RAM flasher remains available and the marker stays set. The
+`gwprov device recover` command starts the RAM flasher if needed or attaches to
+a live idle stub and synchronizes its mailbox counter. It leaves the device
+in Recovery Mode ready for commands; it does not boot bank 1:
 
 ```sh
 gwprov device recover
 ```
 
-That command requires the active hardware device. It resets into bank 1 and
-verifies the CPU left the stub. If the mailbox reports active `ERASE`, `PROG`,
-or `HASH`, or its state cannot be read, GWProv refuses recovery so an active
-flash operation is not interrupted. A stub still in `BOOTING` is recoverable
-only when VTOR has not moved into the stub's SRAM range yet.
+That command requires the active hardware device. If no flasher is running,
+GWProv starts it and waits for IDLE. If it is already live and idle, GWProv
+attaches and synchronizes the mailbox context counter. An idle but halted or
+terminal-error stub is restarted; a busy or unreadable resident flasher is
+left alone.
 
 ## Local and remote device sessions
 

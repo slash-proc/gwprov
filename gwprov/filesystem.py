@@ -425,7 +425,8 @@ def operate(*, operation: str, target: str, profile: str | None = None,
                 device.bank2.write_bytes(old_bank)
                 if old_metadata is not None: metadata_path.write_bytes(old_metadata)
                 raise
-            print(f"Rebuilt FrogFS ({new_size} bytes) in profile {device.root}")
+            from .profiles import profile_reference
+            print(f"Rebuilt FrogFS ({new_size} bytes) in profile {profile_reference(device.root)}")
             return 0
     if kind == "littlefs":
         if size is None or size <= 0: raise ValueError("LittleFS operations require a positive --size")

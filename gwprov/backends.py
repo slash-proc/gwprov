@@ -20,7 +20,7 @@ class SelectedPyOCDBackend(OCDBackend):
 
     def __init__(self, unique_id: str, *, frequency: int | None = None,
                  operation: str = "GWProv hardware session", lease_wait: float = 30.0,
-                 probe_adapter: str | None = None, allow_recovery: bool = False):
+                 probe_adapter: str | None = None, allow_recovery_marker: bool = False):
         super().__init__()
         if not unique_id:
             raise ValueError("probe unique ID must not be empty")
@@ -45,7 +45,7 @@ class SelectedPyOCDBackend(OCDBackend):
         self._session_options = options
         self.session = None
         self._lease = TargetLease(f"probe:{unique_id}", operation, wait=lease_wait,
-                                  allow_recovery=allow_recovery)
+                                  allow_recovery_marker=allow_recovery_marker)
         self._opened = False
         self._frequency_override = frequency or 0
         self.version = tuple(int(x) for x in pyocd.__version__.split("."))
@@ -162,7 +162,7 @@ class WebSocketBackend(OCDBackend):
 
     def __init__(self, uri: str, *, frequency: int | None = None, timeout: float = 10.0,
                  origin: str | None = None, operation: str = "GWProv remote session",
-                 lease_wait: float = 30.0, allow_recovery: bool = False):
+                 lease_wait: float = 30.0, allow_recovery_marker: bool = False):
         super().__init__()
         parsed = urlparse(uri)
         if parsed.scheme not in {"ws", "wss"} or not parsed.netloc or parsed.path != "/gdb":
@@ -176,7 +176,7 @@ class WebSocketBackend(OCDBackend):
         self._backend_name = "gnwmanager remote"
         self.version = (0, 0, 0)
         self._lease = TargetLease(f"remote:{uri}", operation, wait=lease_wait,
-                                  allow_recovery=allow_recovery)
+                                  allow_recovery_marker=allow_recovery_marker)
 
     @property
     def probe_name(self) -> str:
@@ -314,7 +314,8 @@ class SelectedOpenOCDBackend(OpenOCDBackend):
     ADAPTERS = ("stlink", "jlink", "cmsis-dap", "rpi-gpio")
 
     def __init__(self, adapter: str, *, port: int | None = None,
-                 operation: str = "GWProv OpenOCD session", lease_wait: float = 30.0):
+                 operation: str = "GWProv OpenOCD session", lease_wait: float = 30.0,
+                 allow_recovery_marker: bool = False):
         if adapter not in self.ADAPTERS:
             raise ValueError(f"unsupported OpenOCD adapter {adapter!r}; choose {', '.join(self.ADAPTERS)}")
         if port is None:
@@ -324,8 +325,10 @@ class SelectedOpenOCDBackend(OpenOCDBackend):
         super().__init__(port=port)
         self.adapter = adapter
         self._connected = False
-        self._lease = TargetLease(f"adapter:{adapter}", operation, wait=lease_wait)
+        self._lease = TargetLease(f"adapter:{adapter}", operation, wait=lease_wait,
+                                  allow_recovery_marker=allow_recovery_marker)
         self._probe_leases = []
+        self._allow_recovery_marker = allow_recovery_marker
 
     def open(self):
         from collections import deque
@@ -353,7 +356,8 @@ class SelectedOpenOCDBackend(OpenOCDBackend):
         try:
             for probe in sorted(matching_probes, key=lambda row: row["id"]):
                 lease = TargetLease(f"probe:{probe['id']}", self._lease.operation,
-                                    wait=self._lease.wait)
+                                    wait=self._lease.wait,
+                                    allow_recovery_marker=self._allow_recovery_marker)
                 lease.acquire()
                 self._probe_leases.append(lease)
             self._lease.acquire()
@@ -429,10 +433,12 @@ class AutoOpenOCDBackend(OCDBackend):
 
     ADAPTERS = SelectedOpenOCDBackend.ADAPTERS
 
-    def __init__(self, *, operation: str = "GWProv OpenOCD session", port: int | None = None):
+    def __init__(self, *, operation: str = "GWProv OpenOCD session", port: int | None = None,
+                 allow_recovery_marker: bool = False):
         super().__init__()
         self.operation = operation
         self.port = port
+        self.allow_recovery_marker = allow_recovery_marker
         self.backend = None
         self.version = (0, 0, 0)
 
@@ -440,7 +446,8 @@ class AutoOpenOCDBackend(OCDBackend):
         failures = []
         for adapter in self.ADAPTERS:
             backend = SelectedOpenOCDBackend(adapter, port=self.port,
-                                             operation=self.operation, lease_wait=0)
+                                             operation=self.operation, lease_wait=0,
+                                             allow_recovery_marker=self.allow_recovery_marker)
             try:
                 backend.open()
             except Exception as error:

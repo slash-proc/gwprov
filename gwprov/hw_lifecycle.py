@@ -1,6 +1,8 @@
 """Safe hardware lifecycle checks shared by destructive GWProv operations."""
 from __future__ import annotations
 
+import time
+
 RAM_STUB_START = 0x24000000
 RAM_STUB_END = 0x24100000
 MAILBOX_STATUS = 0x24025800
@@ -8,6 +10,7 @@ VTOR = 0xE000ED08
 DHCSR = 0xE000EDF0
 STATUS_IDLE = 0xCAFE0000
 S_HALT = 1 << 17
+GNWMANAGER_CONTEXT_COUNTER = 0x20000054
 
 
 class TargetModeError(RuntimeError):
@@ -17,17 +20,21 @@ class TargetModeError(RuntimeError):
 def inspect_target_mode(backend) -> dict:
     """Passively classify the RAM stub using the web-builder's live checks.
 
-    VTOR identifies code executing from the SRAM window.  The mailbox IDLE
-    value plus DHCSR.S_HALT clear is the stronger live-stub witness used by
-    gnw-web-builder; the mailbox alone is stale after a reset or halt.
+    VTOR identifies code executing from the SRAM window. The mailbox IDLE
+    value and DHCSR.S_HALT clear only confirm liveness after VTOR identifies
+    the RAM service; the mailbox alone is stale after a reset or halt.
     """
     vtor = int(backend.read_uint32(VTOR)) & 0xFFFFFFFF
     dhcsr = int(backend.read_uint32(DHCSR)) & 0xFFFFFFFF
     status = int(backend.read_uint32(MAILBOX_STATUS)) & 0xFFFFFFFF
     stub_resident = RAM_STUB_START <= vtor < RAM_STUB_END
     halted = bool(dhcsr & S_HALT)
-    alive = status == STATUS_IDLE and not halted
-    detected = stub_resident or alive
+    # The mailbox is retained across resets. IDLE plus a running core is not
+    # sufficient on its own: application firmware can be running with a stale
+    # IDLE mailbox, which would make us attach to the app and claim recovery
+    # succeeded. Require the vector table to identify the RAM service too.
+    alive = stub_resident and status == STATUS_IDLE and not halted
+    detected = stub_resident
     return {"mode": "gnwmanager-recovery" if detected else "application",
             "stubResident": stub_resident, "stubAlive": alive,
             "stubDetected": detected,
@@ -52,7 +59,7 @@ def assert_application_mode(backend, *, operation: str) -> dict:
             f"Cannot {operation}: gnwmanager Recovery Mode is {state_label} "
             f"(VTOR 0x{state['vtor']:08x}). GWProv will not reset or replace "
             "the RAM service implicitly. When its status is IDLE, run "
-            "`gwprov device recover` to boot bank 1, then retry."
+            "`gwprov device recover` to synchronize with the flasher, then retry."
         )
     return state
 
@@ -75,35 +82,74 @@ def clear_backend_recovery_required(backend) -> None:
             lease.clear_recovery_required()
 
 
-def recover_to_bank1(backend) -> dict:
-    """Explicitly leave a quiescent RAM recovery stub and boot internal bank 1."""
+def attach_to_idle_gnwmanager(backend, gnw, *, timeout: float = 5.0) -> int:
+    """Synchronize a host GnW client with an already-running idle RAM service.
+
+    The service's context counter is firmware state, not host state. Reusing a
+    live stub with a fresh GnW instance requires adopting that counter before
+    posting mailbox work, as gnw-web-builder does when attaching its flasher.
+    """
+    ready_addresses = [int(context["ready"].address) for context in gnw.contexts]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status_before = backend.read_uint32(MAILBOX_STATUS) & 0xFFFFFFFF
+        ready_before = [backend.read_uint32(addr) & 0xFFFFFFFF for addr in ready_addresses]
+        upload_before = gnw.read_uint32("upload_in_progress") & 0xFFFFFFFF
+        download_before = gnw.read_uint32("download_in_progress") & 0xFFFFFFFF
+        if (status_before == STATUS_IDLE and ready_before == [0, 0]
+                and upload_before == 0 and download_before == 0):
+            counter = backend.read_uint32(GNWMANAGER_CONTEXT_COUNTER) & 0xFFFFFFFF
+            status_after = backend.read_uint32(MAILBOX_STATUS) & 0xFFFFFFFF
+            ready_after = [backend.read_uint32(addr) & 0xFFFFFFFF for addr in ready_addresses]
+            upload_after = gnw.read_uint32("upload_in_progress") & 0xFFFFFFFF
+            download_after = gnw.read_uint32("download_in_progress") & 0xFFFFFFFF
+            counter_after = backend.read_uint32(GNWMANAGER_CONTEXT_COUNTER) & 0xFFFFFFFF
+            if (status_after == STATUS_IDLE and ready_after == [0, 0]
+                    and upload_after == 0 and download_after == 0
+                    and counter != 0 and counter_after == counter):
+                gnw.context_counter = counter
+                gnw._gnwmanager_started = True
+                return counter
+        time.sleep(0.02)
+    raise TargetModeError(
+        "Cannot attach to the running gnwmanager RAM service: its mailbox did not "
+        "reach a stable, idle state. No flash commands were sent."
+    )
+
+
+def recover_flasher(backend, gnw=None) -> dict:
+    """Start or synchronize with the RAM flasher, leaving it ready for commands."""
+    if gnw is None:
+        from gnwmanager.gnw import GnW
+        gnw = GnW(backend)
+
     state = inspect_target_mode(backend)
-    status = state["status"]
-    terminal_error = (status & 0xFFFF0000) == 0xBAD00000
-    safe_to_reset = (status == STATUS_IDLE or terminal_error or
-                     (status == 0 and not state["stubResident"]))
-    if not safe_to_reset:
+    if state["stubAlive"]:
+        counter = attach_to_idle_gnwmanager(backend, gnw)
+        mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
+        return {**state, "contextCounter": counter, "started": False}
+    terminal_error = (state["status"] & 0xFFFF0000) == 0xBAD00000
+    recoverable_resident_stub = (state["stubResident"] and
+                                 state["status"] == STATUS_IDLE and state["halted"])
+    if state["stubDetected"] and not (terminal_error or recoverable_resident_stub):
         raise TargetModeError(
-            "Recovery refused: the device is not in a confirmed quiescent gnwmanager "
-            f"Recovery Mode (VTOR 0x{state['vtor']:08x}, status "
-            f"0x{state['status']:08x}, "
+            "Recovery refused: gnwmanager is resident but not confirmed live and idle "
+            f"(VTOR 0x{state['vtor']:08x}, status 0x{state['status']:08x}, "
             f"{'halted' if state['halted'] else 'running'}). "
-            "Wait for an active ERASE/PROG/HASH operation to finish; if the "
-            "state cannot be read, restore the device connection before retrying."
+            "Wait for any active operation to finish; do not reset a busy or halted flasher."
         )
-    backend.reset_and_halt()
-    msp = backend.read_uint32(0x08000000)
-    pc = backend.read_uint32(0x08000004)
-    backend.write_register("msp", msp)
-    backend.write_register("pc", pc)
-    backend.resume()
-    after = inspect_target_mode(backend)
-    pc_after = int(backend.read_register("pc")) & ~1
-    if after["halted"] or after["stubResident"] or RAM_STUB_START <= pc_after < RAM_STUB_END:
+    if not state["stubDetected"]:
+        assert_application_mode(backend, operation="start the recovery flasher")
+    mark_backend_recovery_required(backend, "starting recovery flasher")
+    gnw.start_gnwmanager(force=bool(state["stubDetected"]))
+    state = inspect_target_mode(backend)
+    if not state["stubAlive"]:
         raise TargetModeError(
-            "Bank 1 was selected but the CPU did not leave Recovery Mode; "
-            "check `gwprov ps` before issuing another hardware command."
+            "Recovery failed: gnwmanager did not reach live IDLE after startup "
+            f"(VTOR 0x{state['vtor']:08x}, status 0x{state['status']:08x})."
         )
-    clear_backend_recovery_required(backend)
-    return {"msp": msp, "pc": pc, "pcAfter": pc_after, **after}
+    counter = attach_to_idle_gnwmanager(backend, gnw)
+    mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
+    state = inspect_target_mode(backend)
+    return {**state, "contextCounter": counter, "started": True}
 

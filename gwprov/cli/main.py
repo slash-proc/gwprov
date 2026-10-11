@@ -126,9 +126,10 @@ def _project_stage_local(args) -> int:
 
 
 def _profile_create(args) -> int:
-    from gwprov.profiles import profile_destination
+    from gwprov.profiles import profile_destination, profile_reference
 
     destination = profile_destination(args.directory, output_dir=args.output_dir)
+    destination_label = profile_reference(destination, profile_dir=args.output_dir)
     if args.stock:
         if not args.backup_dir:
             raise ValueError("--stock requires at least one --backup-dir")
@@ -136,7 +137,7 @@ def _profile_create(args) -> int:
         result = create_stock_profile(destination, backup_dirs=args.backup_dir,
                                       locked=args.locked, model=args.model or "auto",
                                       extflash_mib=args.extflash_mib or 64)
-        print(f"Created stock {result['model']} profile: {destination}; locked={result['locked']}")
+        print(f"Created stock {result['model']} profile: {destination_label}; locked={result['locked']}")
         return 0
     if not args.content:
         raise ValueError("profile create requires --content, or use --stock with --backup-dir")
@@ -150,18 +151,18 @@ def _profile_create(args) -> int:
                             bootloader_version=args.bootloader_version,
                             bootloader_file=args.bootloader_file)
     if report.get('variant') == 'sd':
-        print(f"Created {destination}: SD image {report['layout']['sdImageBytes']} bytes; "
+        print(f"Created {destination_label}: SD image {report['layout']['sdImageBytes']} bytes; "
               f"{report['layout']['extflashBytes'] // (1024 * 1024)} MiB extflash")
     else:
-        print(f"Created {destination}: FrogFS {report['layout']['frogfsBytes']} bytes; "
+        print(f"Created {destination_label}: FrogFS {report['layout']['frogfsBytes']} bytes; "
               f"LittleFS {report['layout']['littlefsBytes']} bytes; "
               f"{report['layout']['extflashBytes'] // (1024 * 1024)} MiB extflash")
-    print(f"Boot with: gwprov gwemu run --profile {destination}")
+    print(f"Boot with: gwprov gwemu run --profile {destination_label}")
     return 0
 
 
 def _profile_duplicate(args) -> int:
-    from gwprov.profiles import duplicate_profile
+    from gwprov.profiles import duplicate_profile, profile_reference
 
     result = duplicate_profile(args.source, args.destination, output_dir=args.output_dir)
     if args.output == "json":
@@ -169,10 +170,11 @@ def _profile_duplicate(args) -> int:
     else:
         console = Console()
         console.print("[bold green]Profile duplicated[/]")
-        console.print(f"  [dim]From[/]  {result['source']}")
-        console.print(f"  [dim]To[/]    [bold cyan]{result['destination']}[/]")
+        console.print(f"  [dim]From[/]  {profile_reference(result['source'])}")
+        destination = profile_reference(result['destination'], profile_dir=args.output_dir)
+        console.print(f"  [dim]To[/]    [bold cyan]{destination}[/]")
         console.print(f"  [dim]Files[/] {result['files']}")
-        console.print(f"\nRun it with [bold]gwprov gwemu run --profile {result['destination']}[/]")
+        console.print(f"\nRun it with [bold]gwprov gwemu run --profile {destination}[/]")
     return 0
 
 
@@ -455,24 +457,26 @@ def _device_recover(args) -> int:
         from gwprov.backends import SelectedPyOCDBackend
         backend = SelectedPyOCDBackend(device_id.removeprefix("probe:"),
                                        operation="gwprov device recover", lease_wait=0,
-                                       allow_recovery=True)
+                                       allow_recovery_marker=True)
     elif device_id.startswith("remote:"):
         from gwprov.backends import WebSocketBackend
         backend = WebSocketBackend(device_id.removeprefix("remote:"),
                                    origin=get_active_origin(),
                                    operation="gwprov device recover", lease_wait=0,
-                                   allow_recovery=True)
+                                   allow_recovery_marker=True)
     else:
         raise ValueError("device recover requires an active physical device")
 
-    from gwprov.hw_lifecycle import recover_to_bank1
+    from gwprov.hw_lifecycle import recover_flasher
     try:
         backend.open()
-        state = recover_to_bank1(backend)
+        from gnwmanager.gnw import GnW
+        state = recover_flasher(backend, GnW(backend))
     finally:
         backend.close()
-    print("Device recovered: bank 1 is running")
-    print(f"  PC: 0x{state['pc']:08x}  VTOR: 0x{state['vtor']:08x}")
+    action = "started" if state["started"] else "attached to"
+    print(f"Recovery flasher {action}; ready for commands")
+    print(f"  Context: {state['contextCounter']}  VTOR: 0x{state['vtor']:08x}")
     return 0
 
 
@@ -583,10 +587,11 @@ def _sdcard(args) -> int:
 
 def _apply_assigned(args) -> int:
     output = getattr(args, "output", "text")
+    assume_yes = bool(getattr(args, "yes", False))
     from gwprov.active_device import get_active, get_active_origin, set_active
     from gwprov.device_assignments import get_assignment, set_assignment
     from gwprov.devices import device_rows
-    from gwprov.profiles import DeviceProfile
+    from gwprov.profiles import DeviceProfile, profile_reference
 
     device_id = get_active()
     if not device_id:
@@ -602,18 +607,25 @@ def _apply_assigned(args) -> int:
         raise ValueError(f"active device {device_id} is no longer available")
 
     if row["kind"] == "gwemu":
+        if args.start:
+            raise ValueError("--start and --bank apply only to hardware deployments")
         from gwprov.gwemu_manager import stop_instance
         from gwprov.daemon import start_instance
         current_profile = row.get("profile")
         if current_profile == str(profile.root) and not assignment.get("sdcard"):
-            if output == "json":
-                print(json.dumps({"device": device_id, "profile": str(profile.root),
-                                  "status": "already-applied"}, indent=2))
+            if output in {"json", "yaml"}:
+                _print_structured({"device": device_id, "profile": str(profile.root),
+                                   "status": "already-applied"}, output)
             else:
-                print(f"GWemu pid {row['pid']} already uses profile {profile.root}.")
+                print(f"GWemu pid {row['pid']} already uses profile {profile_reference(profile.root)}.")
             return 0
         if row.get("status") == "unknown":
             raise ValueError("cannot apply to a GWemu instance with unknown execution state; inspect `gwprov ps`")
+        _confirm_apply(args, assume_yes, [
+            f"Profile: {profile_reference(profile.root)}",
+            f"Target: GWemu pid {row['pid']} ({row.get('status', 'unknown')})",
+            "Action: launch or select the profile instance, then stop the currently selected instance",
+        ])
         old_id = device_id
         from gwprov.gwemu_manager import instances
         matches = [item for item in instances()
@@ -639,11 +651,11 @@ def _apply_assigned(args) -> int:
         if assignment.get("sdcard"):
             set_assignment(new_id, "sdcard", assignment["sdcard"])
         set_active(new_id)
-        if output == "json":
-            print(json.dumps({"device": new_id, "profile": str(profile.root),
-                              "status": "applied"}, indent=2))
+        if output in {"json", "yaml"}:
+            _print_structured({"device": new_id, "profile": str(profile.root),
+                               "status": "applied"}, output)
         else:
-            print(f"Applied profile {profile.root} to GWemu; active device is {new_id}.")
+            print(f"Applied profile {profile_reference(profile.root)} to GWemu; active device is {new_id}.")
         return 0
 
     target = {}
@@ -658,22 +670,46 @@ def _apply_assigned(args) -> int:
     regions = None
     sd_written = None
     card_name = assignment.get("sdcard")
+    card = None
     if card_name and profile.resolved_sd:
         from gwprov.sd_cards import list_cards
         card = next((item for item in list_cards()
                      if item["name"].casefold() == card_name.casefold()), None)
         if card is None:
             raise ValueError(f"assigned SD card {card_name!r} is no longer registered")
-        from gwprov.deploy import deployment_plan, overlay_sd_directory
-        planned_regions = deployment_plan(str(profile.root))["regions"]
+        from gwprov.deploy import deployment_plan
+        write_plan = deployment_plan(str(profile.root))
+        planned_regions = write_plan["regions"]
         regions = [item["region"] for item in planned_regions if item["region"] != "sd"]
+    else:
+        from gwprov.deploy import deployment_plan
+        write_plan = deployment_plan(str(profile.root))
+        planned_regions = write_plan["regions"]
+        regions = [item["region"] for item in planned_regions]
+    if args.start and not regions:
+        raise ValueError("--start requires at least one hardware flash region in the profile")
+    from gwprov.deploy import deployment_write_summary
+    hardware_plan = {**write_plan,
+                     "regions": [item for item in planned_regions if item["region"] in regions]}
+    write_rows = deployment_write_summary(str(profile.root), hardware_plan)
+    operation = [
+        f"Profile: {profile_reference(profile.root)}",
+        f"Target: Hardware · {device_id}",
+        (f"After writing: start bank {args.bank} reset vector" if args.start
+         else "After writing: leave the RAM flasher running"),
+    ]
+    if card is not None:
+        operation.append(f"SD card: {card['name']} · {card['path']} (existing files are retained; matching files are replaced)")
+    _confirm_apply(args, assume_yes, operation, writes=write_rows)
+    if card is not None:
+        from gwprov.deploy import overlay_sd_directory
         sd_written = overlay_sd_directory(profile.resolved_sd, Path(card["path"]))
     if regions == []:
         result = {"profile": str(profile.root), "written": [
             {"region": "sd", "files": sd_written, "mode": "mounted-folder-overlay"}
         ]}
-        if output == "json":
-            print(json.dumps(result, indent=2))
+        if output in {"json", "yaml"}:
+            _print_structured(result, output)
         else:
             print(f"Updated SD card with {sd_written} file(s).", flush=True)
         return 0
@@ -681,6 +717,7 @@ def _apply_assigned(args) -> int:
     callback, finish = _deployment_progress_display(output)
     try:
         result = apply_deployment(str(profile.root), regions=regions,
+                                  start=args.start, bank=args.bank,
                                   progress=callback, **target)
     finally:
         if finish:
@@ -688,13 +725,83 @@ def _apply_assigned(args) -> int:
     if sd_written is not None:
         result["written"].append({"region": "sd", "files": sd_written,
                                   "mode": "mounted-folder-overlay"})
-    if output == "json":
-        print(json.dumps(result, indent=2))
+    if output in {"json", "yaml"}:
+        _print_structured(result, output)
     return 0
 
 
 def _apply_parser(args) -> int:
     return _apply_assigned(args)
+
+
+def _confirm_apply(args, assume_yes: bool, details: list[str], *, writes=None) -> None:
+    """Require an explicit go-ahead before apply changes a device or files."""
+    if assume_yes:
+        return
+    from rich.prompt import Confirm
+
+    console = Console(file=sys.stderr, force_terminal=sys.stderr.isatty())
+    console.print(_apply_plan_renderable(details, writes or [], console.width))
+    if not sys.stdin.isatty():
+        raise ValueError("confirmation needs an interactive terminal; rerun with `gwprov apply --yes`")
+    try:
+        accepted = Confirm.ask("Continue?", default=False, console=console)
+    except EOFError as exc:
+        raise ValueError("apply was not confirmed; rerun with `gwprov apply --yes` to skip the prompt") from exc
+    if not accepted:
+        raise ValueError("apply cancelled")
+
+
+def _apply_plan_renderable(details: list[str], writes: list[dict], width: int):
+    from rich import box
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    summary = []
+    for detail in details:
+        label, separator, value = detail.partition(": ")
+        text = Text()
+        if separator:
+            text.append(f"{label:<10} ", style="dim")
+            text.append(value)
+        else:
+            text.append(detail)
+        summary.append(text)
+    renderables = list(summary)
+    if writes:
+        if width >= 92:
+            table = Table(box=box.SIMPLE, expand=True, padding=(0, 1),
+                          show_header=True, header_style="bold")
+            table.add_column("FLASH TARGET", style="bright_cyan", overflow="fold")
+            table.add_column("IMAGE", overflow="fold")
+            table.add_column("SIZE", justify="right", no_wrap=True)
+            for row in writes:
+                table.add_row(Text(str(row["target"])), Text(str(row["content"])),
+                              _human_size(row["bytes"]) if row["bytes"] is not None else "device read")
+        else:
+            table = Text()
+            for index, row in enumerate(writes):
+                if index:
+                    table.append("\n")
+                table.append(str(row["target"]), style="bold bright_cyan")
+                table.append("\n  ")
+                table.append(str(row["content"]))
+                table.append(" · ")
+                table.append(_human_size(row["bytes"]) if row["bytes"] is not None else "device read",
+                             style="dim")
+        renderables.extend([Text("Planned writes", style="bold"), table])
+    return Panel(Group(*renderables), title="Apply plan", border_style="bright_cyan",
+                 box=box.ROUNDED, expand=True)
+
+
+def _human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("bytes", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{int(value)} {unit}" if unit == "bytes" else f"{value:.1f} {unit}".replace(".0 ", " ")
+        value /= 1024
 
 
 def _resource_view(section: str, args) -> int:
@@ -911,22 +1018,40 @@ def _show(args) -> int:
 def _deploy_plan(args) -> int:
     from gwprov.deploy import deployment_plan
     plan = deployment_plan(args.profile, args.region)
-    if args.output == "json":
-        print(json.dumps(plan, indent=2))
+    if args.output in {"json", "yaml"}:
+        _print_structured(plan, args.output)
     else:
-        print(f"Deployment plan: {plan['profile']}")
+        from gwprov.profiles import profile_reference
+        print(f"Deployment plan: {profile_reference(plan['profile'])}")
         for row in plan["regions"]:
             destination = f"bank {row['bank']}+0x{row['offset']:x}" if "bank" in row else f"offset 0x{row['offset']:x}"
             print(f"  {row['region']:<10} {row['bytes']:>10} bytes  {destination}  sha256={row['sha256']}")
-        print("Boot after deployment: bank 1 reset vector")
+        print("Apply leaves the RAM flasher running unless --start is given.")
+        print("Use --start --bank 1 (default) or --start --bank 2 to run a bank after writing.")
         print("SD deployment overlays files and retains existing files.")
     return 0
 
 
+def _print_structured(value, output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(value, indent=2))
+    elif output_format == "yaml":
+        import yaml
+        print(yaml.safe_dump(value, sort_keys=False), end="")
+    else:
+        raise ValueError(f"unsupported structured output format: {output_format}")
+
+
 def _deployment_progress_display(output: str):
-    """Return a stdout callback for readable deployment progress."""
-    if output == "json":
-        return None, None
+    """Keep live diagnostics off stdout when a structured result is requested."""
+    if output in {"json", "yaml"}:
+        diagnostic = Console(file=sys.stderr, force_terminal=sys.stderr.isatty())
+
+        def report_json_progress(event: dict) -> None:
+            if event["event"] == "device_extflash":
+                diagnostic.print(_device_extflash_renderable(event["summary"], diagnostic.width))
+
+        return report_json_progress, None
     from rich.progress import (BarColumn, DownloadColumn, Progress, TaskProgressColumn,
                                TextColumn, TimeElapsedColumn)
     console = Console(file=sys.stdout, force_terminal=sys.stdout.isatty())
@@ -941,7 +1066,13 @@ def _deployment_progress_display(output: str):
             nonlocal task_id
             kind = event["event"]
             if kind == "start":
-                task_id = progress.add_task("Preparing deployment", total=event["total_bytes"])
+                if task_id is None:
+                    task_id = progress.add_task("Preparing deployment", total=event["total_bytes"])
+                else:
+                    progress.update(task_id, total=event["total_bytes"], completed=0,
+                                    description="Preparing deployment")
+            elif kind == "device_extflash":
+                progress.console.print(_device_extflash_renderable(event["summary"], console.width))
             elif kind == "phase" and task_id is not None:
                 progress.update(task_id, description=event["message"])
             elif kind == "region_start" and task_id is not None:
@@ -950,7 +1081,8 @@ def _deployment_progress_display(output: str):
                 progress.update(task_id, completed=event["overall_done"])
             elif kind == "complete" and task_id is not None:
                 progress.update(task_id, completed=event["overall_total"],
-                                description="Deployment complete")
+                                description=(f"Started {event['booted']}" if event.get("booted")
+                                             else "RAM flasher ready"))
 
         def finish() -> None:
             progress.stop()
@@ -964,6 +1096,8 @@ def _deployment_progress_display(output: str):
         if kind == "start":
             print(f"Preparing deployment ({event['region_count']} regions, "
                   f"{event['total_bytes'] / (1024 * 1024):.1f} MiB).", flush=True)
+        elif kind == "device_extflash":
+            console.print(_device_extflash_renderable(event["summary"], console.width))
         elif kind == "phase":
             print(f"{event['message']}…", flush=True)
         elif kind == "region_start":
@@ -980,9 +1114,46 @@ def _deployment_progress_display(output: str):
         elif kind == "region_complete":
             print(f"  {event['region']}: complete.", flush=True)
         elif kind == "complete":
-            print("Deployment complete; booted bank 1.", flush=True)
+            if event.get("booted"):
+                print(f"Deployment complete; started {event['booted']}.", flush=True)
+            else:
+                print("Deployment complete; RAM flasher remains running.", flush=True)
 
     return update, None
+
+
+def _device_extflash_renderable(summary: dict, width: int):
+    from rich import box
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    detail = Text(f"Detected capacity: {_human_size(summary['size'])}")
+    if summary.get("model"):
+        detail.append(f" · {summary['model']} device", style="dim")
+    if width >= 92:
+        table = Table(box=box.SIMPLE, expand=True, padding=(0, 1), show_header=True,
+                      header_style="bold")
+        table.add_column("DEVICE RANGE", style="bright_cyan", overflow="fold")
+        table.add_column("CURRENT CONTENT", overflow="fold")
+        table.add_column("SIZE", justify="right", no_wrap=True)
+        for row in summary["regions"]:
+            table.add_row(Text(row["target"]), Text(row["content"]),
+                          _human_size(row["bytes"]))
+    else:
+        table = Text()
+        for index, row in enumerate(summary["regions"]):
+            if index:
+                table.append("\n")
+            table.append(row["target"], style="bold bright_cyan")
+            table.append("\n  ")
+            table.append(row["content"])
+            table.append(" · ")
+            table.append(_human_size(row["bytes"]), style="dim")
+    return Panel(Group(detail, Text("Current extflash contents", style="bold"), table),
+                 title="Read from device", border_style="bright_cyan",
+                 box=box.ROUNDED, expand=True)
 
 
 def _deploy_apply(args) -> int:
@@ -1008,12 +1179,13 @@ def _deploy_apply(args) -> int:
     try:
         result = apply_deployment(args.profile, probe_id=probe_id, programmer=programmer,
                                   remote_url=remote_url, remote_origin=remote_origin,
-                                  regions=args.region, progress=callback)
+                                  regions=args.region, start=args.start, bank=args.bank,
+                                  progress=callback)
     finally:
         if finish:
             finish()
-    if args.output == "json":
-        print(json.dumps(result, indent=2))
+    if args.output in {"json", "yaml"}:
+        _print_structured(result, args.output)
     return 0
 
 
@@ -1545,7 +1717,8 @@ _gwprov_complete() {
     --output=*)
       local output_values
       case "$context" in
-        ps:*|apply:|deploy:plan|deploy:apply|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps) output_values="text json" ;;
+        apply:|deploy:plan|deploy:apply) output_values="text json yaml" ;;
+        ps:*|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps) output_values="text json" ;;
         profile:list|sdcard:list) output_values="text json names" ;;
         profile:duplicate) output_values="text json" ;;
         *) output_values="" ;;
@@ -1569,7 +1742,8 @@ _gwprov_complete() {
     --format:gwemu:profile) candidates="text json" ;;
     --format:profile:hardware|--format:perf:hardware) candidates="text json html pdf" ;;
     --format:report:render) candidates="html pdf" ;;
-    --output:ps:*|--output:apply:|--output:deploy:plan|--output:deploy:apply|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps)
+    --output:apply:|--output:deploy:plan|--output:deploy:apply|-o:apply:|-o:deploy:plan|-o:deploy:apply) candidates="text json yaml" ;;
+    --output:ps:*|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps)
       candidates="text json" ;;
     --output:profile:list|--output:sdcard:list) candidates="text json names" ;;
     --output:profile:duplicate) candidates="text json" ;;
@@ -1583,6 +1757,8 @@ _gwprov_complete() {
     --timing-mode:gwemu:start|--timing-mode:gwemu:run) candidates="default baseline experimental-m7" ;;
     --icount:gwemu:start|--icount:gwemu:run) candidates="0 1 2 3 4 5 6 7 8 9 10" ;;
     --bank:retro-go:build|--bank:gwemu:run) candidates="1 2" ;;
+    --bank:deploy:apply) candidates="1 2" ;;
+    --bank:apply) candidates="1 2" ;;
     --oc-level:retro-go:config) candidates="0 1 2 3" ;;
     --filesystem:media:inventory) candidates="frogfs littlefs fatfs" ;;
     --mode:media:compare) candidates="contents image" ;;
@@ -1590,7 +1766,7 @@ _gwprov_complete() {
     --model:profile:create) candidates="auto mario zelda" ;;
     *) candidates="" ;;
   esac
-  if [[ -n "$candidates" && ( "$prev" == "--variant" || "$prev" == "--format" || "$prev" == "--output" || "$prev" == "--region" || "$prev" == "--programmer" || "$prev" == "--target" || "$prev" == "--bank" || "$prev" == "--oc-level" || "$prev" == "--filesystem" || "$prev" == "--mode" || "$prev" == "--extflash-mib" || "$prev" == "--model" || "$prev" == "--timing-mode" || "$prev" == "--icount" ) ]]; then
+  if [[ -n "$candidates" && ( "$prev" == "--variant" || "$prev" == "--format" || "$prev" == "--output" || "$prev" == "-o" || "$prev" == "--region" || "$prev" == "--programmer" || "$prev" == "--target" || "$prev" == "--bank" || "$prev" == "--oc-level" || "$prev" == "--filesystem" || "$prev" == "--mode" || "$prev" == "--extflash-mib" || "$prev" == "--model" || "$prev" == "--timing-mode" || "$prev" == "--icount" ) ]]; then
     COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
     return
   fi
@@ -1607,6 +1783,7 @@ _gwprov_complete() {
       set) candidates="active profile sdcard" ;;
       deploy) candidates="plan apply" ;;
       ps) candidates="--help -h --output --no-pager --profile" ;;
+      apply) candidates="--help -h -y --yes -f --force --start --bank -o --output" ;;
       completion) candidates="bash zsh" ;;
       adapters) candidates="list add remove rm" ;;
       device) candidates="recover" ;;
@@ -1653,6 +1830,8 @@ _gwprov_complete() {
     candidates=$(_gwprov_profile_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == duplicate && "$cur" != -* ]]; then
     candidates=$(_gwprov_profile_names)
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == deploy && ( "${COMP_WORDS[2]-}" == plan || "${COMP_WORDS[2]-}" == apply ) && "$cur" != -* ]]; then
+    candidates=$(_gwprov_profile_names)
   elif (( COMP_CWORD == 3 )) && [[ ( "${COMP_WORDS[1]-}" == sdcard || "${COMP_WORDS[1]-}" == sd ) && ( "${COMP_WORDS[2]-}" == remove || "${COMP_WORDS[2]-}" == rm ) && "$cur" != -* ]]; then
     candidates=$(_gwprov_sdcard_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == ofw && "${COMP_WORDS[2]-}" == patch && "$cur" != -* ]]; then
@@ -1664,8 +1843,8 @@ _gwprov_complete() {
     case "$context" in
       ps:*) candidates="--output --no-pager --profile" ;;
       config:show) candidates="--output" ;;
-      deploy:plan) candidates="--profile --region --output" ;;
-      deploy:apply) candidates="--profile --probe-id --programmer --remote-url --remote-origin --region --output" ;;
+      deploy:plan) candidates="--region -o --output" ;;
+      deploy:apply) candidates="--probe-id --programmer --remote-url --remote-origin --region --start --bank -o --output" ;;
       projects:list|project:list) candidates="--firmware-repo --output" ;;
       projects:versions|project:versions) candidates="--output" ;;
       projects:info|project:info) candidates="--version --output" ;;
@@ -1764,7 +1943,9 @@ _gwprov() {
       case "$context" in
         profile:list|sdcard:list) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=names"; return ;;
         profile:duplicate) compadd -- "${cur%%=*}=text" "${cur%%=*}=json"; return ;;
-        ps:*|apply:|deploy:plan|deploy:apply|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps)
+        apply:|deploy:plan|deploy:apply)
+          compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=yaml"; return ;;
+        ps:*|projects:list|project:list|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|gwemu:ps)
           compadd -- "${cur%%=*}=text" "${cur%%=*}=json"; return ;;
       esac
       prefix=${cur%%=*}=; pathpart=${cur#*=}; IPREFIX=$prefix PREFIX=$pathpart _files; return
@@ -1772,7 +1953,7 @@ _gwprov() {
   esac
   case "$prev" in
     --profile) _gwprov_profile_complete "$cur"; return ;;
-    --input|--input-dir|--firmware|--bios|--firmware-dir|--bios-dir|--game|--game-dir|--content|--source|--profile|--output|--output-dir|--bootloader-file|--backup-dir|--source-tree|--image|--shared-sd-root|--retro-go-root|--rom|--rom-dir|--config|--timeline|--record-timeline|--bank1|--bank2|--extflash|--sdcard|--symbols|--debug-config|--app-symbols|--gdb|--gwemu-bin)
+    --input|--input-dir|--firmware|--bios|--firmware-dir|--bios-dir|--game|--game-dir|--content|--source|--profile|--output|-o|--output-dir|--bootloader-file|--backup-dir|--source-tree|--image|--shared-sd-root|--retro-go-root|--rom|--rom-dir|--config|--timeline|--record-timeline|--bank1|--bank2|--extflash|--sdcard|--symbols|--debug-config|--app-symbols|--gdb|--gwemu-bin)
       _files; return ;;
     --variant) compadd -- flash sd; return ;;
   esac
@@ -1783,7 +1964,8 @@ _gwprov() {
     --format:report:render) compadd -- html pdf; return ;;
     --output:profile:list|--output:sdcard:list) compadd -- text json names; return ;;
     --output:profile:duplicate) compadd -- text json; return ;;
-    --output:ps:*|--output:apply:|--output:deploy:plan|--output:deploy:apply|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps) compadd -- text json; return ;;
+    --output:apply:|--output:deploy:plan|--output:deploy:apply|-o:apply:|-o:deploy:plan|-o:deploy:apply) compadd -- text json yaml; return ;;
+    --output:ps:*|--output:projects:list|--output:project:list|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps) compadd -- text json; return ;;
     --region:deploy:plan|--region:deploy:apply) compadd -- bank1 bank2 frogfs littlefs extflash sd; return ;;
     --programmer:deploy:apply|--programmer:debug:python|--programmer:profile:hardware|--programmer:perf:hardware) compadd -- stlink jlink cmsis-dap rpi-gpio; return ;;
     --target:debug:python) compadd -- gwemu hardware; return ;;
@@ -1792,6 +1974,8 @@ _gwprov() {
     --icount:gwemu:start|--icount:gwemu:run) compadd -- 0 1 2 3 4 5 6 7 8 9 10; return ;;
     --timing-mode:gwemu:start|--timing-mode:gwemu:run) compadd -- default baseline experimental-m7; return ;;
     --bank:retro-go:build|--bank:gwemu:run) compadd -- 1 2; return ;;
+    --bank:deploy:apply) compadd -- 1 2; return ;;
+    --bank:apply) compadd -- 1 2; return ;;
     --oc-level:retro-go:config) compadd -- 0 1 2 3; return ;;
     --filesystem:media:inventory) compadd -- frogfs littlefs fatfs; return ;;
     --mode:media:compare) compadd -- contents image; return ;;
@@ -1850,6 +2034,8 @@ _gwprov() {
     candidates="${(@f)$(_gwprov_profile_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == duplicate && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_profile_names)}"
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == deploy && ( ${words[3]} == plan || ${words[3]} == apply ) && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_profile_names)}"
   elif (( CURRENT == 4 )) && [[ ( ${words[2]} == sdcard || ${words[2]} == sd ) && ( ${words[3]} == remove || ${words[3]} == rm ) && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_sdcard_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == ofw && ${words[3]} == patch && "$cur" != -* ]]; then
@@ -1860,8 +2046,9 @@ _gwprov() {
     case "$context" in
       ps:*) candidates="--output --no-pager --profile" ;;
       config:show) candidates="--output" ;;
-      deploy:plan) candidates="--profile --region --output" ;;
-      deploy:apply) candidates="--profile --probe-id --programmer --remote-url --remote-origin --region --output" ;;
+      deploy:plan) candidates="--region -o --output" ;;
+      deploy:apply) candidates="--probe-id --programmer --remote-url --remote-origin --region --start --bank -o --output" ;;
+      apply) candidates="--help -h -y --yes -f --force --start --bank -o --output" ;;
       projects:list|project:list) candidates="--firmware-repo --output" ;;
       projects:versions|project:versions) candidates="--output" ;;
       projects:info|project:info) candidates="--version --output" ;;
@@ -2040,7 +2227,7 @@ def build_parser() -> argparse.ArgumentParser:
     device = commands.add_parser("device", help="inspect or recover the active physical device")
     device_commands = device.add_subparsers(dest="device_command", required=True)
     device_recover = device_commands.add_parser(
-        "recover", help="recover a quiescent gnwmanager RAM service and boot bank 1")
+        "recover", help="start or synchronize with the gnwmanager RAM flasher")
     device_recover.set_defaults(handler=_device_recover)
     device_config = commands.add_parser("config", help="inspect configuration stored on the active device")
     config_commands = device_config.add_subparsers(dest="device_config_command", required=True)
@@ -2086,9 +2273,18 @@ def build_parser() -> argparse.ArgumentParser:
     sdcard_compose.add_argument("--rom-dir", default="dos")
     sdcard_compose.add_argument("--config")
     sdcard_compose.set_defaults(handler=_sd_compose)
-    apply = commands.add_parser("apply", help="apply the assigned profile to the active device")
-    apply.add_argument("--output", choices=("text", "json"), default="text",
-                       help="show live progress or emit a machine-readable result")
+    apply = commands.add_parser(
+        "apply", help="apply the assigned profile to the active device",
+        description="Apply the assigned profile to the active device.",
+        epilog="Examples:\n  gwprov apply\n  gwprov apply --yes\n  gwprov apply -o json --force\n  gwprov apply -o yaml --force")
+    apply.add_argument("-y", "--yes", "-f", "--force", dest="yes", action="store_true",
+                       help="skip the confirmation prompt")
+    apply.add_argument("--start", action="store_true",
+                       help="start firmware after writing; otherwise leave the RAM flasher running")
+    apply.add_argument("--bank", type=int, choices=(1, 2), default=1,
+                       help="bank to start with --start (default: 1)")
+    apply.add_argument("-o", "--output", choices=("text", "json", "yaml"), default="text",
+                       help="show progress, or emit a JSON/YAML result")
     apply.set_defaults(handler=_apply_parser)
     ps = commands.add_parser("ps", help="show live GWemu and hardware state")
     ps.add_argument("--output", choices=("text", "json"), default="text")
@@ -2097,23 +2293,31 @@ def build_parser() -> argparse.ArgumentParser:
     ps.set_defaults(handler=_ps)
     deploy = commands.add_parser("deploy", help="plan and apply firmware or filesystem writes")
     deploy_commands = deploy.add_subparsers(dest="deploy_command", required=True)
-    deploy_plan = deploy_commands.add_parser("plan", help="show exact bank and filesystem writes")
-    deploy_plan.add_argument("--profile", required=True)
+    deploy_plan = deploy_commands.add_parser("plan", help="show exact bank and filesystem writes",
+                                             description="Show the profile blobs, destination ranges, sizes, and hashes without connecting to hardware.",
+                                             epilog="Examples:\n  gwprov deploy plan basic-test\n  gwprov deploy plan basic-test -o yaml")
+    deploy_plan.add_argument("profile", metavar="PROFILE",
+                             help="profile name or path to plan")
     deploy_plan.add_argument("--region", action="append", choices=("bank1", "bank2", "frogfs", "littlefs", "extflash", "sd"))
-    deploy_plan.add_argument("--output", choices=("text", "json"), default="text")
+    deploy_plan.add_argument("-o", "--output", choices=("text", "json", "yaml"), default="text")
     deploy_plan.set_defaults(handler=_deploy_plan)
     deploy_apply = deploy_commands.add_parser("apply", help="write selected profile regions to hardware")
-    deploy_apply.add_argument("--profile", required=True)
+    deploy_apply.add_argument("profile", metavar="PROFILE",
+                              help="profile name or path to deploy")
     deploy_target = deploy_apply.add_mutually_exclusive_group()
     deploy_target.add_argument("--probe-id", help="select a local PyOCD probe by unique ID")
     deploy_target.add_argument("--programmer", choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"),
                               help="select one local OpenOCD adapter explicitly")
     deploy_target.add_argument("--remote-url", help="use one gnwmanager serve URL")
     deploy_apply.add_argument("--remote-origin", help="Origin required by the selected remote server")
-    deploy_apply.add_argument("--output", choices=("text", "json"), default="text",
-                              help="show live progress or emit a machine-readable result")
+    deploy_apply.add_argument("-o", "--output", choices=("text", "json", "yaml"), default="text",
+                              help="show progress, or emit a JSON/YAML result")
     deploy_apply.add_argument("--region", action="append", choices=("bank1", "bank2", "frogfs", "littlefs", "extflash", "sd"),
                               help="region to deploy; repeatable, defaults to all profile regions")
+    deploy_apply.add_argument("--start", action="store_true",
+                              help="start firmware after writing; otherwise leave the RAM flasher running")
+    deploy_apply.add_argument("--bank", type=int, choices=(1, 2), default=1,
+                              help="bank to start with --start (default: 1)")
     deploy_apply.set_defaults(handler=_deploy_apply)
     tree = commands.add_parser("tree", help="browse every command and what it does")
     tree.add_argument("--format", choices=("tree", "names"), default="tree",

@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -693,9 +694,147 @@ def _ps(args) -> int:
                         no_pager=args.no_pager)
 
 
+def _resolve_device_selector(selector: str) -> dict:
+    """Resolve a device ID or display/name selector without opening hardware."""
+    from gwprov.devices import device_rows
+
+    rows = device_rows()
+    folded = selector.casefold()
+    matches = [row for row in rows
+               if str(row.get("id", "")).casefold() == folded
+               or str(row.get("displayName", "")).casefold() == folded
+               or str(row.get("name", "")).casefold() == folded]
+    if not matches:
+        raise ValueError(f"device {selector!r} is not currently available; use `gwprov devices` to list devices")
+    if len(matches) > 1:
+        choices = ", ".join(str(row["id"]) for row in matches)
+        raise ValueError(f"device name {selector!r} is ambiguous; select one by ID: {choices}")
+    return matches[0]
+
+
 def _device_config(args) -> int:
     from gwprov.device_config import show_device_config
     return show_device_config(output=args.output)
+
+
+def _retro_go_config(args) -> int:
+    """Read or modify Retro-Go /CONFIG with inline options.
+
+    A profile target changes the managed image.  A device target changes its
+    assigned profile and deploys only the LittleFS region after confirmation.
+    With no mutation flags the operation is read-only.
+    """
+    from gwprov.common.retrogo_config import build_from_values, rom_path
+    from gwprov.device_config import decode_config, read_config
+    from gwprov.profiles import DeviceProfile, profile_reference
+
+    if args.device and args.profile:
+        raise ValueError("choose a device or --profile, not both")
+    if not args.device and not args.profile:
+        raise ValueError("retro-go config requires DEVICE or --profile PROFILE")
+    if args.rom and (args.auto_start is not None or args.no_auto_start):
+        raise ValueError("--rom cannot be combined with --auto-start or --no-auto-start")
+    target_row = _resolve_device_selector(args.device) if args.device else None
+    device_id = target_row["id"] if target_row else None
+    assigned_profile = (target_row or {}).get("assignedProfile") if target_row else None
+    profile_name = args.profile or assigned_profile
+    mutation_requested = any((args.auto_start is not None, args.no_auto_start,
+                              args.timeout is not None, args.oc_level is not None,
+                              args.selected_tab is not None, args.cursor is not None,
+                              args.browse_subpath is not None))
+    if device_id and not profile_name and mutation_requested:
+        raise ValueError("device has no assigned profile; use --profile PROFILE for the update")
+
+    blob, source, _ = read_config(device_id=device_id, profile=profile_name,
+                                  remote_origin=(target_row or {}).get("remoteOrigin"))
+    decoded = decode_config(blob)
+    values = decoded["values"]
+    startup_file = None
+    if args.rom:
+        startup_file = rom_path(*args.rom)
+    elif args.auto_start is not None:
+        startup_file = args.auto_start
+    elif args.no_auto_start:
+        startup_file = ""
+    overrides = {
+        "startup_file": startup_file,
+        "menu_timeout_s": args.timeout,
+        "cpu_oc_level": args.oc_level,
+        "selected_tab": args.selected_tab,
+        "cursor": args.cursor,
+        "browse_subpath": args.browse_subpath,
+    }
+    mutations = {key: value for key, value in overrides.items() if value is not None}
+    if not mutations:
+        if args.output:
+            output_path = Path(args.output).expanduser().resolve()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(blob)
+        return _print_config_report(decoded, source=source, target=device_id or profile_name,
+                                    output_format=args.format)
+
+    if "startup_file" in mutations and len(mutations["startup_file"]) >= 256:
+        raise ValueError("--auto-start path must be shorter than 256 bytes")
+    if "menu_timeout_s" in mutations and mutations["menu_timeout_s"] < 0:
+        raise ValueError("--timeout must be nonnegative")
+    if "cpu_oc_level" in mutations and not 0 <= mutations["cpu_oc_level"] <= 3:
+        raise ValueError("--oc-level must be between 0 and 3")
+    new_blob = build_from_values(values, **mutations)
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(new_blob)
+
+    if profile_name:
+        with tempfile.NamedTemporaryFile(prefix="gwprov-config-", suffix=".bin", delete=False) as handle:
+            temp_path = Path(handle.name)
+            handle.write(new_blob)
+        try:
+            from gwprov.filesystem import operate
+            operate(operation="add", target="flash/ext", profile=profile_name,
+                    filesystem="littlefs", path="CONFIG", source=str(temp_path))
+        finally:
+            temp_path.unlink(missing_ok=True)
+    if device_id:
+        if target_row.get("kind") != "hardware":
+            raise ValueError("writing Retro-Go CONFIG to GWemu is not supported; update its profile instead")
+        _confirm_apply(args, bool(args.yes), [
+            f"Target: {target_row.get('displayName') or target_row.get('name') or device_id}",
+            f"Profile: {profile_reference(DeviceProfile.load(profile_name).root)}",
+            "Action: write /CONFIG and deploy the LittleFS region",
+        ])
+        from gwprov.deploy import apply_deployment
+        remote_url = device_id.removeprefix("remote:") if device_id.startswith("remote:") else None
+        apply_deployment(profile_name, probe_id=target_row.get("probeId"),
+                         remote_url=remote_url,
+                         remote_origin=target_row.get("remoteOrigin"),
+                         regions=["littlefs"])
+    return _print_config_report(decode_config(new_blob), source=source,
+                                target=device_id or profile_name,
+                                output_format=args.format)
+
+
+def _print_config_report(decoded: dict, *, source: str, target: str,
+                         output_format: str) -> int:
+    report = {"schemaVersion": 1, "target": target, "source": source,
+              **decoded}
+    valid = all(decoded["integrity"][key]
+                for key in ("magic_valid", "version_supported", "crc_valid"))
+    if output_format == "json":
+        print(json.dumps(report, indent=2))
+        return 0 if valid else 1
+    from rich.console import Console
+    from rich.table import Table
+    table = Table(title=f"Retro-Go /CONFIG: {target}", title_justify="left", expand=True)
+    table.add_column("SETTING", style="cyan", overflow="fold")
+    table.add_column("VALUE", overflow="fold")
+    for key, value in decoded["values"].items():
+        if key == "start_action":
+            value = {0: "resume", 1: "new game"}.get(value, f"unknown ({value})")
+        table.add_row(key.replace("_", " "), str(value))
+    Console().print(table)
+    Console().print(f"Source: {source}")
+    return 0 if valid else 1
 
 
 def _device_recover(args) -> int:
@@ -2719,7 +2858,7 @@ _gwprov_complete() {
       case "$context" in
         tree:*) format_values="tree names" ;;
         gwemu:profile) format_values="text json" ;;
-        projects:install|project:install) format_values="text json" ;;
+        projects:install|project:install|retro-go:config) format_values="text json" ;;
         profile:hardware|perf:hardware) format_values="text json html pdf" ;;
         report:render) format_values="html pdf" ;;
         *) format_values="" ;;
@@ -2765,7 +2904,7 @@ _gwprov_complete() {
     --format:tree:*) candidates="tree names" ;;
     --format:gwemu:profile) candidates="text json" ;;
     --format:profile:hardware|--format:perf:hardware) candidates="text json html pdf" ;;
-    --format:report:render) candidates="html pdf" ;;
+    --format:report:render|--format:retro-go:config) candidates="text json" ;;
     --output:apply:|--output:deploy:plan|--output:deploy:apply|-o:apply:|-o:deploy:plan|-o:deploy:apply) candidates="text json yaml" ;;
     --output:ps:*|--output:projects:list|--output:project:list|--output:projects:ls|--output:project:ls|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps)
       candidates="text json" ;;
@@ -2859,6 +2998,8 @@ _gwprov_complete() {
     esac
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == debug && "${COMP_WORDS[2]-}" == python && "$cur" != -* ]]; then
     candidates=$(_gwprov_device_names)
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == retro-go && "${COMP_WORDS[2]-}" == config && "$cur" != -* ]]; then
+    candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "$cur" != -* ]]; then
     candidates="$(_gwprov_profile_names)"
   elif (( COMP_CWORD == 4 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "$cur" != -* ]]; then
@@ -2902,7 +3043,7 @@ _gwprov_complete() {
       tree:*) candidates="--format --no-pager" ;;
       retro-go:install) candidates="--repo --version --variant --output" ;;
       retro-go:build) candidates="--path --make-target --bank --extflash-part-mb --extflash-offset-mb --jobs --makevar --clean --docker --quiet --dry-run" ;;
-      retro-go:config) candidates="--output --rom --menu-timeout --oc-level --selected-tab --cursor --browse-subpath" ;;
+      retro-go:config) candidates="--profile --output --format --auto-start --no-auto-start --rom --timeout --menu-timeout --oc-level --selected-tab --cursor --browse-subpath --yes --force" ;;
       gwemu:start) candidates="--profile --gdb-port --audio --headless --timeline --record-timeline --timing-mode --icount --rtc-epoch --gwemu-bin" ;;
       gwemu:stop) candidates="--profile --pid --timeout" ;;
       gwemu:pause|gwemu:resume) candidates="--profile --pid" ;;
@@ -2988,7 +3129,7 @@ _gwprov() {
       case "$context" in
         tree:*) compadd -- "${cur%%=*}=tree" "${cur%%=*}=names" ;;
         gwemu:profile) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" ;;
-        projects:install|project:install) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" ;;
+        projects:install|project:install|retro-go:config) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" ;;
         profile:hardware|perf:hardware) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=html" "${cur%%=*}=pdf" ;;
         report:render) compadd -- "${cur%%=*}=html" "${cur%%=*}=pdf" ;;
       esac
@@ -3020,6 +3161,7 @@ _gwprov() {
     --format:gwemu:profile) compadd -- text json; return ;;
     --format:profile:hardware|--format:perf:hardware) compadd -- text json html pdf; return ;;
     --format:report:render) compadd -- html pdf; return ;;
+    --format:retro-go:config) compadd -- text json; return ;;
     --output:profile:list|--output:profile:ls|--output:sdcard:list|--output:sdcard:ls) compadd -- text json names; return ;;
     --output:profile:duplicate) compadd -- text json; return ;;
     --output:apply:|--output:deploy:plan|--output:deploy:apply|-o:apply:|-o:deploy:plan|-o:deploy:apply) compadd -- text json yaml; return ;;
@@ -3067,7 +3209,7 @@ _gwprov() {
       perf) candidates="hardware" ;;
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       show) candidates="adapters devices projects profile perf sdcard" ;;
-      config) candidates="show" ;;
+        config) candidates="show" ;;
       set) candidates="active profile sdcard name" ;;
       *) candidates="" ;;
     esac
@@ -3091,6 +3233,8 @@ _gwprov() {
       *) candidates="" ;;
     esac
   elif (( CURRENT == 4 )) && [[ ${words[2]} == debug && ${words[3]} == python && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_device_names)}"
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == retro-go && ${words[3]} == config && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == edit && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_profile_names)}"
@@ -3135,7 +3279,7 @@ _gwprov() {
       tree:*) candidates="--format --no-pager" ;;
       retro-go:install) candidates="--repo --version --variant --output" ;;
       retro-go:build) candidates="--path --make-target --bank --extflash-part-mb --extflash-offset-mb --jobs --makevar --clean --docker --quiet --dry-run" ;;
-      retro-go:config) candidates="--output --rom --menu-timeout --oc-level --selected-tab --cursor --browse-subpath" ;;
+      retro-go:config) candidates="--profile --output --format --auto-start --no-auto-start --rom --timeout --menu-timeout --oc-level --selected-tab --cursor --browse-subpath --yes --force" ;;
       gwemu:start) candidates="--profile --gdb-port --audio --headless --timeline --record-timeline --timing-mode --icount --rtc-epoch --gwemu-bin" ;;
       gwemu:stop) candidates="--profile --pid --timeout" ;;
       gwemu:pause|gwemu:resume) candidates="--profile --pid" ;;
@@ -3572,16 +3716,37 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--dry-run", action="store_true")
     build.set_defaults(handler=_build_retro_go)
 
-    config = retro_commands.add_parser("config", help="write Retro-Go's /CONFIG file")
-    config.add_argument("--output", required=True)
+    config = retro_commands.add_parser(
+        "config", help="show or change Retro-Go /CONFIG for a device or profile",
+        description=("Read Retro-Go's /CONFIG, or change selected settings inline.\n\n"
+                     "Examples:\n"
+                     "  gwprov retro-go config retro-go-zelda\n"
+                     "  gwprov retro-go config retro-go-zelda --auto-start /homebrews/demo.bin --timeout 0\n"
+                     "  gwprov retro-go config --profile basic-test --oc-level 2"))
+    config.add_argument("device", nargs="?", metavar="DEVICE",
+                        help="device name or ID; required unless --profile is used")
+    config.add_argument("--profile", metavar="PROFILE",
+                        help="read or update a managed profile instead of a device")
+    config.add_argument("--output", metavar="FILE",
+                        help="also save the resulting 416-byte CONFIG blob")
+    config.add_argument("--format", choices=("text", "json"), default="text",
+                        help="display format (default: text)")
+    auto_start = config.add_mutually_exclusive_group()
+    auto_start.add_argument("--auto-start", metavar="FILE_PATH",
+                            help="launch this Retro-Go file at boot")
+    auto_start.add_argument("--no-auto-start", action="store_true",
+                            help="clear the automatic launch file and show the launcher")
     config.add_argument("--rom", nargs=2, metavar=("CORE", "FILENAME"),
-                        help="auto-launch a ROM, for example --rom gb Tetris.gb")
-    config.add_argument("--menu-timeout", type=int, default=0)
-    config.add_argument("--oc-level", type=int, choices=range(4), default=0)
-    config.add_argument("--selected-tab", type=int, default=0)
-    config.add_argument("--cursor", type=int, default=0)
-    config.add_argument("--browse-subpath", default="")
-    config.set_defaults(handler=_make_config)
+                        help="set auto-start from a core and filename, for example --rom gb Tetris.gb")
+    config.add_argument("--timeout", "--menu-timeout", dest="timeout", type=int,
+                        help="main-menu idle timeout in seconds; use 0 to disable")
+    config.add_argument("--oc-level", type=int, choices=range(4))
+    config.add_argument("--selected-tab", type=int)
+    config.add_argument("--cursor", type=int)
+    config.add_argument("--browse-subpath")
+    config.add_argument("-y", "--yes", "-f", "--force", action="store_true",
+                        help="skip confirmation before writing a device")
+    config.set_defaults(handler=_retro_go_config)
 
     gwemu = commands.add_parser("gwemu", help="launch and control GWemu targets")
     gwemu_commands = gwemu.add_subparsers(dest="gwemu_command", required=True)

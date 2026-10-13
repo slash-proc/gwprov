@@ -149,6 +149,18 @@ def _read_littlefs(context, size: int, block_size: int) -> bytes:
             fs.unmount()
 
 
+def _profile_blob(profile_value: str):
+    """Read /CONFIG from a managed profile's LittleFS image."""
+    profile, extflash_size, start, size, block_size = _layout(profile_value)
+    if not profile.extflash.is_file():
+        raise FileNotFoundError(f"profile extflash image is missing: {profile.extflash}")
+    if profile.extflash.stat().st_size < start + size:
+        raise ValueError("profile extflash image is smaller than its declared LittleFS partition")
+    with profile.extflash.open("rb") as stream:
+        blob = _read_littlefs(_ImageContext(stream, start, size, block_size), size, block_size)
+    return blob, f"profile extflash image: {profile.extflash}"
+
+
 def _vm_image(device_id: str):
     import psutil
     from .gwemu_manager import instances
@@ -186,7 +198,7 @@ def _vm_image(device_id: str):
     return blob, f"GWemu extflash image: {extflash_path}"
 
 
-def _hardware_blob(device_id: str) -> tuple[bytes, str]:
+def _hardware_blob(device_id: str, *, remote_origin: str | None = None) -> tuple[bytes, str]:
     from .active_device import get_active, get_active_origin
     from .backends import SelectedPyOCDBackend, WebSocketBackend
     from .device_assignments import get_assignment
@@ -202,7 +214,9 @@ def _hardware_blob(device_id: str) -> tuple[bytes, str]:
                                        lease_wait=0)
     elif device_id.startswith("remote:"):
         uri = device_id.removeprefix("remote:")
-        origin = get_active_origin() if device_id == get_active() else None
+        origin = remote_origin
+        if origin is None and device_id == get_active():
+            origin = get_active_origin()
         backend = WebSocketBackend(uri, origin=origin,
                                    operation="gwprov config read", lease_wait=0)
     else:
@@ -217,18 +231,33 @@ def _hardware_blob(device_id: str) -> tuple[bytes, str]:
     return blob, f"hardware mapped flash using profile layout: {profile_reference(profile.root)}"
 
 
-def show_device_config(*, output: str = "text") -> int:
-    from .active_device import get_active
-
-    device_id = get_active()
+def read_config(*, device_id: str | None = None, profile: str | None = None,
+                remote_origin: str | None = None) -> tuple[bytes, str, str | None]:
+    """Read a CONFIG blob from an explicit device or managed profile."""
+    if device_id and profile:
+        raise ValueError("choose a device or profile, not both")
+    if profile:
+        blob, source = _profile_blob(profile)
+        return blob, source, profile
     if not device_id:
-        raise ValueError("no active device; select one with `gwprov set active DEVICE`")
+        raise ValueError("specify a device or profile")
     if device_id.startswith("gwemu:"):
         blob, source = _vm_image(device_id)
     else:
-        blob, source = _hardware_blob(device_id)
+        blob, source = _hardware_blob(device_id, remote_origin=remote_origin)
+    from .device_assignments import get_assignment
+    assigned = get_assignment(device_id).get("profile")
+    return blob, source, assigned
+
+
+def show_device_config(*, output: str = "text", device_id: str | None = None,
+                       profile: str | None = None,
+                       remote_origin: str | None = None) -> int:
+    blob, source, _ = read_config(device_id=device_id, profile=profile,
+                                  remote_origin=remote_origin)
     decoded = decode_config(blob)
-    report = {"schemaVersion": 1, "device": device_id, "source": source,
+    report = {"schemaVersion": 1, "device": device_id, "profile": profile,
+              "source": source,
               "path": "/CONFIG", "bytes": len(blob), **decoded}
     valid = all(decoded["integrity"][key]
                 for key in ("magic_valid", "version_supported", "crc_valid"))

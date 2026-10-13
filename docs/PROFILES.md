@@ -202,6 +202,20 @@ card settings are independent of flash banks; no SD card is included unless
 requested. `--sdcard-size SIZE_MB` creates/resizes the bundled card and implies
 `--sdcard`; it cannot be combined with `--no-sdcard`.
 
+Retro-Go's `/CONFIG` is changed inline; there is no separate config editor or
+config build step:
+
+```console
+gwprov retro-go config PROFILE
+gwprov retro-go config --profile PROFILE --auto-start /homebrews/demo.bin --timeout 0
+gwprov retro-go config --profile PROFILE --no-auto-start
+```
+
+For hardware, use its device name or stable ID instead of `PROFILE`. GWProv
+updates the assigned profile's LittleFS image and deploys only that region after
+the normal write confirmation. Add `--yes` to skip the confirmation. Use
+`--output FILE` to save the resulting 416-byte CONFIG blob.
+
 ## Plan and flash
 
 ```console

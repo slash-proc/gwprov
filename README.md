@@ -978,7 +978,9 @@ gwprov input tap LEFT+GAME
 gwprov fs create frogfs 2 dev-local
 gwprov fs create lfs 2 dev-local
 gwprov fs create sdcard 128 dev-local
-gwprov retro-go config --output build/CONFIG --rom gb Tetris.gb
+gwprov retro-go config retro-go-profile
+gwprov retro-go config retro-go-profile --auto-start /roms/gb/Tetris.gb --timeout 0
+gwprov retro-go config --profile retro-go-profile --oc-level 2 --output build/CONFIG
 gwprov retro-go build --path references/game-and-watch-retro-go-sd --dry-run
 gwprov media frogfs --retro-go-root references/game-and-watch-retro-go-sd [packer options]
 gwprov ofw patch mario --backup-dir backup --output-dir build/ofw [patch options]
@@ -1002,6 +1004,22 @@ the mounted folder and files absent from the profile are retained.
 The `sdcard` command also creates and populates raw SD images; `sd` remains a short alias.
 
 The target-neutral APIs are under `gwprov.common`: `Image` and `Target` select media and destination, `sdcard.compose()` describes SD contents, and target-specific SD managers write to an image, a mounted card, or the device. A `.tl` timeline can be replayed by GWemu or injected into compatible firmware through the probe.
+
+### Retro-Go configuration
+
+`gwprov retro-go config` is a read/modify/write command. With no setting flags it
+decodes the existing `/CONFIG`. Add settings inline to update a managed profile or
+an assigned hardware device; device writes prompt unless `--yes` is supplied.
+
+```bash
+gwprov retro-go config DEVICE
+gwprov retro-go config DEVICE --auto-start /homebrews/demo.bin --timeout 0
+gwprov retro-go config --profile PROFILE --no-auto-start
+gwprov retro-go config --profile PROFILE --rom gb Tetris.gb --format json
+```
+
+`--output FILE` saves the resulting 416-byte CONFIG blob. `--timeout 0` disables
+Retro-Go's idle standby timer, which is useful for unattended test runs.
 
 ## Structure and source provenance
 

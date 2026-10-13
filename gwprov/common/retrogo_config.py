@@ -57,9 +57,11 @@ def rom_path(dirname, filename):
 
 
 def build(startup_file="", menu_timeout_s=0, backlight=6, volume=4,
-          font_size=8, theme=2, lang=0, startup_app=0, cpu_oc_level=0,
+          font_size=8, theme=2, colors=0, turbo_buttons=0, font=0,
+          lang=0, startup_app=0, cpu_oc_level=0,
           start_action=START_ACTION_RESUME, welcome_prompt=1,
-          selected_tab=0, cursor=0, browse_subpath=""):
+          selected_tab=0, cursor=0, browse_subpath="",
+          debug_clock_always_on=0):
     """Return the packed /CONFIG bytes, CRC included."""
     if len(startup_file) >= STARTUP_FILE_LEN:
         raise ValueError("startup_file too long")
@@ -79,11 +81,11 @@ def build(startup_file="", menu_timeout_s=0, backlight=6, volume=4,
         "I",          # crc32 (zero while computing)
         CONFIG_MAGIC,
         CONFIG_VERSION, backlight, start_action, volume, font_size,
-        theme, 0, 0, 0, lang, startup_app, cpu_oc_level,
+        theme, colors, turbo_buttons, font, lang, startup_app, cpu_oc_level,
         startup_file.encode() ,
         menu_timeout_s, selected_tab, cursor,
         browse_subpath.encode(),
-        0,
+        debug_clock_always_on,
         welcome_prompt,
         b"",
         0,
@@ -95,6 +97,37 @@ def build(startup_file="", menu_timeout_s=0, backlight=6, volume=4,
 
     crc = zlib.crc32(blob) & 0xFFFFFFFF
     return blob[:-4] + struct.pack("<I", crc)
+
+
+def build_from_values(values: dict, **overrides) -> bytes:
+    """Rebuild CONFIG while preserving settings not named by the caller.
+
+    The CLI uses this for inline configuration changes.  Keeping the decode
+    keys here makes a read/modify/write operation explicit and prevents an
+    option such as ``--timeout`` from silently resetting unrelated launcher
+    preferences.
+    """
+    current = {
+        "startup_file": values.get("startup_file", ""),
+        "menu_timeout_s": values.get("main_menu_timeout_s", 0),
+        "backlight": values.get("backlight", 6),
+        "volume": values.get("volume", 4),
+        "font_size": values.get("font_size", 8),
+        "theme": values.get("theme", 2),
+        "colors": values.get("colors", 0),
+        "turbo_buttons": values.get("turbo_buttons", 0),
+        "font": values.get("font", 0),
+        "startup_app": values.get("startup_app", 0),
+        "cpu_oc_level": values.get("cpu_oc_level", 0),
+        "selected_tab": values.get("selected_tab", 0),
+        "cursor": values.get("cursor", 0),
+        "browse_subpath": values.get("browse_subpath", ""),
+        "debug_clock_always_on": int(bool(values.get("debug_clock_always_on", False))),
+        "start_action": values.get("start_action", START_ACTION_RESUME),
+        "welcome_prompt": values.get("welcome_prompt", 1),
+    }
+    current.update({key: value for key, value in overrides.items() if value is not None})
+    return build(**current)
 
 
 def main():

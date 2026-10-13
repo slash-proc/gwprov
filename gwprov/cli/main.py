@@ -647,6 +647,36 @@ def _device_runtime_control(args) -> int:
     raise ValueError(f"unsupported device action: {args.action}")
 
 
+def _device_logs(args) -> int:
+    if args.lines < 1:
+        raise ValueError("--lines must be positive")
+    row = _resolve_device_selector(args.device)
+    if row.get("kind") != "gwemu":
+        raise ValueError("logs currently supports managed GWemu devices; use debug python for hardware logs")
+    profile = row.get("profile")
+    if not profile:
+        raise ValueError("GWemu device has no profile log path")
+    path = Path(profile) / "gwemu.log"
+    if not path.is_file():
+        raise ValueError(f"GWemu log is not available: {path}")
+    if args.follow:
+        with path.open("r", errors="replace") as stream:
+            stream.seek(0, os.SEEK_END)
+            while True:
+                line = stream.readline()
+                if line:
+                    print(line, end="")
+                elif row.get("status") in {"exited", "unknown"}:
+                    break
+                else:
+                    time.sleep(0.25)
+        return 0
+    lines = path.read_text(errors="replace").splitlines()
+    for line in lines[-args.lines:]:
+        print(line)
+    return 0
+
+
 def _start_profile(args) -> int:
     from gwprov.gwemu_manager import start_instance, instances
     from gwprov.profiles import DeviceProfile
@@ -2154,6 +2184,36 @@ def _filesystem(args) -> int:
     image = args.image
     size = args.size
     size_mib = getattr(args, "size_mib", None)
+    if operation == "ls" and args.profile and not image:
+        aliases = {"all": "all", "a": "all", "frogfs": "frogfs", "f": "frogfs",
+                   "littlefs": "littlefs", "lfs": "littlefs", "l": "littlefs",
+                   "sdcard": "sd", "sd": "sd"}
+        raw_path = getattr(args, "path", None)
+        selector = aliases.get((raw_path or "all").casefold())
+        if selector is None:
+            # Preserve the ordinary filesystem path form when the final
+            # positional value is not one of the resource selectors.
+            selector = "path"
+        if selector == "all":
+            from gwprov.profiles import DeviceProfile
+            profile = DeviceProfile.load(args.profile)
+            targets = [("frogfs", "flash/ext"), ("littlefs", "flash/ext")]
+            if profile.resolved_sd is not None:
+                targets.append(("sd", "sd"))
+            for kind, target_name in targets:
+                print(f"[{kind}]")
+                operate(operation="ls", target=target_name, profile=args.profile,
+                        filesystem=kind, path="/", block_size=args.block_size)
+            return 0
+        from gwprov.profiles import DeviceProfile
+        if selector == "path":
+            selector = None
+        if selector == "sd" and not DeviceProfile.load(args.profile).resolved_sd:
+            raise ValueError("profile has no SD card image")
+        if selector:
+            target = "sd" if selector == "sd" else "flash/ext"
+            filesystem = selector
+            args.path = "/"
     if args.fs_command == "create":
         aliases = {"littlefs": "littlefs", "lfs": "littlefs",
                    "frogfs": "frogfs", "sd": "sd", "sdcard": "sd"}
@@ -3060,7 +3120,7 @@ _gwprov_complete() {
       completion) candidates="bash zsh" ;;
       adapters) candidates="list ls add remove rm" ;;
       start) candidates=$(_gwprov_profile_names) ;;
-      recover|pause|halt|resume|reset) candidates=$(_gwprov_device_names) ;;
+      recover|pause|halt|resume|reset|logs) candidates=$(_gwprov_device_names) ;;
       device) candidates="recover" ;;
       projects|project) candidates="list ls versions info install stage-local" ;;
       backups) candidates="add list ls" ;;
@@ -3309,7 +3369,7 @@ _gwprov() {
       completion) candidates="bash zsh" ;;
       adapters) candidates="list ls add remove rm" ;;
       start) candidates="${(@f)$(_gwprov_profile_names)}" ;;
-      recover|pause|halt|resume|reset) candidates="${(@f)$(_gwprov_device_names)}" ;;
+      recover|pause|halt|resume|reset|logs) candidates="${(@f)$(_gwprov_device_names)}" ;;
       device) candidates="recover" ;;
       projects|project) candidates="list ls versions info install stage-local" ;;
       backups) candidates="add list ls" ;;
@@ -3538,7 +3598,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.help_categories = (
         ("Overview and selection", ("show", "set", "ps")),
         ("All devices and adapters", ("devices", "adapters")),
-        ("Selected-device controls", ("start", "recover", "pause", "halt", "resume", "reset", "apply", "device", "gwemu", "input", "deploy", "perf", "config")),
+        ("Selected-device controls", ("start", "recover", "pause", "halt", "resume", "reset", "logs", "apply", "device", "gwemu", "input", "deploy", "perf", "config")),
         ("Profiles and storage", ("profile", "filesystem", "media", "sdcard")),
         ("Project catalog", ("projects",)),
         ("File workflows not yet device-scoped", ("retro-go", "ofw")),
@@ -3612,6 +3672,11 @@ def build_parser() -> argparse.ArgumentParser:
         control = commands.add_parser(action, help=help_text)
         control.add_argument("device", metavar="DEVICE", help="managed device name or ID")
         control.set_defaults(handler=_device_runtime_control, action=action)
+    logs = commands.add_parser("logs", help="show or follow a managed device's runtime log")
+    logs.add_argument("device", metavar="DEVICE", help="managed device name or ID")
+    logs.add_argument("--lines", type=int, default=80, help="number of trailing lines (default: 80)")
+    logs.add_argument("--follow", "-f", action="store_true", help="follow until the managed process exits")
+    logs.set_defaults(handler=_device_logs)
     device_config = commands.add_parser("config", help="inspect configuration stored on the active device")
     config_commands = device_config.add_subparsers(dest="device_config_command", required=True)
     config_show = config_commands.add_parser("show", help="read and decode Retro-Go's current /CONFIG")
@@ -4153,7 +4218,10 @@ def build_parser() -> argparse.ArgumentParser:
     create_fs.add_argument("filename", nargs="?", help="output filename (defaults by filesystem type)")
     create_fs.add_argument("--size-mib", type=int, help="SD image capacity or profile SD size in MiB")
     create_fs.add_argument("--force", action="store_true", help="replace existing filesystem data")
-    ls_fs = filesystem_commands.add_parser("ls", aliases=("tree",), help="list files and directories")
+    ls_fs = filesystem_commands.add_parser(
+        "ls", aliases=("tree",), help="list files and directories",
+        description=("List a profile filesystem. With a profile target, an empty path lists "
+                     "all available filesystems; use all/a, frogfs/f, littlefs/lfs/l, or sdcard/sd."))
     filesystem_target(ls_fs)
     ls_fs.add_argument("path", nargs="?", help="directory inside the filesystem")
     add_fs = filesystem_commands.add_parser("add", help="add or replace a file")
@@ -4301,6 +4369,8 @@ def _normalize_profile_object_form(argv: list[str] | None) -> list[str] | None:
             return ["input", "tap", argv[3], "--device", argv[1], *argv[4:]]
     if len(argv) < 3 or argv[0] not in {"profile"}:
         return argv
+    if len(argv) >= 4 and argv[2] == "filesystem" and argv[3] in {"tree", "ls"}:
+        return ["filesystem", "tree", "--profile", argv[1], *argv[4:]]
     known_actions = {"create", "duplicate", "edit", "list", "ls", "show", "apply", "hardware"}
     if argv[1] in known_actions or argv[1].startswith("-") or argv[2].startswith("-"):
         return argv

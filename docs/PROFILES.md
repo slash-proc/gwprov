@@ -217,6 +217,18 @@ updates the assigned profile's LittleFS image and deploys only that region after
 the normal write confirmation. Add `--yes` to skip the confirmation. Use
 `--output FILE` to save the resulting 416-byte CONFIG blob.
 
+Inspect profile storage with the same object-first form:
+
+```console
+gwprov profile PROFILE filesystem tree
+gwprov profile PROFILE filesystem tree frogfs
+gwprov profile PROFILE filesystem tree littlefs
+gwprov profile PROFILE filesystem tree sdcard
+```
+
+An empty selector shows every filesystem present. Asking for `sdcard` on a
+profile without an SD image produces a direct error.
+
 ## Plan and flash
 
 ```console

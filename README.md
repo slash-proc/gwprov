@@ -981,6 +981,7 @@ gwprov fs create sdcard 128 dev-local
 gwprov retro-go config retro-go-profile
 gwprov retro-go config retro-go-profile --auto-start /roms/gb/Tetris.gb --timeout 0
 gwprov retro-go config --profile retro-go-profile --oc-level 2 --output build/CONFIG
+gwprov profile retro-go-profile filesystem tree
 gwprov retro-go build --path references/game-and-watch-retro-go-sd --dry-run
 gwprov media frogfs --retro-go-root references/game-and-watch-retro-go-sd [packer options]
 gwprov ofw patch mario --backup-dir backup --output-dir build/ofw [patch options]

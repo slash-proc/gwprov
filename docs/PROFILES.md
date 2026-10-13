@@ -9,13 +9,14 @@ each component at its mapped offset.
 ## Find stock backups
 
 ```console
-$ gwprov backups search ~/Downloads
+$ gwprov backups add ~/Downloads
 Found verified Mario backup pair: /home/me/Downloads/ofw-backup
 $ gwprov backups list
 ```
 
-`backups search [DIRECTORY]` searches recursively, defaulting to the current
-directory. `backups list` (also `ls`) shows previously discovered valid backup
+`backups add DIRECTORY|FILE|ZIP` recursively registers valid backup pairs. A
+file-based add must include both internal and external images; an ITCM image is
+optional. `backups list` (also `ls`) shows previously discovered valid backup
 pairs and their locations.
 
 ## Create stock profiles

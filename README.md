@@ -39,7 +39,7 @@ Find your stock firmware backup, create a profile, then review and apply it to t
 selected hardware device:
 
 ```bash
-gwprov backups search ~/Downloads
+gwprov backups add ~/Downloads
 gwprov profile create mario-stock -m
 gwprov set active probe:YOUR_PROBE_ID
 gwprov deploy plan mario-stock
@@ -1074,7 +1074,7 @@ with `project versions`, `project info`, and `project install`; both `tgb` and
 
 ## Pristine stock profiles
 
-Stock profiles use backups discovered by `gwprov backups search`; see
+Stock profiles use backups discovered by `gwprov backups add`; see
 [Profiles: creation, editing, and deployment](docs/PROFILES.md) for the current
 workflow. Existing profile directories are never overwritten.
 

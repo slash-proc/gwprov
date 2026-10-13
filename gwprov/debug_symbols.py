@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def retro_go_profile_symbols(version: str | None) -> tuple[Path, list[Path]] | None:
-    """Return a managed profile's firmware/app ELFs for an exact version match."""
+    """Return a managed profile's firmware and payload ELFs for an exact version match."""
     if not version:
         return None
     from .profiles import profile_directory
@@ -32,9 +32,12 @@ def retro_go_profile_symbols(version: str | None) -> tuple[Path, list[Path]] | N
         installed_version = firmware.get("version") if isinstance(firmware, dict) else None
         if installed_version != version:
             continue
-        app_symbols = sorted((candidate / "debug" / "apps").rglob("*.elf"),
-                             key=lambda item: item.as_posix().casefold())
-        matches.append((candidate, firmware_elf, app_symbols))
+        debug_root = candidate / "debug"
+        payload_symbols = sorted(
+            [*debug_root.joinpath("apps").rglob("*.elf"),
+             *debug_root.joinpath("projects").rglob("*.elf")],
+            key=lambda item: item.as_posix().casefold())
+        matches.append((candidate, firmware_elf, payload_symbols))
     if not matches:
         return None
 
@@ -47,17 +50,19 @@ def retro_go_profile_symbols(version: str | None) -> tuple[Path, list[Path]] | N
         # rebuilds that reuse the same version string. Never choose by path order.
         return None
 
-    def app_hashes(candidate: Path, paths: list[Path]) -> dict[str, tuple[str, Path]]:
-        root = candidate / "debug" / "apps"
+    def payload_hashes(candidate: Path, paths: list[Path]) -> dict[str, tuple[str, Path]]:
+        root = candidate / "debug"
         result = {}
         for path in paths:
             relative = path.relative_to(root).as_posix()
             result[relative] = (hashlib.sha256(path.read_bytes()).hexdigest(), path)
         return result
 
-    app_maps = [app_hashes(candidate, paths) for candidate, _, paths in matches]
-    common_apps = {}
-    for relative, (digest, path) in app_maps[0].items():
-        if all(mapping.get(relative, (None, None))[0] == digest for mapping in app_maps[1:]):
-            common_apps[relative] = path
-    return matches[0][1], [common_apps[name] for name in sorted(common_apps)]
+    payload_maps = [payload_hashes(candidate, paths)
+                    for candidate, _, paths in matches]
+    common_payloads = {}
+    for relative, (digest, path) in payload_maps[0].items():
+        if all(mapping.get(relative, (None, None))[0] == digest
+               for mapping in payload_maps[1:]):
+            common_payloads[relative] = path
+    return matches[0][1], [common_payloads[name] for name in sorted(common_payloads)]

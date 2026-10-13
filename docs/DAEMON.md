@@ -84,6 +84,12 @@ state. `gwprov gwemu stop` requests a graceful QMP quit and waits for the child.
 Debugger launches that need reset-time breakpoints request an initial halt from
 the daemon; ordinary launches start running.
 
+Managed GDB listeners are loopback-only. When a command does not provide
+`--gdb-port`, GWProv starts at the conventional base of 1234 plus one (1235)
+and walks upward until the OS reports a free port. The lower-level direct
+GWemu target uses the same rule for GDB and for its TCP QMP listener (base
+4444, first automatic candidate 4445); both ports are kept distinct.
+
 GWemu processes started outside these managed CLI commands remain external
 instances. GWProv can inventory them when process visibility and their existing
 QMP endpoint permit it, but cannot adopt a process whose QMP stream it does not
@@ -103,9 +109,15 @@ idle interactive console alive.
 Standalone device operations take the process-shared target lease and hand the
 monitor connection off before connecting directly to the adapter. The daemon
 skips target polling during writes, erases, programming, and reset transitions;
-it resumes polling when that lease ends. Explicit OpenOCD debug sessions that
-cannot use the shared PyOCD connection also hold a lease and pause the monitor
-for the session.
+it resumes polling when that lease ends. It also watches for an external
+gnwmanager, OpenOCD, or PyOCD process and closes its monitor connection so that
+tool can acquire the adapter. The device row remains in the daemon inventory
+with an `externalSession` record containing the process, PID, command, adapter,
+and handoff time. The last live firmware observation is retained separately as
+`lastObserved`; the current status becomes `unknown` while target reads are
+suspended. When the process exits, the daemon clears that record and performs a
+fresh live poll. Explicit OpenOCD debug sessions that cannot use the shared
+PyOCD connection also hold a lease and pause the monitor for the session.
 
 The CLI sends lease heartbeats on a separate thread every two seconds, so a
 long flash write does not delay them. Releasing the lease returns the device
@@ -121,10 +133,16 @@ cancellation of substantial device operations before restart. Failed or
 interrupted writes are surfaced as operation failures; the daemon does not
 assume the device write completed.
 
-If a process exits during a device transition, a durable marker prevents
-background target reads until an operation verifies the device has returned to
-application firmware. A verified idle RAM flasher remains observable through
-passive polling.
+The daemon does not persist a host-side recovery or interrupted-operation
+marker. After an operation ends, the next poll reads VTOR, DHCSR, mailbox state,
+and firmware signatures from the target and reports what is actually present.
+An idle RAM flasher is therefore observable through the same live polling path.
+
+For coordination with tools that already use gnwmanager, run `gnwmanager serve`
+and register its `ws://.../gdb` endpoint. GWProv's WebSocket backend passes
+target operations through the server. That server currently admits one client;
+multi-client sharing would need to be added to gnwmanager's server rather than
+being inferred from GWProv's local leases.
 
 ## Repeatable GWemu timing
 

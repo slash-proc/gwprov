@@ -578,9 +578,15 @@ For local PyOCD targets and registered remote adapters, `debug python` uses
 the daemon-owned connection and automatically loads firmware and app symbols
 from a managed profile when its Retro-Go version matches and the firmware ELF
 is unambiguous. Conflicting same-tag profiles are not guessed. With no
-explicit hardware selector, it uses the active device. The console exposes
+explicit hardware selector, it uses the active device. For an assigned profile,
+project ELFs are loaded automatically as well. `--profile` is only needed to
+select a different symbol profile when one cannot be inferred from the selected
+device. The console exposes
 `dbg.read_log()` for the Retro-Go log buffer; it reads the buffer without
-resetting the device.
+resetting the device. On hardware, `dbg.wait_stopped()` reports a debug stop
+only when the core is stably halted. Reset transitions and register-read races
+are returned as structured states without attempting an invalid register read,
+so callers can distinguish a reset from a fault-handler breakpoint.
 
 `arm_fault_breakpoints()` uses whichever of `common_fault_handler_c`,
 `HardFault_Handler`, `MemManage_Handler`, `BusFault_Handler`, and
@@ -616,19 +622,37 @@ loaded ELF and returns that function's assembly listing. `dbg.addr2line(address)
 uses `arm-none-eabi-addr2line` (or `addr2line`) to resolve runtime addresses to
 source lines, including section rebases. `diagnose` includes source locations
 and nearby disassembly when the PC belongs to a loaded ELF.
+For core and homebrew startup, `dbg.arm_project_launch(elf=PROJECT_ELF,
+entry_symbol="app_main")` sets breakpoints at `gnw_core_entry` and the selected
+C entry point. To include the firmware loader, pass
+`firmware_elf=FIRMWARE_ELF, loader_symbol="run_dynamic_core"` (or
+`"run_gwhb_homebrew"`). Then call `dbg.next_project_launch_event()` to resume
+to the next launch breakpoint and report which boundary it reached. This shows
+whether execution reached the loader, the core trampoline, and the app entry;
+it does not reset the target or claim to identify an internal loader failure.
+`dbg.project_entry_args(elf=PROJECT_ELF)` decodes the load-state, start-paused,
+and save-slot arguments when stopped at the trampoline or `app_main`.
+`dbg.core_load_report(elf=PROJECT_ELF)` reports ELF load segments, RAM_EMU
+code/BSS use, and optional ITCM/RAM_UC fit. `dbg.resolve_project_address(address,
+elf=PROJECT_ELF)` restricts address lookup to that project's ELF.
+`dbg.arm_firmware_boot(elf=FIRMWARE_ELF)` sets breakpoints at available reset,
+system-init, and `main` symbols without resetting the target.
+`dbg.breakpoints()` lists breakpoints installed through GWProv's debugger
+helpers, and `dbg.bp_symbol(name, elf=...)` sets one by name.
+
+When the target is already halted, `dbg.capture_crash_bundle("crash.zip")`
+saves a shareable report with registers, stack traces, fault/watchdog context,
+and the Retro-Go log when available. GWemu bundles also include a screenshot.
+Hardware capture reads the stopped target and does not reset or resume it.
 Use `dbg.watchpoint(address, size=4, access="read")` to stop on a DWT or
 GWemu remote-debug memory access. This can reveal which code reads a known
 peripheral register even when firmware symbols are missing; the stop PC and
 `dbg.addr2line()` identify the access site when symbols or debug data are
 available. A watchpoint observes memory accesses, not CPU register values.
-For firmware that returns its button mask in a register,
-`dbg.press_button(return_at, mask)` injects clean release polls, one or more
-pressed polls, then a release at the routine's return site. Supply the firmware-
-specific return address or symbol and button mask; the debugger does not assume
-an application or button mapping. `dbg.inject_return(return_at, value,
-register="r0")` is the single-poll primitive for other scalar-returning
-routines. Both helpers resume after each injected value and leave the target
-halted if another breakpoint or fault interrupts the operation.
+`dbg.inject_return(return_at, value, register="r0")` is the single-poll
+primitive for scalar-returning routines. It resumes after the injected value
+and leaves the target halted if another breakpoint or fault interrupts the
+operation.
 `dbg.symbols.sections()` shows link-time ranges. When a mapped sidecar's runtime
 base is known, call `dbg.symbols.rebase(".xip_dkc1", actual_base)`; later
 lookups translate symbols in that section while leaving the ELF unchanged.
@@ -837,11 +861,13 @@ left alone.
 `gwprov ps` combines GWemu process/application state with locally visible hardware
 probes. A physical row reports `BUSY` while a substantial operation owns the
 target. Writes and reset transitions suppress polling until their lease ends.
-The daemon continues polling while a verified idle RAM flasher is ready, and
-between calls in local PyOCD Python debug sessions that use the daemon-owned
-adapter connection. If an operation is interrupted before the target's state is
-verified, the daemon pauses target traffic until `gwprov device recover` or a
-verified return to application firmware clears the marker. Other direct
+The daemon derives Recovery Mode and firmware state from live target reads; it
+does not persist a recovery or interrupted-operation marker. When it sees an
+external gnwmanager, OpenOCD, or PyOCD session, it closes its monitor connection
+and reports the external process, PID, command, adapter, and handoff time in
+`externalSession`. The last live target observation remains available as
+`lastObserved` while reads are suspended. When the external session exits, the
+daemon clears that record and performs a fresh poll. Other direct GWProv
 hardware sessions hand the connection to their owner and pause polling.
 
 Hardware identification checks residual ITCM and the RDP lock state first, then
@@ -894,6 +920,20 @@ origins, pass the matching `--remote-origin` once per URL. The remote protocol
 supports memory writes and target control, so expose servers only on loopback or
 a trusted network, preferably through an SSH tunnel or TLS. Its reset operation
 uses the server's reset-and-halt followed by resume.
+
+For one machine-local owner, run gnwmanager's server and point GWProv at it:
+
+```sh
+gnwmanager --backend pyocd serve --port 8765
+gwprov adapters add local-gnwmanager ws://127.0.0.1:8765/gdb
+gwprov set active local-gnwmanager
+gwprov ps
+```
+
+The current gnwmanager server accepts one WebSocket client at a time. GWProv
+can pass target reads, writes, register access, and reset/control calls through
+that connection, but it does not yet multiplex an independent web-builder
+client onto the same server session.
 
 ## CLI
 

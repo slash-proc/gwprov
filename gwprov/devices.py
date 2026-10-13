@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 
 def device_rows(profile: str | None = None, *, refresh: bool = False) -> list[dict]:
@@ -28,6 +29,8 @@ def device_rows(profile: str | None = None, *, refresh: bool = False) -> list[di
         rows.append({"id": f"gwemu:{vm['pid']}", "kind": "gwemu",
                      "backend": "GWProv daemon" if str(vm.get("qmpSocket", "")).startswith("gwprov://") else "QMP",
                      "name": vm.get("profile") or f"GWemu pid {vm['pid']}",
+                     "profile": vm.get("profile"), "gdbPort": vm.get("gdbPort"),
+                     "qmpSocket": vm.get("qmpSocket"),
                      "status": vm["status"], "application": application,
                      "pid": vm["pid"], "display": vm.get("display"),
                      "detail": vm.get("stateDetail") or app_detail})
@@ -60,13 +63,30 @@ def device_rows(profile: str | None = None, *, refresh: bool = False) -> list[di
                                       else get_active_origin())})
     from .device_assignments import assignments
     assigned = assignments()
+    gwemu_groups: dict[str, list[dict]] = {}
     for row in rows:
         values = assigned.get(row["id"], {})
         if values.get("profile"):
             row["assignedProfile"] = values["profile"]
         if values.get("sdcard"):
             row["sdCard"] = values["sdcard"]
-    return sorted(rows, key=lambda row: (row["kind"], row["name"].casefold(), row["id"]))
+        if row.get("kind") == "gwemu":
+            profile = str(row.get("profile") or "")
+            gwemu_groups.setdefault(profile, []).append(row)
+    for profile, group in gwemu_groups.items():
+        base = Path(profile).name if profile else "gwemu"
+        for index, row in enumerate(sorted(group, key=lambda item: int(item.get("pid") or 0)), 1):
+            default_name = f"{base}-{index:02d}"
+            row["displayName"] = assigned.get(row["id"], {}).get("name") or default_name
+    for row in rows:
+        if row.get("kind") != "gwemu":
+            values = assigned.get(row["id"], {})
+            profile = values.get("profile")
+            default_name = Path(profile).name if profile else row.get("name") or row["id"]
+            row["displayName"] = values.get("name") or default_name
+    return sorted(rows, key=lambda row: (row["kind"],
+                                         str(row.get("displayName", row.get("name", ""))).casefold(),
+                                         row["id"]))
 
 
 def show_devices(*, output: str = "text", profile: str | None = None,

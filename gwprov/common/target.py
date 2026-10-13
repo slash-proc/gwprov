@@ -64,12 +64,6 @@ def _make_run_dir():
     return d
 
 
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 class _PipeSocket:
     """Socket-shaped adapter for QEMU's GDB stdio chardev."""
 
@@ -169,7 +163,7 @@ class QMP:
         last = None
         while time.time() < deadline:
             try:
-                self.sock = socket.create_connection(("localhost", port), 2.0)
+                self.sock = socket.create_connection(("127.0.0.1", port), 2.0)
                 break
             except OSError as exc:
                 last = exc
@@ -280,8 +274,15 @@ class GwemuTarget(Target):
         self.timeline = timeline
         self.record = record
         self.stdio_gdb = stdio_gdb
-        self.port = port or (None if stdio_gdb else _free_port())
-        self.qmp_port = qmp_port or (None if stdio_gdb else _free_port())
+        if stdio_gdb:
+            self.port = None
+            self.qmp_port = None
+            self._allocated_ports = ()
+        else:
+            from ..ports import allocate_gwemu_ports
+            self.port, self.qmp_port = allocate_gwemu_ports(
+                gdb_port=port, qmp_port=qmp_port)
+            self._allocated_ports = (self.port, self.qmp_port)
         self.proc = None
         self.qmp = None
         self.keep_temp = keep_temp
@@ -335,8 +336,8 @@ class GwemuTarget(Target):
         if self.stdio_gdb:
             cmd += ["-gdb", "stdio", "-S"]
         else:
-            cmd += ["-qmp", f"tcp:localhost:{self.qmp_port},server=on,wait=off",
-                    "-gdb", f"tcp::{self.port}", "-S"]
+            cmd += ["-qmp", f"tcp:127.0.0.1:{self.qmp_port},server=on,wait=off",
+                    "-gdb", f"tcp:127.0.0.1:{self.port}", "-S"]
         if self.icount is not None:
             # Without -icount, virtual time follows host wall-clock and DWT
             # counts vary ~14% run to run. See docs/06.
@@ -363,7 +364,7 @@ class GwemuTarget(Target):
             self.backend = GDBPipeBackend(self.proc)
         else:
             self.qmp = QMP(self.qmp_port)
-            self.backend = GDBBackend(host="localhost", port=self.port)
+            self.backend = GDBBackend(host="127.0.0.1", port=self.port)
         self.backend.open()
         self.sdcard = QemuSDCardManager(os.path.join(self.tmpdir, "sdcard.img"))
         self.backend.resume()
@@ -404,6 +405,10 @@ class GwemuTarget(Target):
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
         finally:
+            if self._allocated_ports:
+                from ..ports import release_ports
+                release_ports(*self._allocated_ports)
+                self._allocated_ports = ()
             if self.keep_temp:
                 print(f"kept run dir: {self.tmpdir}")
             self._cleanup()

@@ -189,8 +189,6 @@ def identify_runtime(backend, *, start_locked_stub: bool = False,
     if locked is True and not state["stubDetected"] and start_locked_stub:
         # This is the web-builder locked-device attach behavior: a locked target
         # cannot be scanned, so start the RAM flasher immediately. Persist the
-        # no-poll marker before reset/RAM writes; it survives this inventory
-        # process closing the debug connection.
         mark_backend_recovery_required(backend, "starting recovery flasher for locked device")
         try:
             from gnwmanager.gnw import GnW
@@ -719,45 +717,18 @@ def _restore_h7_watchdogs(backend, changed: dict[int, tuple[int, int]]) -> None:
 
 
 def mark_backend_recovery_required(backend, phase: str) -> None:
-    """Persist a no-poll guard across process exits for every lease key held."""
-    leases = [getattr(backend, "_lease", None),
-              *getattr(backend, "_probe_leases", [])]
-    for lease in leases:
-        if lease is not None:
-            lease.mark_recovery_required(phase)
-    if not any(lease is not None for lease in leases):
-        key = getattr(backend, "target_key", None)
-        if key:
-            from .target_leases import update_device_marker
-            update_device_marker(key, phase=phase)
+    """Deprecated compatibility hook; recovery state is read from the target."""
+    return None
 
 
 def mark_backend_flasher_ready(backend) -> None:
-    """Record that the idle RAM service is ready, without claiming a live lease."""
-    leases = [getattr(backend, "_lease", None),
-              *getattr(backend, "_probe_leases", [])]
-    for lease in leases:
-        if lease is not None:
-            lease.mark_flasher_ready()
-    if not any(lease is not None for lease in leases):
-        key = getattr(backend, "target_key", None)
-        if key:
-            from .target_leases import update_device_marker
-            update_device_marker(key, phase="gnwmanager RAM flasher ready", flasher_ready=True)
+    """Deprecated compatibility hook; recovery state is read from the target."""
+    return None
 
 
 def clear_backend_recovery_required(backend) -> None:
-    """Clear the durable no-poll guard only after the target is back in bank 1."""
-    leases = [getattr(backend, "_lease", None),
-              *getattr(backend, "_probe_leases", [])]
-    for lease in leases:
-        if lease is not None:
-            lease.clear_recovery_required()
-    if not any(lease is not None for lease in leases):
-        key = getattr(backend, "target_key", None)
-        if key:
-            from .target_leases import update_device_marker
-            update_device_marker(key)
+    """Deprecated compatibility hook; no host-side recovery marker is kept."""
+    return None
 
 
 def attach_to_idle_gnwmanager(backend, gnw, *, timeout: float = 5.0) -> int:

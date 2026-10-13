@@ -62,13 +62,12 @@ def inventory() -> list[dict]:
     from .target_leases import (adapter_for_probe, external_local_owner,
                                 lease_owner)
 
-    external = external_local_owner()
     rows = []
 
     def owner_state(owner: dict | None, available: str) -> str:
         if owner is None:
             return available
-        active = owner.get("lease_active", not owner.get("recovery_required"))
+        active = bool(owner.get("lease_active")) or str(owner.get("key", "")).startswith("external-")
         if active:
             from .target_leases import operation_is_busy
             return "busy" if operation_is_busy(owner) else available
@@ -76,17 +75,20 @@ def inventory() -> list[dict]:
 
     for probe in enumerate_local_probes():
         adapter_type = adapter_for_probe(f"{probe['vendor']} {probe['name']}") or probe["backend"]
+        external = external_local_owner(adapter_type)
         owner = (lease_owner(f"probe:{probe['id']}")
                  or lease_owner(f"adapter:{adapter_type}"))
         if (external and external.get("adapter") in (None, adapter_type)
-                and (owner is None or (owner.get("flasher_ready")
-                                      and not owner.get("lease_active")))):
+                and owner is None):
             owner = external
-        detail = owner.get("operation") if owner and owner.get("lease_active") else None
+        detail = owner.get("operation") if owner and (
+            owner.get("lease_active") or str(owner.get("key", "")).startswith("external-")) else None
+        if detail and owner.get("pid"):
+            detail = f"{detail} (pid {owner['pid']})"
         rows.append({"id": f"probe:{probe['id']}", "name": probe["name"],
                      "adapter": adapter_type, "type": "local",
                      "state": owner_state(owner, "available"),
-                     "detail": detail})
+                     "detail": detail, "owner": owner})
     for remote in list_remote():
         device_id = f"remote:{remote['url']}"
         owner = lease_owner(f"remote:{remote['url']}")

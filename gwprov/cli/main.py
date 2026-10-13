@@ -781,16 +781,28 @@ def _set_assignment(args) -> int:
     device = get_active()
     if not device:
         raise ValueError("no active device; select one with `gwprov set active DEVICE`")
-    field = "profile" if args.set_command == "profile" else "sdcard"
+    field = args.set_command
     if args.value is None:
         value = get_assignment(device).get(field)
-        print(f"Active device {device} {field}: {value or 'not set'}")
+        label = "display name" if field == "name" else field
+        if field == "name" and not value:
+            from gwprov.devices import device_rows
+            row = next((row for row in device_rows() if row["id"] == device), None)
+            default = row.get("displayName") if row else None
+            print(f"Active device {device} display name: default ({default or 'unknown'})")
+        else:
+            print(f"Active device {device} {label}: {value or 'not set'}")
         return 0
     if args.value.casefold() in {"none", "clear"}:
         set_assignment(device, field, None)
-        print(f"Cleared {field} assignment for {device}")
+        label = "display name" if field == "name" else f"{field} assignment"
+        print(f"Cleared {label} for {device}")
         return 0
-    if field == "profile":
+    if field == "name":
+        value = args.value.strip()
+        if not value or any(char in value for char in "\r\n\0"):
+            raise ValueError("device name must be a non-empty single-line value")
+    elif field == "profile":
         from gwprov.profiles import DeviceProfile
         value = str(DeviceProfile.load(args.value).root)
     else:
@@ -804,7 +816,8 @@ def _set_assignment(args) -> int:
             raise ValueError(f"unknown SD card {args.value!r}; registered cards: {choices}")
         value = card["name"]
     set_assignment(device, field, value)
-    print(f"Assigned {field} {value} to {device}")
+    label = "display name" if field == "name" else field
+    print(f"Set {label} for {device}: {value}")
     return 0
 
 
@@ -1084,9 +1097,10 @@ def _adapters_list(args) -> int:
     table.add_column("TYPE", overflow="fold")
     table.add_column("ID", overflow="fold")
     table.add_column("STATE")
+    table.add_column("DETAILS", overflow="fold")
     for row in rows:
         table.add_row("●" if row["id"] == active else "", row["name"], row["adapter"],
-                      row["id"], row["state"].upper())
+                      row["id"], row["state"].upper(), row.get("detail") or "")
     Console().print(table)
     if active:
         print("● Active device")
@@ -1627,6 +1641,9 @@ def _report_render(args) -> int:
 def _debug_python(args) -> int:
     from gwprov.debug_shell import python_shell
 
+    if args.autostart_timeout is not None and args.autostart_timeout < 0:
+        raise ValueError("--autostart-timeout must be nonnegative")
+
     symbol_paths = list(args.symbols)
     qmp_socket = args.qmp_socket
     profile = args.profile
@@ -1637,6 +1654,7 @@ def _debug_python(args) -> int:
     detected_retro_go = None
     active_row = None
     target = args.target
+    gdb_port = args.port
     if args.device:
         if any((probe_ids, programmers, remote_urls)):
             raise ValueError("use either the positional device or --probe-id/--programmer/--remote-url")
@@ -1708,6 +1726,8 @@ def _debug_python(args) -> int:
             if vm:
                 qmp_socket = vm.get("qmpSocket")
                 profile = vm.get("profile") or active_row.get("assignedProfile")
+                if gdb_port is None:
+                    gdb_port = vm.get("gdbPort")
         active_id = get_active()
         selected_is_active = (active_row is None or active_row.get("id") == active_id)
         if qmp_socket is None and profile is None and active_id and selected_is_active:
@@ -1720,25 +1740,46 @@ def _debug_python(args) -> int:
         from gwprov.profiles import DeviceProfile
         profile_root = DeviceProfile.load(profile).root
         firmware_symbols = profile_root / "debug" / "retro-go-debug.elf"
-        if not firmware_symbols.is_file():
-            raise ValueError(f"profile has no bundled firmware symbols: {firmware_symbols}")
-        symbol_paths.insert(0, str(firmware_symbols))
-        app_symbols = sorted((firmware_symbols.parent / "apps").rglob("*.elf"))
-        symbol_paths[1:1] = [str(path) for path in app_symbols]
+        if firmware_symbols.is_file():
+            symbol_paths.insert(0, str(firmware_symbols))
+        debug_root = profile_root / "debug"
+        app_symbols = sorted((debug_root / "apps").rglob("*.elf")) if (debug_root / "apps").is_dir() else []
+        project_symbols = sorted((debug_root / "projects").rglob("*.elf")) if (debug_root / "projects").is_dir() else []
+        symbol_paths[1:1] = [str(path) for path in [*app_symbols, *project_symbols]
+                             if str(path) not in symbol_paths]
+        if not firmware_symbols.is_file() and not app_symbols and not project_symbols and not symbol_paths:
+            raise ValueError(f"profile has no bundled debug symbols: {debug_root}")
         if target == "gwemu" and qmp_socket is None:
             from gwprov.gwemu_manager import instances
             matches = [row for row in instances() if row.get("profile") == str(profile_root)]
             if len(matches) == 1:
                 qmp_socket = matches[0].get("qmpSocket")
+                if gdb_port is None:
+                    gdb_port = matches[0].get("gdbPort")
             elif len(matches) > 1:
                 raise ValueError("profile has multiple GWemu instances; select a QMP handle explicitly")
-    return python_shell(target=target, host=args.host, port=args.port,
+    elif active_row and active_row.get("assignedProfile"):
+        from gwprov.profiles import DeviceProfile
+        assigned_root = DeviceProfile.load(active_row["assignedProfile"]).root
+        project_root = assigned_root / "debug" / "projects"
+        if project_root.is_dir():
+            for path in sorted(project_root.rglob("*.elf")):
+                if str(path) not in symbol_paths:
+                    symbol_paths.append(str(path))
+    if target == "gwemu" and gdb_port is None:
+        raise ValueError("GWemu GDB port was not supplied and could not be inferred; "
+                         "pass --port or select a managed GWemu instance")
+    return python_shell(target=target, host=args.host, port=gdb_port,
                         openocd_port=args.openocd_port, probe_ids=probe_ids,
                         programmers=programmers, remote_urls=remote_urls,
                         remote_origins=remote_origins,
                         symbols=symbol_paths,
                         qmp_socket=qmp_socket, debug_config=args.debug_config,
-                        retro_go_version=detected_retro_go)
+                        retro_go_version=detected_retro_go,
+                        start_paused=args.paused,
+                        attach_only=args.attach_only,
+                        autostart_timeout=args.autostart_timeout,
+                        watchdog_freeze=not args.no_watchdog_freeze)
 
 
 def _ofw_patch(args) -> int:
@@ -2769,7 +2810,7 @@ _gwprov_complete() {
     case "${COMP_WORDS[1]}" in
       show) candidates="adapters devices projects profile perf sdcard" ;;
       config) candidates="show" ;;
-      set) candidates="active profile sdcard" ;;
+      set) candidates="active profile sdcard name" ;;
       deploy) candidates="plan apply" ;;
       ps) candidates="--help -h --output --no-pager --profile" ;;
       apply) candidates="--help -h -y --yes -f --force --start --bank -o --output" ;;
@@ -3027,7 +3068,7 @@ _gwprov() {
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       show) candidates="adapters devices projects profile perf sdcard" ;;
       config) candidates="show" ;;
-      set) candidates="active profile sdcard" ;;
+      set) candidates="active profile sdcard name" ;;
       *) candidates="" ;;
     esac
   elif (( CURRENT == 4 )) && [[ ( ${words[2]} == sdcard || ${words[2]} == sd ) && ${words[3]} == add && "$cur" != -* ]]; then
@@ -3285,9 +3326,11 @@ def build_parser() -> argparse.ArgumentParser:
     active.add_argument("--remote-origin", help="Origin required by a selected WebSocket server")
     active.set_defaults(handler=_set_active)
     for field, help_text in (("profile", "assign a device profile to the active device"),
-                             ("sdcard", "assign a registered SD card to the active device")):
+                             ("sdcard", "assign a registered SD card to the active device"),
+                             ("name", "set a display name for the active device")):
         assignment = set_commands.add_parser(field, help=help_text)
-        assignment.add_argument("value", nargs="?", metavar="NAME")
+        assignment.add_argument("value", nargs="?", metavar="VALUE",
+                                help="new value; use clear to remove the assignment")
         assignment.set_defaults(handler=_set_assignment)
     sdcard = commands.add_parser("sdcard", aliases=("sd",),
                                  help="manage mounted SD cards and card images")
@@ -3378,14 +3421,14 @@ def build_parser() -> argparse.ArgumentParser:
     debug_commands = debug_tools.add_subparsers(dest="debug_command", required=True)
     python_debug = debug_commands.add_parser(
         "python", help="attach a persistent Python console to a selected device",
-        description="Attach a Python console to a named device or the active device. The target kind is inferred from the selected device.",
-        epilog="Examples:\n  gwprov debug python\n  gwprov debug python probe:290077000E0000513751594E\n  gwprov debug python 'GWemu pid 12345'\n  gwprov debug python --target hardware --probe-id 290077000E0000513751594E")
+        description="Attach to a named or active device. Hardware autostart can be skipped with --attach-only.",
+        epilog="Examples:\n  gwprov debug python\n  gwprov debug python --attach-only\n  gwprov debug python --attach-only --no-watchdog-freeze\n  gwprov debug python --autostart-timeout 20\n  gwprov debug python probe:290077000E0000513751594E\n  gwprov debug python 'GWemu pid 12345'\n  gwprov debug python --target hardware --probe-id 290077000E0000513751594E")
     python_debug.add_argument("device", nargs="?", help="device name or ID; defaults to the active device")
     python_debug.add_argument("--target", choices=("gwemu", "hardware"),
                               help="target kind when using an explicit backend or the active device")
     python_debug.add_argument("--host", default="127.0.0.1")
-    python_debug.add_argument("--port", type=int, default=1234,
-                              help="GWemu GDB port (default: 1234)")
+    python_debug.add_argument("--port", type=int,
+                              help="GWemu GDB port; inferred for a managed instance")
     python_debug.add_argument("--openocd-port", type=int, default=6666)
     python_debug.add_argument("--probe-id", action="append", default=[],
                               help="select a local PyOCD probe by unique ID (repeatable; defaults to the active device)")
@@ -3396,11 +3439,19 @@ def build_parser() -> argparse.ArgumentParser:
                               help="connect through the daemon to one gnwmanager serve URL; repeat for independent servers")
     python_debug.add_argument("--remote-origin", action="append", default=[],
                               help="Origin header for the corresponding remote URL (repeatable)")
-    python_debug.add_argument("--qmp-socket", help="GWProv-managed QMP handle; normally discovered from --profile")
+    python_debug.add_argument("--qmp-socket", help="GWProv-managed QMP handle; normally discovered from the selected device")
     python_debug.add_argument("--debug-config", help="local ELF/map, relocation and counter descriptor")
-    python_debug.add_argument("--profile", help="load the profile's bundled official Retro-Go ELF symbols")
+    python_debug.add_argument("--profile", help="select a symbol profile when it is not inferred from the selected device")
     python_debug.add_argument("--symbols", action="append", default=[], metavar="ELF",
-                              help="load an additional firmware or app ELF (repeatable)")
+                              help="load additional firmware, app, or project ELF symbols (repeatable)")
+    python_debug.add_argument("--paused", action="store_true",
+                              help="set start_paused at the project's app_main autostart hook")
+    python_debug.add_argument("--attach-only", action="store_true",
+                              help="open the Python console without resetting or waiting for app_main")
+    python_debug.add_argument("--autostart-timeout", type=float, metavar="SECONDS",
+                              help="return to the Python console if automatic app_main launch takes this long")
+    python_debug.add_argument("--no-watchdog-freeze", action="store_true",
+                              help="do not write MCU watchdog-freeze bits on attach")
     python_debug.set_defaults(handler=_debug_python)
 
     project = commands.add_parser("projects", aliases=("project",),
@@ -3683,7 +3734,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     debug = gwemu_commands.add_parser("debug", help="run GWemu under GDB with bundled firmware symbols")
     debug.add_argument("--profile", help="override the active GWemu device")
-    debug.add_argument("--gdb-port", type=int, default=1234)
+    debug.add_argument("--gdb-port", type=int,
+                       help="GDB port; automatic allocation starts at 1235")
     debug.add_argument("--headless", action="store_true",
                         help="run without a display window")
     debug.add_argument("--symbols", help="override profile's matching firmware ELF")

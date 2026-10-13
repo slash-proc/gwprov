@@ -862,7 +862,9 @@ def _application_state_from_target(symbol_table, firmware: Path, app_elfs: list[
 
     function_names = {name for name in active_names if name}
     if current and current["elf"] != str(firmware):
-        return "Running"
+        project = next((elf for elf in reversed(app_elfs)
+                        if str(elf) == current["elf"]), None)
+        return f"Running: {project.stem}" if project else "Running"
     if function_names & {"run_gwhb_homebrew", "run_homebrew"}:
         return "Starting"
     if function_names & {"app_main", "main"}:
@@ -887,6 +889,9 @@ def _application_state(row: dict[str, Any]) -> str:
     symbol_table = SymbolTable()
     symbol_table.load(firmware)
     app_elfs = sorted((root / "debug" / "apps").rglob("*.elf"))
+    project_root = root / "debug" / "projects"
+    if project_root.is_dir():
+        app_elfs.extend(sorted(project_root.rglob("*.elf")))
     for elf in app_elfs:
         symbol_table.load(elf)
     def read_memory(address, size):
@@ -1052,9 +1057,11 @@ def start_instance(profile: str, *, audio: bool = False,
         raise ValueError("managed GWemu uses QMP over the private GWProv daemon channel; "
                          "--qmp-socket is not available for `gwprov gwemu start`")
     if gdb_port is None:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            gdb_port = probe.getsockname()[1]
+        from .ports import DEFAULT_GDB_PORT, find_free_port
+        gdb_port = find_free_port(DEFAULT_GDB_PORT)
+    else:
+        from .ports import validate_requested_port
+        gdb_port = validate_requested_port(gdb_port)
     from .daemon import start_instance as daemon_start
     row = daemon_start(str(root), audio=audio, gdb_port=gdb_port, headless=headless,
                       timeline=timeline, record_timeline=record_timeline,

@@ -122,13 +122,11 @@ stub.
 synchronizes its context counter when already live and idle. It restarts an
 idle but halted or terminal-error stub; it refuses a busy or unreadable
 resident service. Recovery leaves the device in Recovery Mode ready for commands.
-The target lease keeps a durable marker for the RAM service state. `gwprov ps`
-reports `BUSY` while a substantial process holds the target lease; otherwise it
-reports the observed running, halted, or unknown state. The daemon continues
-passive polling while a verified idle flasher is ready. If an operation is
-interrupted before the target state is verified, polling pauses until explicit
-recovery or a verified return to application firmware clears the interruption
-marker. The application column identifies the gnwmanager Recovery stub when
+`gwprov ps` reports `BUSY` while a substantial process holds the target lease;
+otherwise it reports the observed running, halted, or unknown state. Recovery
+state is never represented by a durable host-side marker: the daemon reads the
+target's VTOR, mailbox, DHCSR, and firmware signatures on its next poll. The
+application column identifies the gnwmanager Recovery stub when
 its live state is confirmed. VTOR, mailbox, DHCSR, and firmware signatures
 distinguish the stub from a transient SRAM application, and identify stock
 Mario/Zelda, bootloader, or Retro-Go version when signatures are readable.

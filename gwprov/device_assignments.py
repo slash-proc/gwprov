@@ -23,7 +23,7 @@ def assignments() -> dict[str, dict[str, str]]:
     if not isinstance(rows, dict):
         raise RuntimeError(f"invalid device assignments file: {path}")
     return {key: {name: value for name, value in row.items()
-                   if name in {"profile", "sdcard"} and isinstance(value, str)}
+                   if name in {"profile", "sdcard", "name"} and isinstance(value, str)}
             for key, row in rows.items() if isinstance(key, str) and isinstance(row, dict)}
 
 
@@ -32,8 +32,12 @@ def get_assignment(device_id: str) -> dict[str, str]:
 
 
 def set_assignment(device_id: str, field: str, value: str | None) -> Path:
-    if field not in {"profile", "sdcard"}:
+    if field not in {"profile", "sdcard", "name"}:
         raise ValueError(f"unsupported device assignment: {field}")
+    if field == "name" and value is not None:
+        value = value.strip()
+        if not value or any(char in value for char in "\r\n\0"):
+            raise ValueError("device name must be a non-empty single-line value")
     rows = assignments()
     current = rows.setdefault(device_id, {})
     if value is None:

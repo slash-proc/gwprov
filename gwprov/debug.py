@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 
-def debug_profile(profile_dir: str, *, gdb_port: int = 1234, headless: bool = False,
+def debug_profile(profile_dir: str, *, gdb_port: int | None = None, headless: bool = False,
                   qmp_socket: str | None = None, qmp_enabled: bool = True,
                   symbols: str | None = None, gdb: str | None = None,
                   audio: bool = False, break_on_fault: bool = True,
@@ -39,6 +39,13 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234, headless: bool = Fa
     if qmp_socket:
         raise ValueError("managed GWemu uses QMP over the private GWProv daemon channel; "
                          "--qmp-socket is not available")
+
+    if gdb_port is None:
+        from .ports import DEFAULT_GDB_PORT, find_free_port
+        gdb_port = find_free_port(DEFAULT_GDB_PORT)
+    else:
+        from .ports import validate_requested_port
+        gdb_port = validate_requested_port(gdb_port)
 
     # Validate every option needed to build the GDB script before launching
     # GWemu. It starts halted with -S; raising after Popen leaves an orphaned
@@ -144,6 +151,7 @@ def debug_profile(profile_dir: str, *, gdb_port: int = 1234, headless: bool = Fa
         print("GDB controls the GWemu session. Use continue, stepi, "
               "info registers, x/16wx ADDRESS, monitor system_reset, and bt.",
               flush=True)
+        print(f"GDB endpoint: 127.0.0.1:{gdb_port}", flush=True)
         if qmp_path:
             print("QMP controls: private GWProv daemon channel", flush=True)
         return subprocess.run(gdb_cmd, check=False).returncode

@@ -131,12 +131,12 @@ def lease_owner(key: str) -> dict | None:
         if _lock(fd, blocking=False):
             owner = _read_metadata(fd, key)
             _unlock(fd)
-            if owner.get("recovery_required"):
-                return {**owner, "lease_active": False}
             return None
         owner = _read_metadata(fd, key)
         if not owner.get("operation"):
             owner = {"key": key, "operation": "target operation (owner metadata pending)"}
+        for field in ("recovery_required", "flasher_ready", "phase", "recovery_marked"):
+            owner.pop(field, None)
         return {**owner, "lease_active": True}
     finally:
         os.close(fd)
@@ -161,6 +161,8 @@ def active_lease_owners() -> list[dict]:
                 _unlock(fd)
                 continue
             owner = _read_metadata(fd, "unknown target")
+            for field in ("recovery_required", "flasher_ready", "phase", "recovery_marked"):
+                owner.pop(field, None)
             owner["lease_active"] = True
             owners.append(owner)
         except OSError:
@@ -172,26 +174,8 @@ def active_lease_owners() -> list[dict]:
 
 def update_device_marker(key: str, *, phase: str | None = None,
                          flasher_ready: bool = False) -> None:
-    """Persist observed RAM-service state without holding a BUSY operation lease."""
-    path = _path_for(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        if os.name == "nt" and os.fstat(fd).st_size == 0:
-            os.write(fd, b"\0")
-        _lock(fd, blocking=True)
-        owner = _read_metadata(fd, key)
-        owner["key"] = key
-        if phase is None:
-            for field in ("recovery_required", "flasher_ready", "phase", "recovery_marked"):
-                owner.pop(field, None)
-        else:
-            owner.update(recovery_required=True, flasher_ready=flasher_ready,
-                         phase=phase, recovery_marked=time.time())
-        _write_metadata(fd, owner)
-        _unlock(fd)
-    finally:
-        os.close(fd)
+    """Compatibility shim for old callers; device state is never marked locally."""
+    return None
 
 
 class TargetLease:
@@ -235,6 +219,8 @@ class TargetLease:
                 owner = {**previous, "key": self.key, "operation": self.operation,
                          "pid": self.owner_pid or os.getpid(), "started": time.time(),
                          "daemon_owned": self.daemon_owned}
+                for field in ("recovery_required", "flasher_ready", "phase", "recovery_marked"):
+                    owner.pop(field, None)
                 self.owner = owner
                 try:
                     _write_metadata(fd, owner)
@@ -264,29 +250,16 @@ class TargetLease:
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
     def mark_recovery_required(self, phase: str) -> None:
-        if self.fd is None or self.owner is None:
-            raise RuntimeError("target lease must be held before recording its device mode")
-        self.owner.pop("flasher_ready", None)
-        self.owner.update(recovery_required=True, phase=phase,
-                          recovery_marked=time.time())
-        _write_metadata(self.fd, self.owner)
+        """Deprecated compatibility hook; target mode comes from live polling."""
+        return None
 
     def mark_flasher_ready(self) -> None:
-        """Record a verified idle RAM flasher without calling it an active lease."""
-        if self.fd is None or self.owner is None:
-            raise RuntimeError("target lease must be held before recording its device mode")
-        self.owner.update(recovery_required=True, flasher_ready=True,
-                          phase="gnwmanager RAM flasher ready", recovery_marked=time.time())
-        _write_metadata(self.fd, self.owner)
+        """Deprecated compatibility hook; target mode comes from live polling."""
+        return None
 
     def clear_recovery_required(self) -> None:
-        if self.fd is None or self.owner is None:
-            raise RuntimeError("target lease must be held before clearing device mode")
-        self.owner.pop("recovery_required", None)
-        self.owner.pop("flasher_ready", None)
-        self.owner.pop("phase", None)
-        self.owner.pop("recovery_marked", None)
-        _write_metadata(self.fd, self.owner)
+        """Deprecated compatibility hook; no host-side recovery state exists."""
+        return None
 
     def release(self) -> None:
         fd, self.fd = self.fd, None
@@ -338,8 +311,13 @@ class TargetLease:
         self.release()
 
 
-def external_local_owner() -> dict | None:
-    """Detect a debug-server process that bypasses GWProv's lease files."""
+def external_local_owner(adapter: str | None = None) -> dict | None:
+    """Detect a debug-server process that bypasses GWProv's lease files.
+
+    ``adapter`` is the normalized local adapter kind (for example ``stlink``).
+    Processes that do not expose an adapter selector, such as a plain PyOCD
+    invocation, remain conservative matches for the requested adapter.
+    """
     current = os.getpid()
 
     def describe(pid: int, name: str, command: str) -> dict | None:
@@ -360,12 +338,17 @@ def external_local_owner() -> dict | None:
                        and argv[index + 1] == module
                        for index, arg in enumerate(argv))
 
+        def is_command(command: str) -> bool:
+            return any(Path(arg).name.casefold().removesuffix(".exe") == command
+                       for arg in argv[1:])
+
         if name == "openocd" or executable == "openocd":
             adapter = next((item for item in ("stlink", "jlink", "cmsis-dap", "rpi-gpio")
                             if item in argv), None)
             return {"key": "external-openocd", "operation": "external OpenOCD session",
                     "pid": pid, "command": command[:240], "adapter": adapter}
-        if name == "gnwmanager" or executable == "gnwmanager" or is_module("gnwmanager"):
+        if (name == "gnwmanager" or executable == "gnwmanager"
+                or is_module("gnwmanager") or is_command("gnwmanager")):
             # `gnwmanager -b gdb ...` is a QEMU GDB-stub client.  It does not
             # open or own a USB debug probe, so it must not block a physical
             # PyOCD/OpenOCD session.  Keep unknown and probe-backed manager
@@ -395,7 +378,7 @@ def external_local_owner() -> dict | None:
                     continue
                 owner = describe(pid, info.get("name") or "",
                                  " ".join(info.get("cmdline") or []))
-                if owner:
+                if owner and (adapter is None or owner.get("adapter") in (None, adapter)):
                     return owner
             except Exception:
                 continue
@@ -412,7 +395,7 @@ def external_local_owner() -> dict | None:
                 command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
                 name = (entry / "comm").read_text(errors="replace").strip()
                 owner = describe(int(entry.name), name, command)
-                if owner:
+                if owner and (adapter is None or owner.get("adapter") in (None, adapter)):
                     return owner
             except (OSError, ValueError):
                 continue

@@ -142,7 +142,7 @@ class ManagedVM:
 
 
 class HardwarePoller:
-    """Daemon-owned, persistent probe session with a five-second state heartbeat."""
+    """Daemon-owned probe session with a five-second state heartbeat."""
 
     def __init__(self, probe: dict):
         self.probe = probe
@@ -165,9 +165,16 @@ class HardwarePoller:
         self.cached_banks: list[dict] | None = None
         self.banks_scanned_at = 0.0
         self.operation_lease = None
+        # An external debugger owns the physical transport while this poller
+        # remains the source of lifecycle state. Keep the last live target
+        # observation visible until the external process exits; target reads
+        # are intentionally suspended during the handoff.
+        self.external_owner: dict | None = None
 
     def poll(self, *, force: bool = False) -> None:
         with self.lock:
+            if self.release_for_external_session():
+                return
             # A foreground CLI owns the interface while its process-shared
             # lease is held. This also protects a newly started daemon before
             # that CLI has re-registered its lease heartbeat.
@@ -175,30 +182,6 @@ class HardwarePoller:
                                         operation_suppresses_poll)
             owner = lease_owner(self.key)
             active_owner = owner if owner and owner.get("lease_active") else None
-            interrupted = (owner and owner.get("recovery_required")
-                           and not owner.get("flasher_ready"))
-            if interrupted:
-                # A failed/reset-interrupted operation may have left the target
-                # in a state where even passive reads are unsafe. Preserve the
-                # last observed firmware labels, but stop all target traffic
-                # until an explicit recovery or verified firmware return clears
-                # this marker. A verified idle flasher is represented separately
-                # by flasher_ready and remains eligible for normal polling.
-                phase = owner.get("phase") or "hardware operation"
-                busy = bool(active_owner and operation_is_busy(active_owner))
-                with self.state_lock:
-                    self.state.pop("busyOwner", None)
-                    if busy:
-                        self.state["busyOwner"] = active_owner
-                    self.state.update(status="busy" if busy else "unknown",
-                        detail=(f"{active_owner.get('operation')} in progress; "
-                                "target polling paused after an interrupted operation"
-                                if busy else
-                                f"Polling paused after interrupted {phase}; "
-                                "run `gwprov device recover` to inspect the target"),
-                        interruptedOperation=True, polledAt=time.time())
-                self.last_poll = time.monotonic()
-                return
             if active_owner:
                 if operation_is_busy(active_owner):
                     self._update_state(status="busy", busyOwner=active_owner,
@@ -212,10 +195,11 @@ class HardwarePoller:
                     self._update_state(polledAt=time.time())
                     self.last_poll = time.monotonic()
                     return
-            # A verified idle flasher marker is not a live lease, so normal
-            # polling may continue. Daemon-proxied debug sessions share this
-            # connection and serialize their calls with this poller's lock;
-            # passive reads therefore continue between debugger commands.
+            # Daemon-proxied debug sessions share this connection and serialize
+            # their calls with this poller's lock; passive reads continue between
+            # debugger commands. Recovery and programming state are derived from
+            # the target on every poll and are never represented by a durable
+            # host-side marker.
             # Writes and resets suppress polling above. Locked-device stub
             # startup is separately guarded and verified below.
             if not active_owner or not operation_is_busy(active_owner):
@@ -237,7 +221,8 @@ class HardwarePoller:
                             self.probe["id"], operation="GWProv daemon monitor", lease_wait=0,
                             probe_adapter=adapter_for_probe(
                                 f"{self.probe.get('vendor', '')} {self.probe.get('name', '')}"),
-                            allow_recovery_marker=True, daemon_managed=True)
+                            allow_recovery_marker=True, daemon_managed=True,
+                            resume_on_disconnect=False)
                     self.backend.target_key = self.key
                     self.backend.open()
                     self.backend._lease = self.operation_lease
@@ -283,11 +268,6 @@ class HardwarePoller:
                     self.cached_banks = runtime["banks"]
                     self.banks_scanned_at = time.monotonic()
                 vtor = runtime.get("vtor")
-                if (runtime.get("locked") is False and not runtime.get("stubDetected")
-                        and isinstance(vtor, int) and
-                        (0x08000000 <= vtor < 0x08200000)):
-                    from .hw_lifecycle import clear_backend_recovery_required
-                    clear_backend_recovery_required(self.backend)
                 halted = runtime.get("halted")
                 service_state = runtime.get("serviceState")
                 detected_status = ("unknown" if halted is None else
@@ -303,6 +283,10 @@ class HardwarePoller:
                                    installed=runtime.get("installed", "Unknown"),
                                    detail=runtime.get("detail"),
                                    runtime=runtime, polledAt=time.time())
+                values.pop("externalOwner", None)
+                values.pop("externalSession", None)
+                values.pop("lastObserved", None)
+                self.external_owner = None
                 if active_owner and values["status"] == "busy":
                     values["busyOwner"] = active_owner
                 self._update_state(**values)
@@ -330,6 +314,70 @@ class HardwarePoller:
             self.state.pop("busyOwner", None)
             self.state.update(status="unknown", detail="Refreshing device state after operation")
         self.last_poll = 0.0
+
+    def release_for_external_session(self) -> bool:
+        """Yield a local adapter to gnwmanager/OpenOCD/PyOCD started outside GWProv."""
+        if self.probe.get("url"):
+            return False
+        with self.lock:
+            from .target_leases import adapter_for_probe, external_local_owner, lease_owner
+            owner = lease_owner(self.key)
+            if owner and owner.get("lease_active"):
+                # A foreground GWProv operation owns the target for its duration.
+                return False
+            adapter = adapter_for_probe(
+                f"{self.probe.get('vendor', '')} {self.probe.get('name', '')}")
+            external = external_local_owner(adapter)
+            if external is None:
+                if self.external_owner is None:
+                    return False
+                # The external owner disappeared. Preserve the last observed
+                # runtime until the normal poll immediately refreshes it.
+                self.external_owner = None
+                self._update_state(externalSession=None,
+                                   detail="External adapter session ended; refreshing device state",
+                                   polledAt=time.time())
+                self.last_poll = 0.0
+                return False
+            now = time.time()
+            if (self.external_owner is None
+                    or self.external_owner.get("pid") != external.get("pid")):
+                external = {**external, "started": now, "lastSeen": now}
+            else:
+                external = {**external,
+                            "started": self.external_owner.get("started", now),
+                            "lastSeen": now}
+            self.external_owner = external
+            with self.state_lock:
+                last_observed = {
+                    key: self.state.get(key)
+                    for key in ("status", "application", "installed", "runtime", "polledAt")
+                    if self.state.get(key) is not None
+                }
+            last_application = last_observed.get("application")
+            cached_note = (f"; last observed {last_application}"
+                           if last_application else "")
+            if self.backend is None:
+                self._update_state(
+                    status="unknown", lastObserved=last_observed,
+                    externalOwner=external, externalSession=external,
+                    detail=(f"Adapter owned by {external.get('operation', 'external debug session')} "
+                            f"(pid {external.get('pid', 'unknown')}); target reads suspended"
+                            f"{cached_note}"),
+                    polledAt=now)
+                self.last_poll = time.monotonic()
+                return True
+            self.backend.close()
+            self.backend = None
+            self._update_state(
+                status="unknown", lastObserved=last_observed,
+                externalOwner=external, externalSession=external,
+                detail=(f"Adapter owned by {external.get('operation', 'external debug session')} "
+                        f"(pid {external.get('pid', 'unknown')}); target reads suspended"
+                        f"{cached_note}"),
+                polledAt=now)
+            self.last_poll = time.monotonic()
+            return True
 
     def _update_state(self, **values) -> None:
         with self.state_lock:
@@ -584,9 +632,9 @@ class Service:
                     raise DeviceBusyError(key, owner)
                 if probe.get("id"):
                     from .target_leases import adapter_for_probe, external_local_owner
-                    external = external_local_owner()
                     adapter = probe.get("adapter") or adapter_for_probe(
                         f"{probe.get('vendor', '')} {probe.get('name', '')}")
+                    external = external_local_owner(adapter)
                     if external and (external.get("adapter") is None or adapter is None
                                      or external.get("adapter") == adapter):
                         raise DeviceBusyError(key, external)
@@ -766,6 +814,9 @@ class Service:
         headless = bool(message.get("headless", False))
         audio = bool(message.get("audio", False))
         gdb_port = message.get("gdb_port")
+        if gdb_port is not None:
+            from .ports import validate_requested_port
+            gdb_port = validate_requested_port(gdb_port)
         if profile_value:
             from .profiles import DeviceProfile
             profile = str(DeviceProfile.load(profile_value).root)
@@ -997,6 +1048,10 @@ class Service:
                 leases = list(self.leases.values())
             now = time.monotonic()
             for poller in pollers:
+                # Do this check independently of the five-second state poll so
+                # another tool can acquire the adapter promptly after starting.
+                if poller.release_for_external_session():
+                    continue
                 if poller.key in paused or now - poller.last_poll < 5.0:
                     continue
                 from .target_leases import operation_suppresses_poll

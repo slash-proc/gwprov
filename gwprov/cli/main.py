@@ -3074,7 +3074,7 @@ _gwprov_complete() {
       sdcard|sd) candidates="list ls add remove rm create compose" ;;
       input) candidates="tap" ;;
       report) candidates="render" ;;
-      profile) candidates="create duplicate edit list ls show apply" ;;
+      profile) candidates="create duplicate edit list ls show apply $(_gwprov_profile_names)" ;;
         perf) candidates="hardware" ;;
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       *) candidates="" ;;
@@ -3102,12 +3102,18 @@ _gwprov_complete() {
         ;;
       *) candidates="" ;;
     esac
+  elif (( COMP_CWORD == 4 )) && [[ "${COMP_WORDS[1]-}" == projects || "${COMP_WORDS[1]-}" == project ]] && [[ "${COMP_WORDS[2]-}" == install && "$cur" != -* ]]; then
+    candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == debug && "${COMP_WORDS[2]-}" == python && "$cur" != -* ]]; then
     candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == retro-go && "${COMP_WORDS[2]-}" == config && "$cur" != -* ]]; then
     candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "$cur" != -* ]]; then
     candidates="$(_gwprov_profile_names)"
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == apply && "$cur" != -* ]]; then
+    candidates="$(_gwprov_profile_names)"
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" != create && "${COMP_WORDS[2]-}" != duplicate && "${COMP_WORDS[2]-}" != edit && "${COMP_WORDS[2]-}" != list && "${COMP_WORDS[2]-}" != ls && "${COMP_WORDS[2]-}" != show && "${COMP_WORDS[2]-}" != apply && "$cur" != -* ]]; then
+    candidates="show apply edit list ls"
   elif (( COMP_CWORD == 4 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "$cur" != -* ]]; then
     candidates="add remove"
   elif (( COMP_CWORD == 5 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "${COMP_WORDS[4]-}" == add && "$cur" != -* ]]; then
@@ -3116,6 +3122,9 @@ _gwprov_complete() {
     candidates="show"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == active && "$cur" != -* ]]; then
     candidates=$(_gwprov_device_names)
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == backups && "${COMP_WORDS[2]-}" == add && "$cur" != -* ]]; then
+    _gwprov_complete_dirs "$cur"
+    return
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == profile && "$cur" != -* ]]; then
     candidates="$(_gwprov_profile_names) clear none"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == sdcard && "$cur" != -* ]]; then
@@ -3176,6 +3185,7 @@ _gwprov_complete() {
       perf:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
       profile:create) candidates="-m --mario -z --zelda -p --patched -b --bootloader -r --retro-go --content --output-dir --name --littlefs --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file --sd-bootloader-file" ;;
       profile:duplicate) candidates="--output-dir --output" ;;
+      profile:apply) candidates="--region --start --bank --output --yes --force" ;;
       profile:list|profile:ls) candidates="--output --no-pager" ;;
       profile:show) candidates="--shared-sd-root" ;;
       completion) candidates="bash zsh" ;;
@@ -3313,7 +3323,7 @@ _gwprov() {
       sdcard|sd) candidates="list ls add remove rm create compose" ;;
       input) candidates="tap" ;;
       report) candidates="render" ;;
-      profile) candidates="create duplicate edit list ls show apply" ;;
+      profile) candidates="create duplicate edit list ls show apply ${(@f)$(_gwprov_profile_names)}" ;;
       perf) candidates="hardware" ;;
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       show) candidates="adapters devices projects profile perf sdcard" ;;
@@ -3340,12 +3350,18 @@ _gwprov() {
       stage-local) _files; return ;;
       *) candidates="" ;;
     esac
+  elif (( CURRENT == 5 )) && [[ ${words[2]} == projects || ${words[2]} == project ]] && [[ ${words[3]} == install && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == debug && ${words[3]} == python && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == retro-go && ${words[3]} == config && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == edit && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_profile_names)}"
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == apply && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_profile_names)}"
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} != create && ${words[3]} != duplicate && ${words[3]} != edit && ${words[3]} != list && ${words[3]} != ls && ${words[3]} != show && ${words[3]} != apply && "$cur" != -* ]]; then
+    candidates="show apply edit list ls"
   elif (( CURRENT == 5 )) && [[ ${words[2]} == profile && ${words[3]} == edit && "$cur" != -* ]]; then
     candidates="add remove"
   elif (( CURRENT == 6 )) && [[ ${words[2]} == profile && ${words[3]} == edit && ${words[5]} == add && "$cur" != -* ]]; then
@@ -3354,6 +3370,9 @@ _gwprov() {
     candidates="show"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == active && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_device_names)}"
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == backups && ${words[3]} == add && "$cur" != -* ]]; then
+    _files
+    return
   elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == profile && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_profile_names)} clear none"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == sdcard && "$cur" != -* ]]; then
@@ -3414,6 +3433,7 @@ _gwprov() {
       perf:hardware) candidates="--probe-id --programmer --remote-url --remote-origin --profile --symbols --counter-symbol --frame-counter --total-cycle-counter --start-at --set-register --startup-timeout --duration --interval --output --format --top" ;;
       profile:create) candidates="-m --mario -z --zelda -p --patched -b --bootloader -r --retro-go --content --output-dir --name --littlefs --littlefs-mib --extflash-mib --sd-size-mib --sd-label --bootloader-repo --bootloader-version --bootloader-file --sd-bootloader-file" ;;
       profile:duplicate) candidates="--output-dir --output" ;;
+      profile:apply) candidates="--region --start --bank --output --yes --force" ;;
       profile:list|profile:ls) candidates="--output --no-pager" ;;
       profile:show) candidates="--shared-sd-root" ;;
       *) candidates="" ;;
@@ -4274,6 +4294,11 @@ def _normalize_profile_object_form(argv: list[str] | None) -> list[str] | None:
     """Accept ``profile PROFILE ACTION`` while keeping parser actions simple."""
     if argv is None:
         return None
+    if argv and argv[0] == "input" and len(argv) >= 4:
+        # Canonical object-first form: input DEVICE tap BUTTON.  Internally
+        # retain the historical input tap BUTTON parser shape.
+        if argv[1] not in {"tap"} and argv[2] == "tap":
+            return ["input", "tap", argv[3], "--device", argv[1], *argv[4:]]
     if len(argv) < 3 or argv[0] not in {"profile"}:
         return argv
     known_actions = {"create", "duplicate", "edit", "list", "ls", "show", "apply", "hardware"}

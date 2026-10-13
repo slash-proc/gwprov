@@ -698,6 +698,43 @@ def _start_profile(args) -> int:
     return 0
 
 
+def _duplicate_device(args) -> int:
+    source = _resolve_device_selector(args.device)
+    profile_path = source.get("assignedProfile") or source.get("profile")
+    if not profile_path:
+        raise ValueError("device has no managed profile to clone")
+    from gwprov.profiles import duplicate_profile, profile_destination
+    if args.part:
+        from gwprov.profiles import DeviceProfile
+        profile = DeviceProfile.load(profile_path)
+        parts = {"bank1": profile.bank1, "bank2": profile.bank2,
+                 "bank0": profile.extflash, "extflash": profile.extflash,
+                 "sdcard": profile.resolved_sd}
+        source_path = parts[args.part]
+        if source_path is None or not source_path.is_file():
+            raise ValueError(f"device profile part is missing: {source_path}")
+        if not args.output:
+            raise ValueError("--output is required when copying a device part")
+        destination = Path(args.output).expanduser().resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copyfile(source_path, destination)
+        print(f"Copied {args.part} from {source.get('displayName') or source['id']} to {destination}")
+        return 0
+    if not args.gwemu:
+        raise ValueError("choose --gwemu to clone a device, or --part PART --output FILE to copy one part")
+    from gwprov.daemon import start_instance
+    from gwprov.profiles import profile_reference
+    import secrets
+    name = args.name or f"{Path(profile_path).name}-clone-{secrets.token_hex(3)}"
+    destination = profile_destination(name, output_dir=args.output_dir)
+    duplicate_profile(profile_path, destination, output_dir=args.output_dir)
+    row = start_instance(str(destination), headless=args.headless,
+                         gdb_port=args.gdb_port)
+    print(f"Cloned {source.get('displayName') or source['id']} to GWemu {profile_reference(destination)} (pid {row['pid']}).")
+    return 0
+
+
 def _gwemu_ps(args) -> int:
     from gwprov.gwemu_manager import show_instances
     return show_instances(output=args.output, no_pager=args.no_pager)
@@ -3090,12 +3127,17 @@ _gwprov_complete() {
     --oc-level:retro-go:config) candidates="0 1 2 3" ;;
     --filesystem:media:inventory) candidates="frogfs littlefs fatfs" ;;
     --mode:media:compare) candidates="contents image" ;;
+    --part:duplicate) candidates="bank1 bank2 bank0 extflash sdcard" ;;
     --extflash-mib:profile:create) candidates="64 128 256" ;;
     --model:profile:create) candidates="auto mario zelda" ;;
     *) candidates="" ;;
   esac
   if [[ -n "$candidates" && ( "$prev" == "--variant" || "$prev" == "--format" || "$prev" == "--output" || "$prev" == "-o" || "$prev" == "--region" || "$prev" == "--programmer" || "$prev" == "--target" || "$prev" == "--bank" || "$prev" == "--oc-level" || "$prev" == "--filesystem" || "$prev" == "--mode" || "$prev" == "--extflash-mib" || "$prev" == "--model" || "$prev" == "--timing-mode" || "$prev" == "--icount" ) ]]; then
     COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
+    return
+  fi
+  if [[ "$prev" == "--part" ]]; then
+    COMPREPLY=( $(compgen -W "bank1 bank2 bank0 extflash sdcard" -- "$cur") )
     return
   fi
   if [[ "$prev" == "-r" || "$prev" == "--retro-go" ]]; then
@@ -3120,7 +3162,7 @@ _gwprov_complete() {
       completion) candidates="bash zsh" ;;
       adapters) candidates="list ls add remove rm" ;;
       start) candidates=$(_gwprov_profile_names) ;;
-      recover|pause|halt|resume|reset|logs) candidates=$(_gwprov_device_names) ;;
+      recover|pause|halt|resume|reset|logs|duplicate) candidates=$(_gwprov_device_names) ;;
       device) candidates="recover" ;;
       projects|project) candidates="list ls versions info install stage-local" ;;
       backups) candidates="add list ls" ;;
@@ -3206,6 +3248,7 @@ _gwprov_complete() {
     case "$context" in
       ps:*) candidates="--output --no-pager --profile" ;;
       config:show) candidates="--output" ;;
+      duplicate:*) candidates="--gwemu --part --name --output-dir --output --headless --gdb-port" ;;
       deploy:plan) candidates="--region -o --output" ;;
       deploy:apply) candidates="--probe-id --programmer --remote-url --remote-origin --region --start --bank -o --output" ;;
       projects:list|project:list|projects:ls|project:ls) candidates="--firmware-repo --output" ;;
@@ -3331,6 +3374,7 @@ _gwprov() {
     --input|--input-dir|--firmware|--bios|--firmware-dir|--bios-dir|--game|--game-dir|--content|--source|--profile|--output|-o|--output-dir|--bootloader-file|--sd-bootloader-file|--backup-dir|--source-tree|--image|--shared-sd-root|--retro-go-root|--rom|--rom-dir|--config|--timeline|--record-timeline|--bank1|--bank2|--extflash|--sdcard|--symbols|--debug-config|--app-symbols|--gdb|--gwemu-bin)
       _files; return ;;
     --variant) compadd -- flash sd; return ;;
+    --part) compadd -- bank1 bank2 bank0 extflash sdcard; return ;;
   esac
   case "$prev:$context" in
     --format:tree:*) compadd -- tree names; return ;;
@@ -3356,6 +3400,7 @@ _gwprov() {
     --oc-level:retro-go:config) compadd -- 0 1 2 3; return ;;
     --filesystem:media:inventory) compadd -- frogfs littlefs fatfs; return ;;
     --mode:media:compare) compadd -- contents image; return ;;
+    --part:duplicate) compadd -- bank1 bank2 bank0 extflash sdcard; return ;;
     --extflash-mib:profile:create) compadd -- 64 128 256; return ;;
     --model:profile:create) compadd -- auto mario zelda; return ;;
   esac
@@ -3369,7 +3414,7 @@ _gwprov() {
       completion) candidates="bash zsh" ;;
       adapters) candidates="list ls add remove rm" ;;
       start) candidates="${(@f)$(_gwprov_profile_names)}" ;;
-      recover|pause|halt|resume|reset|logs) candidates="${(@f)$(_gwprov_device_names)}" ;;
+      recover|pause|halt|resume|reset|logs|duplicate) candidates="${(@f)$(_gwprov_device_names)}" ;;
       device) candidates="recover" ;;
       projects|project) candidates="list ls versions info install stage-local" ;;
       backups) candidates="add list ls" ;;
@@ -3453,6 +3498,7 @@ _gwprov() {
     case "$context" in
       ps:*) candidates="--output --no-pager --profile" ;;
       config:show) candidates="--output" ;;
+      duplicate:*) candidates="--gwemu --part --name --output-dir --output --headless --gdb-port" ;;
       deploy:plan) candidates="--region -o --output" ;;
       deploy:apply) candidates="--probe-id --programmer --remote-url --remote-origin --region --start --bank -o --output" ;;
       apply) candidates="--help -h -y --yes -f --force --start --bank -o --output" ;;
@@ -3598,7 +3644,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.help_categories = (
         ("Overview and selection", ("show", "set", "ps")),
         ("All devices and adapters", ("devices", "adapters")),
-        ("Selected-device controls", ("start", "recover", "pause", "halt", "resume", "reset", "logs", "apply", "device", "gwemu", "input", "deploy", "perf", "config")),
+        ("Selected-device controls", ("start", "recover", "pause", "halt", "resume", "reset", "logs", "duplicate", "apply", "device", "gwemu", "input", "deploy", "perf", "config")),
         ("Profiles and storage", ("profile", "filesystem", "media", "sdcard")),
         ("Project catalog", ("projects",)),
         ("File workflows not yet device-scoped", ("retro-go", "ofw")),
@@ -3677,6 +3723,19 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--lines", type=int, default=80, help="number of trailing lines (default: 80)")
     logs.add_argument("--follow", "-f", action="store_true", help="follow until the managed process exits")
     logs.set_defaults(handler=_device_logs)
+    duplicate_device = commands.add_parser("duplicate", help="clone a device or copy one of its flash parts")
+    duplicate_device.add_argument("device", metavar="DEVICE", help="source device name or ID")
+    duplicate_kind = duplicate_device.add_mutually_exclusive_group(required=True)
+    duplicate_kind.add_argument("--gwemu", action="store_true",
+                                help="clone the complete managed profile into a new GWemu device")
+    duplicate_kind.add_argument("--part", choices=("bank1", "bank2", "bank0", "extflash", "sdcard"),
+                                help="copy one profile flash part")
+    duplicate_device.add_argument("--name", help="new profile/device name for --gwemu")
+    duplicate_device.add_argument("--output-dir", help="profile store for the clone")
+    duplicate_device.add_argument("--output", help="destination file for --part")
+    duplicate_device.add_argument("--headless", action="store_true")
+    duplicate_device.add_argument("--gdb-port", type=int)
+    duplicate_device.set_defaults(handler=_duplicate_device)
     device_config = commands.add_parser("config", help="inspect configuration stored on the active device")
     config_commands = device_config.add_subparsers(dest="device_config_command", required=True)
     config_show = config_commands.add_parser("show", help="read and decode Retro-Go's current /CONFIG")

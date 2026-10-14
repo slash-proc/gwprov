@@ -2412,21 +2412,8 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
         backends["gwemu"] = GwemuGDBBackend(host=host, port=port)
     elif target == "hardware":
         if not probe_ids and not programmers and not remote_urls:
-            from .active_device import get_active, get_active_origin
-            active = get_active()
-            if not active:
-                raise ValueError(
-                    "no active hardware device; select one with `gwprov set active DEVICE` "
-                    "or pass --probe-id, --programmer, or --remote-url")
-            if active.startswith("probe:"):
-                probe_ids = [active.removeprefix("probe:")]
-            elif active.startswith("remote:"):
-                remote_urls = [active.removeprefix("remote:")]
-                origin = get_active_origin()
-                remote_origins = [origin] if origin else []
-            else:
-                raise ValueError(
-                    f"active device {active!r} is not a physical hardware target")
+            raise ValueError(
+                "hardware debug requires DEVICE or --probe-id, --programmer, or --remote-url")
         from .backends import (SelectedOpenOCDBackend, SelectedPyOCDBackend,
                                WebSocketBackend)
         if len(programmers or []) != len(set(programmers or [])):
@@ -2452,7 +2439,7 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
                                              daemon_proxy=True)
         if not backends:
             raise ValueError(
-                "select an active device or pass --probe-id, --programmer, or --remote-url")
+                "select a device or pass --probe-id, --programmer, or --remote-url")
     else:
         raise ValueError(f"unknown target {target!r}")
 

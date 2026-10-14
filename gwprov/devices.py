@@ -9,9 +9,6 @@ def device_rows(profile: str | None = None, *, refresh: bool = False) -> list[di
     from .gwemu_manager import _application_state, _process_scan_restriction, instances
 
     rows = []
-    from .active_device import get_active
-    from .active_device import get_active_origin
-    active_device = get_active()
     vms = instances()
     restriction = _process_scan_restriction()
     if not vms and restriction:
@@ -45,22 +42,6 @@ def device_rows(profile: str | None = None, *, refresh: bool = False) -> list[di
                      "application": "Unknown", "installed": "Unknown",
                      "detail": f"Daemon state unavailable: {error}"}]
     rows.extend(hardware)
-    if (active_device and active_device.startswith("remote:")
-            and not any(row.get("id") == active_device for row in hardware)):
-        uri = active_device.removeprefix("remote:")
-        try:
-            from .adapters import list_remote
-            configured = next((row for row in list_remote() if row.get("url") == uri), None)
-        except (OSError, RuntimeError, ValueError):
-            configured = None
-        rows.append({"id": active_device, "kind": "hardware",
-                     "backend": "gnwmanager WebSocket",
-                     "name": configured.get("name") if configured else uri,
-                     "status": "unknown", "application": "Unknown", "installed": "Unknown",
-                     "detail": "Selected remote adapter is not present in the daemon inventory",
-                     "adapterName": configured.get("name") if configured else uri,
-                     "remoteOrigin": (configured.get("origin") if configured
-                                      else get_active_origin())})
     from .device_assignments import assignments
     assigned = assignments()
     gwemu_groups: dict[str, list[dict]] = {}

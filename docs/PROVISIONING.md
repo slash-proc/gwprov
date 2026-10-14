@@ -93,18 +93,16 @@ gwprov gwemu run --profile dev-local/profiles/retro-go-demo
 ## Inspect and edit device filesystems
 
 `gwprov show` gives a concise resource overview. Use `gwprov show devices` for
-the short device list and `gwprov ps` for detailed runtime state. Set a device
-focus with the ID shown by `show devices`; single-device controls use it when
-no explicit target is supplied:
+the short device list and `gwprov ps` for detailed runtime state. Device controls
+always take the device name or stable ID shown by `show devices`:
 
 ```bash
 gwprov show
 gwprov show devices
-gwprov set active gwemu:12345
-gwprov gwemu screenshot
+gwprov screenshot gwemu:12345 --output screenshot.png
 ```
 
-`gwprov config show` reads and decodes the active device's stored Retro-Go
+`gwprov config show DEVICE` reads and decodes a device's stored Retro-Go
 `/CONFIG`, including its CRC status. GWemu reads the running instance's extflash
 image; hardware reads its mapped LittleFS partition using the assigned profile's
 layout. Hardware inspection takes a target lease and fails while another session
@@ -116,7 +114,7 @@ point into the RAM service; `IDLE` plus a
 running core then confirms that it is live and idle. The mailbox can retain a
 stale `IDLE` value while application firmware runs, so it cannot identify the
 stub by itself. A resident stub blocks an implicit reset/load by flows that
-need to start the service. `gwprov apply` can attach to an already-running idle
+need to start the service. `gwprov profile PROFILE apply DEVICE` can attach to an already-running idle
 stub.
 `gwprov recover DEVICE` starts the RAM flasher when absent, or attaches and
 synchronizes its context counter when already live and idle. It restarts an
@@ -137,31 +135,23 @@ gnwmanager firmware image back from SRAM and verify MSP/PC register writes. A
 failed verification leaves the core halted and reports the mismatch instead of
 starting an unverified image.
 
-Assigning a profile is separate from selecting the active device. `gwprov apply`
-uses the active device's saved assignment: for GWemu it starts the assigned
-profile and replaces the active VM when its profile differs; for hardware it
-deploys the profile's flash regions and leaves the RAM flasher running. Pass
-`--start` to `gwprov deploy apply PROFILE` to start bank 1 afterward, or add
-`--bank 2` to start bank 2. A registered SD card can be associated with
-hardware so the profile's FAT files are overlaid onto that mounted folder as
-part of apply.
+Applying a profile names both resources: `gwprov profile PROFILE apply DEVICE`.
+For hardware it deploys the profile's flash regions and leaves the RAM flasher
+running. Pass `--start` to start bank 1 afterward, or add `--bank 2` to start
+bank 2. For GWemu, use `gwprov start PROFILE` to create a managed instance.
 
 ```sh
-gwprov set active probe:PROBE_ID
-gwprov config show
-gwprov config show --output json
-gwprov set profile dkc1
+gwprov config show probe:PROBE_ID
+gwprov config show probe:PROBE_ID --output json
+gwprov profile dkc1 apply probe:PROBE_ID
 gwprov sdcard add /Volumes/RETROGO       # name defaults to RETROGO
-gwprov set sdcard RETROGO
-gwprov apply
 ```
 
 Register mounted folders or drive roots with `gwprov sdcard add PATH [NAME]`.
 Names default to the folder name on Unix-like systems and the drive letter on
 Windows. Registration records the path only; it does not format the card.
-Inspect cards with `gwprov sdcard list` or `gwprov show sdcard`. Clear an
-assignment with `gwprov set profile none` or `gwprov set sdcard none` before
-removing a resource. The same `sdcard` command creates and populates raw card
+Inspect cards with `gwprov sdcard list` or `gwprov show sdcard`. The same
+`sdcard` command creates and populates raw card
 images with `gwprov sdcard create` and `gwprov sdcard compose`; `sd` remains a
 short alias for the full command group.
 
@@ -173,8 +163,7 @@ local programmers and registered remote servers. Register one remote
 gwprov adapters add pi-probe ws://10.2.3.122:8765/gdb
 gwprov adapters list
 gwprov devices
-gwprov set active pi-probe
-gwprov input tap B
+gwprov input pi-probe tap B
 gwprov adapters remove pi-probe
 ```
 

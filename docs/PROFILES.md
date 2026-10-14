@@ -66,19 +66,19 @@ assembling multiple profiles.
 
 Projects can also be installed directly into an existing profile. This updates
 the profile files only; it does not connect to or flash hardware. Use
-`deploy apply` afterward to write the updated profile:
+`profile PROFILE apply DEVICE` afterward to write the updated profile:
 
 ```console
 gwprov project install doom --profile dualboot-rg
 gwprov deploy plan dualboot-rg
-gwprov deploy apply dualboot-rg
+gwprov profile dualboot-rg apply DEVICE
 
 # Preview detected files and destinations without changing the profile
 gwprov project install doom --profile dualboot-rg --dry-run
 ```
 
 `--variant` is optional. GWProv infers it from the profile's provisioning
-metadata or SD-image configuration, from the active device's assigned profile,
+metadata or SD-image configuration, from the explicitly selected device's assigned profile,
 or from a target directory's firmware metadata or existing `flash/` and `sd/`
 subdirectories. A release that publishes only one storage variant also supplies
 an unambiguous default. If these clues do not identify one choice, pass
@@ -102,14 +102,14 @@ duplicate names, malformed metadata, or checksum mismatches reject the bundle.
 ```console
 gwprov project install ./doom-v1.2.0.zip --profile dualboot-rg
 gwprov deploy plan dualboot-rg
-gwprov deploy apply dualboot-rg
+gwprov profile dualboot-rg apply DEVICE
 
-# Install and write to the active device's assigned profile in one prompted action
-gwprov project install ./doom-v1.2.0.zip --device
+# Install and write to a device's assigned profile in one prompted action
+gwprov project install ./doom-v1.2.0.zip --device DEVICE
 ```
 
-`--device DEVICE` can name a device; with no value it uses the active device.
-That device must have a managed profile assigned. `--yes` accepts the write
+`--device DEVICE` names a device. That device must have a managed profile
+assigned. `--yes` accepts the write
 without prompting. For an SD project, the profile needs a bundled SD image; a
 direct device install also requires an assigned registered SD card, which gets
 the project files overlaid while retaining unrelated files.
@@ -132,7 +132,7 @@ gwprov project install ./project-bundle.zip --profile dualboot-rg \
 gwprov project install ./project-bundle.zip --profile dualboot-rg \
   --input base=./supported-rom.sfc
 gwprov deploy plan dualboot-rg
-gwprov deploy apply dualboot-rg
+gwprov profile dualboot-rg apply DEVICE
 ```
 
 Mapped payload placement depends on the final FrogFS composition, so the dry-run
@@ -232,9 +232,8 @@ profile without an SD image produces a direct error.
 ## Plan and flash
 
 ```console
-gwprov set active probe:PROBE_ID
 gwprov deploy plan mario-stock
-gwprov deploy apply mario-stock
+gwprov profile mario-stock apply probe:PROBE_ID
 ```
 
 Review the plan's target bank, component names, offsets, and human-readable sizes

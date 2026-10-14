@@ -143,7 +143,7 @@ def _read_littlefs(context, size: int, block_size: int) -> bytes:
         with fs.open("/CONFIG", "rb") as source:
             return source.read()
     except FileNotFoundError as error:
-        raise ValueError("the active device's LittleFS does not contain /CONFIG") from error
+        raise ValueError("the device's LittleFS does not contain /CONFIG") from error
     finally:
         if mounted:
             fs.unmount()
@@ -199,13 +199,12 @@ def _vm_image(device_id: str):
 
 
 def _hardware_blob(device_id: str, *, remote_origin: str | None = None) -> tuple[bytes, str]:
-    from .active_device import get_active, get_active_origin
     from .backends import SelectedPyOCDBackend, WebSocketBackend
     from .device_assignments import get_assignment
 
     assigned = get_assignment(device_id).get("profile")
     if not assigned:
-        raise ValueError("assign a device profile first with `gwprov set profile PROFILE`; "
+        raise ValueError("apply a device profile first with `gwprov profile PROFILE apply DEVICE`; "
                          "GWProv needs its LittleFS layout to locate /CONFIG")
     profile, extflash_size, start, size, block_size = _layout(assigned)
     if device_id.startswith("probe:"):
@@ -214,10 +213,7 @@ def _hardware_blob(device_id: str, *, remote_origin: str | None = None) -> tuple
                                        lease_wait=0)
     elif device_id.startswith("remote:"):
         uri = device_id.removeprefix("remote:")
-        origin = remote_origin
-        if origin is None and device_id == get_active():
-            origin = get_active_origin()
-        backend = WebSocketBackend(uri, origin=origin,
+        backend = WebSocketBackend(uri, origin=remote_origin,
                                    operation="gwprov config read", lease_wait=0)
     else:
         raise ValueError(f"unsupported hardware device ID: {device_id}")

@@ -36,14 +36,13 @@ eval "$(gwprov completion bash)"
 ## Quick start: create and flash a profile
 
 Find your stock firmware backup, create a profile, then review and apply it to the
-selected hardware device:
+named hardware device:
 
 ```bash
 gwprov backups add ~/Downloads
 gwprov profile create mario-stock -m
-gwprov set active probe:YOUR_PROBE_ID
 gwprov deploy plan mario-stock
-gwprov deploy apply mario-stock
+gwprov profile mario-stock apply probe:YOUR_PROBE_ID
 ```
 
 The profile includes Mario stock firmware and assets. The plan shows the bank
@@ -56,7 +55,7 @@ Projects can be added to a profile and then applied to hardware:
 ```bash
 gwprov project install doom --profile mario-retro-go
 gwprov deploy plan mario-retro-go
-gwprov deploy apply mario-retro-go
+gwprov profile mario-retro-go apply DEVICE
 
 # Preview the detected variant, files, and destinations without writing
 gwprov project install doom --profile mario-retro-go --dry-run
@@ -71,10 +70,10 @@ An offline GWRG release ZIP can be installed the same way:
 
 ```bash
 gwprov project install ./doom-v1.2.0.zip --variant flash --profile mario-retro-go
-gwprov deploy apply mario-retro-go
+gwprov profile mario-retro-go apply DEVICE
 ```
 
-Pass `--device` to install into the active device's assigned profile and write it
+Pass `--device DEVICE` to install into that device's assigned profile and write it
 in one prompted operation (`--yes` skips the prompt). Bundle hashes verify the
 included files; they do not authenticate who published the ZIP. More profile
 and bundle examples are in [Provisioning and profile usage](docs/PROFILES.md).
@@ -196,7 +195,7 @@ gwprov profile show "$profile"
 gwprov gwemu run --profile "$profile"
 
 # Capture the live display as PNG; the command also checks for an all-black frame.
-gwprov gwemu screenshot --profile "$profile"
+gwprov screenshot "$profile" --output screenshot.png
 
 # Capture the display and an ELF-symbolized ARM call stack in one report.
 gwprov gwemu diagnose --profile "$profile" --symbols build/dkc1_core.elf
@@ -417,7 +416,7 @@ it captures the GDB transcript, including backtrace, registers, stack words,
 and nearby instructions, in `runtime/gwprov/fault-triage.txt` and leaves GDB
 stopped. Pass `--app-symbols APP.elf` to load app symbols into GDB even when not
 using `--detach-after-app-entry`.
-Use `gwprov gwemu pause --profile "$profile"` or `resume` to stop or continue
+Use `gwprov pause "$profile"` or `gwprov resume "$profile"` to stop or continue
 execution through QMP while GDB remains connected.
 
 For an automatic launch-to-watch cycle, provide the app ELF so gwprov can resolve
@@ -577,9 +576,9 @@ gwprov debug python --target hardware --probe-id PROBE_ID --profile PROFILE
 For local PyOCD targets and registered remote adapters, `debug python` uses
 the daemon-owned connection and automatically loads firmware and app symbols
 from a managed profile when its Retro-Go version matches and the firmware ELF
-is unambiguous. Conflicting same-tag profiles are not guessed. With no
-explicit hardware selector, it uses the active device. For an assigned profile,
-project ELFs are loaded automatically as well. `--profile` is only needed to
+is unambiguous. Conflicting same-tag profiles are not guessed. Provide an
+explicit device or adapter selector. For an assigned profile, project ELFs are
+loaded automatically as well. `--profile` is only needed to
 select a different symbol profile when one cannot be inferred from the selected
 device. The console exposes
 `dbg.read_log()` for the Retro-Go log buffer; it reads the buffer without
@@ -850,7 +849,7 @@ the flasher running; it does not boot bank 1:
 gwprov recover DEVICE
 ```
 
-That command requires the active hardware device. If no flasher is running,
+That command requires a named hardware device. If no flasher is running,
 GWProv starts it and waits for IDLE. If it is already live and idle, GWProv
 attaches and synchronizes the mailbox context counter. An idle but halted or
 terminal-error stub is restarted; a busy or unreadable resident flasher is
@@ -899,8 +898,8 @@ gwprov debug python --target hardware --probe-id PROBE_ID_A --probe-id PROBE_ID_
 ```
 
 The REPL exposes `sessions` and `backends` dictionaries keyed by probe ID, and
-`dbg` aliases the first session. With no explicit hardware selector, GWProv uses
-the active device (`gwprov set active DEVICE`). Use repeatable `--programmer
+`dbg` aliases the first session. Use an explicit device or adapter selector. Use
+repeatable `--programmer
 stlink|jlink|cmsis-dap|rpi-gpio` options to start separate direct OpenOCD
 sessions for explicit adapter types; `--probe-id` pins individual PyOCD probes
 by unique ID. Deployment and hardware profiling accept the same single-target
@@ -926,7 +925,7 @@ For one machine-local owner, run gnwmanager's server and point GWProv at it:
 ```sh
 gnwmanager --backend pyocd serve --port 8765
 gwprov adapters add local-gnwmanager ws://127.0.0.1:8765/gdb
-gwprov set active local-gnwmanager
+gwprov devices
 gwprov ps
 ```
 
@@ -949,10 +948,8 @@ gwprov show devices
 gwprov devices
 gwprov adapters list
 gwprov adapters add pi-probe ws://10.2.3.122:8765/gdb
-gwprov set active DEVICE_ID
-gwprov config show
-gwprov set profile PROFILE
-gwprov apply
+gwprov config show DEVICE_ID
+gwprov profile PROFILE apply DEVICE_ID
 gwprov sdcard add /Volumes/RETROGO
 gwprov sdcard list
 gwprov sdcard create dev-local/sdcard.img --size-mb 128
@@ -973,8 +970,8 @@ gwprov project install slash-proc/pce-go-retro-go-sd --variant sd --output dev-l
   --firmware-dir /path/to/firmware --game-dir pcecd=~/Emulation/Roms/PCE-CD
 gwprov gwemu run --profile PATH/TO/GWEMU/PROFILE
 gwprov gwemu run --bank1 bank1.bin --bank2 bank2.bin --extflash extflash.bin --sdcard sdcard.img
-gwprov input tap B
-gwprov input tap LEFT+GAME
+gwprov input DEVICE_ID tap B
+gwprov input DEVICE_ID tap LEFT+GAME
 gwprov fs create frogfs 2 dev-local
 gwprov fs create lfs 2 dev-local
 gwprov fs create sdcard 128 dev-local
@@ -992,12 +989,10 @@ run `autoload -Uz compinit && compinit` followed by `eval "$(gwprov completion z
 Both modes complete the command tree, managed profiles, devices, SD cards, common options,
 and directory arguments. Device IDs are enumerated without opening a target debug session
 or polling GWemu. Bash loads curated project names on the first project-argument completion and
-reuses them in that shell. Device controls use the selected device from
-`gwprov set active DEVICE_ID` unless the command accepts an explicit target.
+reuses them in that shell. Device controls require an explicit target.
 
-Profiles and SD cards can be assigned to the active device with `gwprov set profile NAME`
-and `gwprov set sdcard NAME`. `gwprov apply` launches the assigned profile on GWemu or
-deploys it to hardware. Register an already-mounted card folder or drive with
+Applying a profile both deploys it and records it as the device's managed profile. Register an
+already-mounted card folder or drive with
 `gwprov sdcard add PATH [NAME]`; the default name is its folder name on Unix-like systems
 or drive letter on Windows. Registering a card does not format or modify it. When a profile
 with an SD image is applied to hardware with a card assigned, its files are overlaid onto

@@ -531,23 +531,15 @@ def _run_gwemu(args) -> int:
                           timeline=args.timeline, record_timeline=args.record_timeline,
                           icount=args.icount, keep_temp=args.keep_temp,
                           timing_mode=args.timing_mode, rtc_epoch=args.rtc_epoch, gwemu_bin=args.gwemu_bin)
-    from gwprov.active_device import set_active
-    set_active(f"gwemu:{row['pid']}")
     from gwprov.gwemu_manager import stop_instance
     import psutil
     process = psutil.Process(row["pid"])
     print(f"GWemu running under the GWProv daemon (pid {row['pid']}); press Ctrl-C to stop.",
           flush=True)
-    from gwprov.active_device import get_active, set_active
     try:
-        result = process.wait()
-        if get_active() == f"gwemu:{row['pid']}":
-            set_active(None)
-        return result
+        return process.wait()
     except KeyboardInterrupt:
         stop_instance(pid=row["pid"])
-        if get_active() == f"gwemu:{row['pid']}":
-            set_active(None)
         return 130
 
 
@@ -557,75 +549,27 @@ def _gwemu_start(args) -> int:
                             headless=args.headless,
                             timeline=args.timeline, record_timeline=args.record_timeline,
                             timing_mode=args.timing_mode, icount=args.icount, rtc_epoch=args.rtc_epoch, gwemu_bin=args.gwemu_bin)
-    if result == 0:
-        from gwprov.active_device import set_active
-        from gwprov.gwemu_manager import instances
-        from gwprov.profiles import DeviceProfile
-        profile_root = str(DeviceProfile.load(args.profile).root)
-        row = next((item for item in instances() if item.get("profile") == profile_root), None)
-        if row:
-            set_active(f"gwemu:{row['pid']}")
     return result
 
 
 def _gwemu_stop(args) -> int:
     from gwprov.gwemu_manager import instances, stop_instance
-    from gwprov.active_device import get_active, set_active
     pid, profile = args.pid, args.profile
     if pid is None and profile is None:
-        selected = _active_gwemu()
-        pid, profile = selected.get("pid"), selected.get("profile")
+        raise ValueError("gwemu stop requires --pid or --profile")
     if pid is None and profile:
         from gwprov.profiles import resolve_profile_path
         selected = next((row for row in instances()
                          if row.get("profile") == str(resolve_profile_path(profile))), None)
         pid = selected.get("pid") if selected else None
     result = stop_instance(pid=pid, profile=profile, timeout=args.timeout)
-    if result == 0 and pid is not None and get_active() == f"gwemu:{pid}":
-        set_active(None)
     return result
-
-
-def _active_gwemu():
-    from gwprov.active_device import get_active
-    from gwprov.gwemu_manager import instances
-    active = get_active()
-    if not active:
-        raise ValueError("no active device; select one with `gwprov set active DEVICE`")
-    if not active.startswith("gwemu:"):
-        raise ValueError(f"active device {active!r} is not a GWemu instance")
-    pid = int(active.split(":", 1)[1])
-    match = next((row for row in instances() if row.get("pid") == pid), None)
-    if match is None:
-        raise ValueError(f"active GWemu instance {active} is no longer running; select another device")
-    return match
 
 
 def _active_gwemu_profile(profile: str | None) -> str:
     if profile:
         return profile
-    selected = _active_gwemu()
-    if not selected.get("profile"):
-        raise ValueError("active GWemu instance has no managed profile; specify --profile")
-    return selected["profile"]
-
-def _gwemu_pause(args) -> int:
-    from gwprov.gwemu_manager import set_instance_running
-    profile, pid = args.profile, args.pid
-    if profile is None and pid is None:
-        selected = _active_gwemu()
-        profile, pid = selected.get("profile"), selected.get("pid")
-    return set_instance_running(profile, pid=pid, running=False)
-
-
-def _gwemu_resume(args) -> int:
-    from gwprov.gwemu_manager import set_instance_running
-    profile, pid = args.profile, args.pid
-    if profile is None and pid is None:
-        selected = _active_gwemu()
-        profile, pid = selected.get("profile"), selected.get("pid")
-    return set_instance_running(profile, pid=pid, running=True)
-
+    raise ValueError("GWemu operation requires --profile")
 
 def _device_runtime_control(args) -> int:
     row = _resolve_device_selector(args.device)
@@ -675,6 +619,15 @@ def _device_logs(args) -> int:
     for line in lines[-args.lines:]:
         print(line)
     return 0
+
+
+def _device_screenshot(args) -> int:
+    row = _resolve_device_selector(args.device)
+    if row.get("kind") != "gwemu":
+        raise ValueError("screenshot currently supports managed GWemu devices")
+    from gwprov.gwemu_manager import screenshot_instance
+    return screenshot_instance(pid=row.get("pid"), profile=row.get("profile"),
+                               output=args.output)
 
 
 def _start_profile(args) -> int:
@@ -738,15 +691,6 @@ def _duplicate_device(args) -> int:
 def _gwemu_ps(args) -> int:
     from gwprov.gwemu_manager import show_instances
     return show_instances(output=args.output, no_pager=args.no_pager)
-
-
-def _gwemu_screenshot(args) -> int:
-    from gwprov.gwemu_manager import screenshot_instance
-    pid, profile = args.pid, args.profile
-    if pid is None and profile is None:
-        selected = _active_gwemu()
-        pid, profile = selected.get("pid"), selected.get("profile")
-    return screenshot_instance(pid=pid, profile=profile, output=args.output)
 
 
 def _gwemu_profile(args) -> int:
@@ -822,11 +766,11 @@ def _resolve_device_selector(selector: str) -> dict:
 
 def _device_config(args) -> int:
     from gwprov.device_config import show_device_config
-    if getattr(args, "device", None):
-        row = _resolve_device_selector(args.device)
-        return show_device_config(output=args.output, device_id=row["id"],
-                                  remote_origin=row.get("remoteOrigin"))
-    return show_device_config(output=args.output)
+    if not getattr(args, "device", None):
+        raise ValueError("config show requires DEVICE")
+    row = _resolve_device_selector(args.device)
+    return show_device_config(output=args.output, device_id=row["id"],
+                              remote_origin=row.get("remoteOrigin"))
 
 
 def _retro_go_config(args) -> int:
@@ -951,13 +895,11 @@ def _print_config_report(decoded: dict, *, source: str, target: str,
 
 
 def _device_recover(args) -> int:
-    from gwprov.active_device import get_active, get_active_origin
-
     selected = getattr(args, "device", None)
-    row = _resolve_device_selector(selected) if selected else None
-    device_id = row["id"] if row else get_active()
-    if not device_id:
-        raise ValueError("recover requires DEVICE (or a legacy active device selection)")
+    if not selected:
+        raise ValueError("recover requires DEVICE")
+    row = _resolve_device_selector(selected)
+    device_id = row["id"]
     if device_id.startswith("probe:"):
         from gwprov.backends import SelectedPyOCDBackend
         backend = SelectedPyOCDBackend(device_id.removeprefix("probe:"),
@@ -967,11 +909,11 @@ def _device_recover(args) -> int:
     elif device_id.startswith("remote:"):
         from gwprov.backends import WebSocketBackend
         backend = WebSocketBackend(device_id.removeprefix("remote:"),
-                                   origin=(row or {}).get("remoteOrigin") or get_active_origin(),
+                                   origin=(row or {}).get("remoteOrigin"),
                                    operation="gwprov recover", lease_wait=0,
                                    allow_recovery_marker=True)
     else:
-        raise ValueError("recover requires an active physical device")
+        raise ValueError("recover requires a physical hardware device")
 
     from gwprov.hw_lifecycle import recover_flasher
     try:
@@ -993,86 +935,6 @@ def _devices_command(args) -> int:
             print(identifier)
         return 0
     return _resource_view("devices", args)
-
-
-def _set_active(args) -> int:
-    from gwprov.active_device import get_active, set_active
-    from gwprov.devices import device_rows
-
-    if args.device is None:
-        if args.remote_origin:
-            raise ValueError("--remote-origin requires selecting a remote device")
-        active = get_active()
-        print(f"Active device: {active or 'not set'}")
-        return 0
-    if args.device.startswith("remote:"):
-        from gwprov.adapters import list_remote
-        url = args.device.removeprefix("remote:")
-        saved = next((row for row in list_remote() if row["url"] == url), None)
-        origin = args.remote_origin if args.remote_origin is not None else (saved or {}).get("origin")
-        set_active(args.device, origin=origin)
-        print(f"Active device: {args.device} (remote gnwmanager)")
-        return 0
-    from gwprov.adapters import list_remote
-    saved = next((row for row in list_remote() if row["name"].casefold() == args.device.casefold()), None)
-    if saved:
-        set_active(f"remote:{saved['url']}", origin=args.remote_origin or saved["origin"])
-        print(f"Active device: {saved['name']} (remote gnwmanager)")
-        return 0
-    rows = device_rows()
-    match = next((row for row in rows if row["id"] == args.device), None)
-    if match is None:
-        choices = ", ".join(row["id"] for row in rows) or "none detected"
-        raise ValueError(f"unknown device {args.device!r}; detected devices: {choices}")
-    set_active(match["id"], origin=args.remote_origin)
-    print(f"Active device: {match['id']} ({match['name']})")
-    return 0
-
-
-def _set_assignment(args) -> int:
-    from gwprov.active_device import get_active
-    from gwprov.device_assignments import get_assignment, set_assignment
-    device = get_active()
-    if not device:
-        raise ValueError("no active device; select one with `gwprov set active DEVICE`")
-    field = args.set_command
-    if args.value is None:
-        value = get_assignment(device).get(field)
-        label = "display name" if field == "name" else field
-        if field == "name" and not value:
-            from gwprov.devices import device_rows
-            row = next((row for row in device_rows() if row["id"] == device), None)
-            default = row.get("displayName") if row else None
-            print(f"Active device {device} display name: default ({default or 'unknown'})")
-        else:
-            print(f"Active device {device} {label}: {value or 'not set'}")
-        return 0
-    if args.value.casefold() in {"none", "clear"}:
-        set_assignment(device, field, None)
-        label = "display name" if field == "name" else f"{field} assignment"
-        print(f"Cleared {label} for {device}")
-        return 0
-    if field == "name":
-        value = args.value.strip()
-        if not value or any(char in value for char in "\r\n\0"):
-            raise ValueError("device name must be a non-empty single-line value")
-    elif field == "profile":
-        from gwprov.profiles import DeviceProfile
-        value = str(DeviceProfile.load(args.value).root)
-    else:
-        if device.startswith("gwemu:"):
-            raise ValueError("SD-card folders can be assigned to hardware devices; GWemu uses the profile's SD image")
-        from gwprov.sd_cards import list_cards
-        card = next((row for row in list_cards()
-                     if row["name"].casefold() == args.value.casefold()), None)
-        if card is None:
-            choices = ", ".join(row["name"] for row in list_cards()) or "none registered"
-            raise ValueError(f"unknown SD card {args.value!r}; registered cards: {choices}")
-        value = card["name"]
-    set_assignment(device, field, value)
-    label = "display name" if field == "name" else field
-    print(f"Set {label} for {device}: {value}")
-    return 0
 
 
 def _sdcard(args) -> int:
@@ -1104,156 +966,6 @@ def _sdcard(args) -> int:
     return 0
 
 
-def _apply_assigned(args) -> int:
-    output = getattr(args, "output", "text")
-    assume_yes = bool(getattr(args, "yes", False))
-    from gwprov.active_device import get_active, get_active_origin, set_active
-    from gwprov.device_assignments import get_assignment, set_assignment
-    from gwprov.devices import device_rows
-    from gwprov.profiles import DeviceProfile, profile_reference
-
-    device_id = get_active()
-    if not device_id:
-        raise ValueError("no active device; select one with `gwprov set active DEVICE`")
-    assignment = get_assignment(device_id)
-    profile_path = assignment.get("profile")
-    if not profile_path:
-        raise ValueError(f"active device {device_id} has no assigned profile; use `gwprov set profile PROFILE`")
-    profile = DeviceProfile.load(profile_path)
-    rows = device_rows()
-    row = next((item for item in rows if item["id"] == device_id), None)
-    if row is None:
-        raise ValueError(f"active device {device_id} is no longer available")
-
-    if row["kind"] == "gwemu":
-        if args.start:
-            raise ValueError("--start and --bank apply only to hardware deployments")
-        from gwprov.gwemu_manager import stop_instance
-        from gwprov.daemon import start_instance
-        current_profile = row.get("profile")
-        if current_profile == str(profile.root) and not assignment.get("sdcard"):
-            if output in {"json", "yaml"}:
-                _print_structured({"device": device_id, "profile": str(profile.root),
-                                   "status": "already-applied"}, output)
-            else:
-                print(f"GWemu pid {row['pid']} already uses profile {profile_reference(profile.root)}.")
-            return 0
-        if row.get("status") == "unknown":
-            raise ValueError("cannot apply to a GWemu instance with unknown execution state; inspect `gwprov ps`")
-        _confirm_apply(args, assume_yes, [
-            f"Profile: {profile_reference(profile.root)}",
-            f"Target: GWemu pid {row['pid']} ({row.get('status', 'unknown')})",
-            "Action: launch or select the profile instance, then stop the currently selected instance",
-        ])
-        old_id = device_id
-        from gwprov.gwemu_manager import instances
-        matches = [item for item in instances()
-                   if item.get("profile") == str(profile.root)]
-        newly_started = False
-        if matches:
-            new_id = f"gwemu:{matches[0]['pid']}"
-        else:
-            started = start_instance(str(profile.root), headless=row.get("display") == "headless")
-            new_id = f"gwemu:{started['pid']}"
-            newly_started = True
-        try:
-            stop_instance(pid=row["pid"])
-        except Exception:
-            if newly_started:
-                try:
-                    stop_instance(pid=started["pid"])
-                except Exception:
-                    pass
-            raise
-        set_assignment(old_id, "profile", None)
-        set_assignment(new_id, "profile", str(profile.root))
-        if assignment.get("sdcard"):
-            set_assignment(new_id, "sdcard", assignment["sdcard"])
-        set_active(new_id)
-        if output in {"json", "yaml"}:
-            _print_structured({"device": new_id, "profile": str(profile.root),
-                               "status": "applied"}, output)
-        else:
-            print(f"Applied profile {profile_reference(profile.root)} to GWemu; active device is {new_id}.")
-        return 0
-
-    target = {}
-    if row.get("probeId"):
-        target["probe_id"] = row["probeId"]
-    elif device_id.startswith("remote:"):
-        target["remote_url"] = device_id.removeprefix("remote:")
-        target["remote_origin"] = get_active_origin()
-    else:
-        raise ValueError(f"active device {device_id} cannot receive a deployment")
-
-    regions = None
-    sd_written = None
-    card_name = assignment.get("sdcard")
-    card = None
-    if card_name and profile.resolved_sd:
-        from gwprov.sd_cards import list_cards
-        card = next((item for item in list_cards()
-                     if item["name"].casefold() == card_name.casefold()), None)
-        if card is None:
-            raise ValueError(f"assigned SD card {card_name!r} is no longer registered")
-        from gwprov.deploy import deployment_plan
-        write_plan = deployment_plan(str(profile.root))
-        planned_regions = write_plan["regions"]
-        regions = [item["region"] for item in planned_regions if item["region"] != "sd"]
-    else:
-        from gwprov.deploy import deployment_plan
-        write_plan = deployment_plan(str(profile.root))
-        planned_regions = write_plan["regions"]
-        regions = [item["region"] for item in planned_regions]
-    if args.start and not regions:
-        raise ValueError("--start requires at least one hardware flash region in the profile")
-    from gwprov.deploy import deployment_write_summary
-    hardware_plan = {**write_plan,
-                     "regions": [item for item in planned_regions if item["region"] in regions]}
-    write_rows = deployment_write_summary(str(profile.root), hardware_plan)
-    operation = [
-        f"Profile: {profile_reference(profile.root)}",
-        f"Target: Hardware ({device_id})",
-        (f"After writing: start bank {args.bank} reset vector" if args.start
-         else "After writing: leave the RAM flasher running"),
-    ]
-    if card is not None:
-        operation.extend((f"SD card: {card['name']}", f"SD card path: {card['path']}",
-                          "SD card action: retain existing files and replace matching files"))
-    _confirm_apply(args, assume_yes, operation, writes=write_rows)
-    if card is not None:
-        from gwprov.deploy import overlay_sd_directory
-        sd_written = overlay_sd_directory(profile.resolved_sd, Path(card["path"]))
-    if regions == []:
-        result = {"profile": str(profile.root), "written": [
-            {"region": "sd", "files": sd_written, "mode": "mounted-folder-overlay"}
-        ]}
-        if output in {"json", "yaml"}:
-            _print_structured(result, output)
-        else:
-            print(f"Updated SD card with {sd_written} file(s).", flush=True)
-        return 0
-    from gwprov.deploy import apply_deployment
-    callback, finish = _deployment_progress_display(output)
-    try:
-        result = apply_deployment(str(profile.root), regions=regions,
-                                  start=args.start, bank=args.bank,
-                                  progress=callback, **target)
-    finally:
-        if finish:
-            finish()
-    if sd_written is not None:
-        result["written"].append({"region": "sd", "files": sd_written,
-                                  "mode": "mounted-folder-overlay"})
-    if output in {"json", "yaml"}:
-        _print_structured(result, output)
-    return 0
-
-
-def _apply_parser(args) -> int:
-    return _apply_assigned(args)
-
-
 def _confirm_apply(args, assume_yes: bool, details: list[str], *, writes=None) -> None:
     """Require an explicit go-ahead before apply changes a device or files."""
     if assume_yes:
@@ -1263,11 +975,11 @@ def _confirm_apply(args, assume_yes: bool, details: list[str], *, writes=None) -
     console = Console(file=sys.stderr, force_terminal=sys.stderr.isatty())
     console.print(_apply_plan_renderable(details, writes or [], console.width))
     if not sys.stdin.isatty():
-        raise ValueError("confirmation needs an interactive terminal; rerun with `gwprov apply --yes`")
+        raise ValueError("confirmation needs an interactive terminal; rerun with `--yes`")
     try:
         accepted = Confirm.ask("Continue?", default=False, console=console)
     except EOFError as exc:
-        raise ValueError("apply was not confirmed; rerun with `gwprov apply --yes` to skip the prompt") from exc
+        raise ValueError("apply was not confirmed; rerun with `--yes` to skip the prompt") from exc
     if not accepted:
         raise ValueError("apply cancelled")
 
@@ -1334,13 +1046,11 @@ def _resource_view(section: str, args) -> int:
 def _adapters_list(args) -> int:
     from rich.console import Console
     from rich.table import Table
-    from gwprov.active_device import get_active
     from gwprov.adapters import inventory
 
     rows = inventory()
-    active = get_active()
     if args.output == "json":
-        print(json.dumps([{**row, "active": row["id"] == active} for row in rows], indent=2))
+        print(json.dumps(rows, indent=2))
         return 0
     if not rows:
         Console().print("[dim]No local adapters or registered remote adapters found. Use `gwprov adapters add NAME URL` to register a remote server.[/]")
@@ -1353,35 +1063,25 @@ def _adapters_list(args) -> int:
     table.add_column("STATE")
     table.add_column("DETAILS", overflow="fold")
     for row in rows:
-        table.add_row("●" if row["id"] == active else "", row["name"], row["adapter"],
+        table.add_row("", row["name"], row["adapter"],
                       row["id"], row["state"].upper(), row.get("detail") or "")
     Console().print(table)
-    if active:
-        print("● Active device")
     return 0
 
 
 def _adapters_add(args) -> int:
     from gwprov.adapters import add_remote
-    from gwprov.active_device import get_active, set_active
     adapter = add_remote(args.name, args.url, origin=args.origin)
-    device_id = f"remote:{adapter['url']}"
-    if get_active() == device_id:
-        set_active(device_id, origin=adapter["origin"])
     print(f"Added remote adapter {adapter['name']}: {adapter['url']}")
     if adapter["origin"]:
         print(f"  Origin: {adapter['origin']}")
-    print(f"Select its device with: gwprov set active {adapter['name']}")
+    print(f"Use it with an explicit device target from `gwprov devices`.")
     return 0
 
 
 def _adapters_remove(args) -> int:
     from gwprov.adapters import remove_remote
-    from gwprov.active_device import get_active, set_active
     adapter = remove_remote(args.name_or_url)
-    device_id = f"remote:{adapter['url']}"
-    if get_active() == device_id:
-        set_active(None)
     print(f"Removed remote adapter {adapter['name']} ({adapter['url']})")
     return 0
 
@@ -1403,35 +1103,28 @@ def _show(args) -> int:
     from rich.console import Console
     from rich.table import Table
     from rich.text import Text
-    from gwprov.active_device import get_active
     from gwprov.devices import device_rows
     section = getattr(args, "section", None)
     if section == "devices":
         rows = device_rows()
-        active = get_active()
         if args.output == "json":
-            print(json.dumps([{**{k: row.get(k) for k in ("id", "kind", "name", "status", "application", "installed",
-                                                              "assignedProfile", "sdCard")},
-                               "active": row["id"] == active} for row in rows], indent=2))
+            print(json.dumps([{k: row.get(k) for k in ("id", "kind", "name", "status", "application", "installed",
+                                                        "assignedProfile", "sdCard")} for row in rows], indent=2))
             return 0
         if not rows:
             Console().print("[dim]No devices detected. Connect a probe or start GWemu, then run `gwprov show devices` again.[/]")
             return 0
         table = Table(title="Devices", title_justify="left", expand=True)
-        table.add_column("", width=1, no_wrap=True)
         for name in ("DEVICE", "TYPE", "STATE", "RUNNING", "INSTALLED", "PROFILE", "SD CARD"):
             table.add_column(name, overflow="fold")
         for row in rows:
             state = Text(str(row["status"]).upper(), style={"running": "green", "ready": "green",
                          "halted": "yellow", "recovery": "yellow",
                          "busy": "cyan", "unknown": "red"}.get(row["status"], "white"))
-            table.add_row(Text("●" if row["id"] == active else "", style="bold cyan"),
-                          row["id"], row["kind"], state, row.get("application", "Unknown"),
+            table.add_row(row["id"], row["kind"], state, row.get("application", "Unknown"),
                           row.get("installed", "Unknown"),
                           row.get("assignedProfile", ""), row.get("sdCard", ""))
         Console().print(table)
-        if active:
-            print("● Active device")
         return 0
     if section == "adapters":
         from gwprov.adapters import inventory
@@ -1514,8 +1207,7 @@ def _show(args) -> int:
         print(json.dumps({"devices": len(rows), "adapters": len(adapter_rows),
                           "projects": "available via project list", "profiles": len(profiles),
                           "sdCards": len(list_cards()),
-                          "performanceProfiles": len(_performance_report_paths()),
-                          "active": get_active()}, indent=2))
+                          "performanceProfiles": len(_performance_report_paths())}, indent=2))
     else:
         rows = device_rows()
         from gwprov.profiles import list_profiles
@@ -1533,7 +1225,6 @@ def _show(args) -> int:
         print(f"  Profiles      {len(profiles)} device profile(s)")
         print(f"  SD cards      {len(cards)} mounted card(s) registered")
         print(f"  Perf          {len(_performance_report_paths())} saved report(s)")
-        print(f"  Active        {get_active() or 'not set'}")
         print("Use `gwprov show devices|adapters|projects|profile|perf|sdcard` for an overview.")
     return 0
 
@@ -1776,25 +1467,12 @@ def _deploy_apply(args) -> int:
         else:
             raise ValueError(f"device {explicit_device!r} has no hardware connection")
     elif not any((probe_id, programmer, remote_url)):
-        from gwprov.active_device import get_active
-        from gwprov.devices import device_rows
-        active = get_active()
-        row = next((item for item in device_rows() if item["id"] == active), None) if active else None
-        if row is None:
-            raise ValueError("select a physical device with `gwprov set active DEVICE` or specify a target")
-        if row.get("probeId"):
-            probe_id = row["probeId"]
-        elif row["id"].startswith("remote:"):
-            remote_url = row["id"].removeprefix("remote:")
-            from gwprov.active_device import get_active_origin
-            remote_origin = remote_origin or get_active_origin()
-        else:
-            raise ValueError("deployment requires a physical hardware device")
+        raise ValueError("deploy apply requires DEVICE or an explicit adapter option")
     from gwprov.deploy import deployment_plan, deployment_write_summary
     plan = deployment_plan(args.profile, args.region)
     _confirm_apply(args, bool(getattr(args, "yes", False)), [
         f"Profile: {args.profile}",
-        f"Target: {explicit_device or 'selected hardware device'}",
+        f"Target: {explicit_device or 'explicit hardware adapter'}",
         (f"After writing: start bank {args.bank} reset vector" if args.start
          else "After writing: leave the RAM flasher running"),
     ], writes=deployment_write_summary(args.profile, plan))
@@ -1814,7 +1492,13 @@ def _deploy_apply(args) -> int:
 
 def _profile_apply(args) -> int:
     args.profile = args.profile_name
-    return _deploy_apply(args)
+    result = _deploy_apply(args)
+    if result == 0:
+        from gwprov.device_assignments import set_assignment
+        from gwprov.profiles import DeviceProfile
+        row = _resolve_device_selector(args.device)
+        set_assignment(row["id"], "profile", str(DeviceProfile.load(args.profile).root))
+    return result
 
 
 def _profile_hardware(args) -> int:
@@ -1822,22 +1506,17 @@ def _profile_hardware(args) -> int:
     probe_id, programmer, remote_url = args.probe_id, args.programmer, args.remote_url
     remote_origin = args.remote_origin
     target_row = None
-    if not any((probe_id, programmer, remote_url)):
-        from gwprov.active_device import get_active
-        from gwprov.devices import device_rows
-        selected_id = get_active()
-        target_row = next((item for item in device_rows()
-                           if item["id"] == selected_id), None) if selected_id else None
-        if target_row is None:
-            raise ValueError("select a physical device with `gwprov set active DEVICE` or specify a target")
+    if args.device:
+        target_row = _resolve_device_selector(args.device)
+        if target_row.get("kind") != "hardware":
+            raise ValueError("perf hardware requires a physical hardware device")
         if target_row.get("probeId"):
             probe_id = target_row["probeId"]
         elif target_row["id"].startswith("remote:"):
             remote_url = target_row["id"].removeprefix("remote:")
-            from gwprov.active_device import get_active_origin
-            remote_origin = remote_origin or get_active_origin()
-        else:
-            raise ValueError("active device is not a hardware target")
+            remote_origin = target_row.get("remoteOrigin")
+    elif not any((probe_id, programmer, remote_url)):
+        raise ValueError("perf hardware requires DEVICE or an explicit adapter option")
     elif probe_id or remote_url:
         from gwprov.devices import device_rows
         target_id = f"probe:{probe_id}" if probe_id else f"remote:{remote_url}"
@@ -1886,6 +1565,8 @@ def _add_hardware_perf_command(subparsers, *, name: str = "hardware", help_text:
     command = subparsers.add_parser(name, help=help_text)
     command._gwprov_hidden = hidden
     target = command.add_mutually_exclusive_group()
+    command.add_argument("device", nargs="?", metavar="DEVICE",
+                         help="hardware device name or ID; omit only with an explicit adapter option")
     target.add_argument("--probe-id", help="select one local PyOCD probe by unique ID")
     target.add_argument("--programmer", choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"),
                         help="select one local OpenOCD adapter explicitly")
@@ -1956,33 +1637,23 @@ def _debug_python(args) -> int:
         if target and target != inferred_target:
             raise ValueError(f"device {args.device!r} is a {inferred_target} target, not {target}")
         target = inferred_target
+    elif target is None and any((probe_ids, programmers, remote_urls)):
+        target = "hardware"
     elif target is None:
-        from gwprov.active_device import get_active
-        from gwprov.devices import device_rows
-        selected_id = get_active()
-        active_row = next((item for item in device_rows() if item["id"] == selected_id), None) if selected_id else None
-        if active_row is None:
-            raise ValueError("select a device with `gwprov set active DEVICE` or provide a device name")
-        target = "gwemu" if active_row.get("kind") == "gwemu" else "hardware"
+        raise ValueError("debug python requires DEVICE or an explicit adapter option")
 
     if target == "hardware" and not any((probe_ids, programmers, remote_urls)):
         if active_row is None:
-            from gwprov.active_device import get_active
-            from gwprov.devices import device_rows
-            selected_id = get_active()
-            active_row = next((item for item in device_rows() if item["id"] == selected_id), None) if selected_id else None
-        if active_row is None:
-            raise ValueError("select a physical device with `gwprov set active DEVICE` or provide a device name")
+            raise ValueError("debug python hardware mode requires DEVICE or --probe-id/--remote-url/--programmer")
         if active_row.get("probeId"):
             probe_ids.append(active_row["probeId"])
         elif active_row["id"].startswith("remote:"):
             remote_urls.append(active_row["id"].removeprefix("remote:"))
-            from gwprov.active_device import get_active_origin
-            origin = get_active_origin()
+            origin = active_row.get("remoteOrigin")
             if origin:
                 remote_origins.append(origin)
         else:
-            raise ValueError("active device is not a hardware target")
+            raise ValueError("selected device is not a hardware target")
         import re
         match = re.search(r"Retro-Go\s+(?:SD\s+)?(v[\w.+-]+)", active_row.get("installed", ""), re.IGNORECASE)
         if match:
@@ -2001,24 +1672,18 @@ def _debug_python(args) -> int:
                     print(f"Using installed Retro-Go {detected_retro_go} symbols from profile "
                           f"{firmware_elf.parents[1].name}")
     if target == "gwemu" and qmp_socket is None and not profile:
-        from gwprov.active_device import get_active
-        if active_row and active_row.get("kind") == "gwemu":
-            from gwprov.gwemu_manager import instances
-            vm = next((item for item in instances()
-                       if str(item.get("pid")) == str(active_row.get("pid"))), None)
-            if vm:
-                qmp_socket = vm.get("qmpSocket")
-                profile = vm.get("profile") or active_row.get("assignedProfile")
-                if gdb_port is None:
-                    gdb_port = vm.get("gdbPort")
-        active_id = get_active()
-        selected_is_active = (active_row is None or active_row.get("id") == active_id)
-        if qmp_socket is None and profile is None and active_id and selected_is_active:
-            selected = _active_gwemu()
-            qmp_socket = selected.get("qmpSocket")
-            profile = selected.get("profile")
-            if qmp_socket is None:
-                raise ValueError("active GWemu device has no QMP endpoint")
+        if active_row is None:
+            raise ValueError("debug python GWemu mode requires DEVICE or --profile")
+        from gwprov.gwemu_manager import instances
+        vm = next((item for item in instances()
+                   if str(item.get("pid")) == str(active_row.get("pid"))), None)
+        if vm:
+            qmp_socket = vm.get("qmpSocket")
+            profile = vm.get("profile") or active_row.get("assignedProfile")
+            if gdb_port is None:
+                gdb_port = vm.get("gdbPort")
+        if qmp_socket is None and profile is None:
+            raise ValueError("selected GWemu device has no QMP endpoint or managed profile")
     if profile:
         from gwprov.profiles import DeviceProfile
         profile_root = DeviceProfile.load(profile).root
@@ -2123,14 +1788,11 @@ def _input_tap(args) -> int:
         raise ValueError(f"unknown button(s): {', '.join(unknown)}")
     keys = [NAMES[name] for name in names]
     transport = None
-    from gwprov.active_device import get_active
-    active = get_active()
     explicit = any((args.probe_id, args.programmer, args.remote_url))
     if getattr(args, "device", None):
         if explicit:
             raise ValueError("use DEVICE or an explicit adapter option, not both")
         row = _resolve_device_selector(args.device)
-        active = row["id"]
         explicit = True
         if row.get("probeId"):
             from gwprov.backends import SelectedPyOCDBackend
@@ -2145,27 +1807,6 @@ def _input_tap(args) -> int:
                                        operation="gwprov input transport")
         else:
             raise ValueError("input tap requires a physical hardware device")
-    else:
-        backend = None
-    if active and not explicit:
-        from gwprov.devices import device_rows
-        row = next((item for item in device_rows() if item["id"] == active), None)
-        if row is None:
-            raise ValueError(f"active device {active!r} is no longer available")
-        if row.get("probeId"):
-            from gwprov.backends import SelectedPyOCDBackend
-            from gwprov.target_leases import adapter_for_probe
-            backend = SelectedPyOCDBackend(row["probeId"], operation="gwprov input transport",
-                                           probe_adapter=adapter_for_probe(
-                                               f"{row.get('vendor', '')} {row.get('name', '')}"))
-        elif row["id"].startswith("remote:"):
-            from gwprov.backends import WebSocketBackend
-            from gwprov.active_device import get_active_origin
-            backend = WebSocketBackend(row["id"].removeprefix("remote:"),
-                                       origin=get_active_origin(),
-                                       operation="gwprov input transport")
-        else:
-            raise ValueError("input tap requires a physical hardware device to be active")
     elif args.probe_id:
         from gwprov.backends import SelectedPyOCDBackend
         backend = SelectedPyOCDBackend(args.probe_id, operation="gwprov input transport")
@@ -2176,8 +1817,8 @@ def _input_tap(args) -> int:
         from gwprov.backends import WebSocketBackend
         backend = WebSocketBackend(args.remote_url, origin=args.remote_origin,
                                    operation="gwprov input transport")
-    elif not active:
-        raise ValueError("no active device; select one with `gwprov set active DEVICE` or specify a target")
+    else:
+        raise ValueError("input tap requires DEVICE or an explicit adapter option")
     if backend is not None:
         backend.open()
         transport = ShadowCellTransport(backend=backend)
@@ -2567,11 +2208,8 @@ def _project_install(args) -> int:
     if not any((args.output, args.profile, device_selector)):
         raise ValueError("project install requires --output, --profile, or a DEVICE target")
     if device_selector:
-        from gwprov.active_device import get_active
         from gwprov.device_assignments import get_assignment
-        device_id = get_active() if device_selector == "active" else device_selector
-        if not device_id:
-            raise ValueError("no active device; select one with `gwprov set active DEVICE`")
+        device_id = device_selector
         if args.dry_run:
             # A plan must stay offline: do not start the daemon or open a debug
             # session just to decorate the destination with live device data.
@@ -2587,7 +2225,7 @@ def _project_install(args) -> int:
         profile_name = assignment.get("profile")
         assigned_card_name = assignment.get("sdcard")
         if not profile_name:
-            raise ValueError(f"device {device_id} has no assigned profile; use `gwprov set profile PROFILE`")
+            raise ValueError(f"device {device_id} has no assigned profile; apply one with `gwprov profile PROFILE apply {device_id}`")
     if args.start and target_device is None:
         raise ValueError("--start applies only to a direct flash project install with a DEVICE target")
     if args.start and args.variant == "sd":
@@ -2645,7 +2283,7 @@ def _project_install(args) -> int:
         target_card = next((item for item in list_cards()
                             if item.get("name") == assigned_card_name), None) if assigned_card_name else None
         if target_card is None:
-            raise ValueError(f"device {target_device['id']} has no registered SD card assignment; use `gwprov set sdcard CARD`")
+            raise ValueError(f"device {target_device['id']} has no registered SD card assignment")
     if args.dry_run and profile_root is not None and variant == "sd":
         from gwprov.profiles import DeviceProfile
         profile = DeviceProfile.load(profile_root)
@@ -3044,7 +2682,7 @@ _gwprov_complete() {
   extra_candidates=""
   case "$cur" in
     --profile=*) _gwprov_complete_profiles "$cur"; return ;;
-    --device=*) COMPREPLY=( $(compgen -W "active $(_gwprov_device_names)" -- "${cur#*=}") ); return ;;
+    --device=*) COMPREPLY=( $(compgen -W "$(_gwprov_device_names)" -- "${cur#*=}") ); return ;;
     --input=*|--input-dir=*|--firmware=*|--bios=*|--firmware-dir=*|--bios-dir=*|--game=*|--game-dir=*|--content=*|--source=*|--profile=*|--output-dir=*|--bootloader-file=*|--sd-bootloader-file=*|--backup-dir=*|--source-tree=*|--image=*|--shared-sd-root=*|--retro-go-root=*|--rom=*|--rom-dir=*|--config=*|--timeline=*|--record-timeline=*|--bank1=*|--bank2=*|--extflash=*|--sdcard=*|--gwemu-bin=*)
       _gwprov_complete_dirs "$cur"
       return
@@ -3071,7 +2709,7 @@ _gwprov_complete() {
     --output=*)
       local output_values
       case "$context" in
-        apply:|deploy:plan|deploy:apply) output_values="text json yaml" ;;
+        deploy:plan|deploy:apply) output_values="text json yaml" ;;
         ps:*|projects:list|project:list|projects:ls|project:ls|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|adapters:ls|gwemu:ps) output_values="text json" ;;
         profile:list|profile:ls|sdcard:list|sdcard:ls) output_values="text json names" ;;
         profile:duplicate) output_values="text json" ;;
@@ -3093,7 +2731,7 @@ _gwprov_complete() {
   if [[ "$prev" == "--profile" ]]; then _gwprov_complete_profiles "$cur"; return; fi
   if [[ "$prev" == "--device" ]]; then
     candidates=$(_gwprov_device_names)
-    COMPREPLY=( $(compgen -W "$candidates active" -- "$cur") )
+    COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
     return
   fi
   if [[ "$prev" == "--probe-id" ]]; then
@@ -3106,7 +2744,7 @@ _gwprov_complete() {
     --format:gwemu:profile) candidates="text json" ;;
     --format:profile:hardware|--format:perf:hardware) candidates="text json html pdf" ;;
     --format:report:render|--format:retro-go:config) candidates="text json" ;;
-    --output:apply:|--output:deploy:plan|--output:deploy:apply|-o:apply:|-o:deploy:plan|-o:deploy:apply) candidates="text json yaml" ;;
+    --output:deploy:plan|--output:deploy:apply|-o:deploy:plan|-o:deploy:apply) candidates="text json yaml" ;;
     --output:ps:*|--output:projects:list|--output:project:list|--output:projects:ls|--output:project:ls|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps)
       candidates="text json" ;;
     --output:profile:list|--output:profile:ls|--output:sdcard:list|--output:sdcard:ls) candidates="text json names" ;;
@@ -3122,7 +2760,6 @@ _gwprov_complete() {
     --icount:gwemu:start|--icount:gwemu:run) candidates="0 1 2 3 4 5 6 7 8 9 10" ;;
     --bank:retro-go:build|--bank:gwemu:run) candidates="1 2" ;;
     --bank:deploy:apply) candidates="1 2" ;;
-    --bank:apply) candidates="1 2" ;;
     --bank:projects:install|--bank:project:install) candidates="1 2" ;;
     --oc-level:retro-go:config) candidates="0 1 2 3" ;;
     --filesystem:media:inventory) candidates="frogfs littlefs fatfs" ;;
@@ -3155,26 +2792,24 @@ _gwprov_complete() {
     case "${COMP_WORDS[1]}" in
       show) candidates="adapters devices projects profile perf sdcard" ;;
       config) candidates="show" ;;
-      set) candidates="active profile sdcard name" ;;
       deploy) candidates="plan apply" ;;
       ps) candidates="--help -h --output --no-pager --profile" ;;
-      apply) candidates="--help -h -y --yes -f --force --start --bank -o --output" ;;
       completion) candidates="bash zsh" ;;
       adapters) candidates="list ls add remove rm" ;;
       start) candidates=$(_gwprov_profile_names) ;;
-      recover|pause|halt|resume|reset|logs|duplicate) candidates=$(_gwprov_device_names) ;;
-      devices|device) candidates="--help -h --output" ;;
+      recover|pause|halt|resume|reset|screenshot|logs|duplicate) candidates=$(_gwprov_device_names) ;;
+      devices) candidates="--help -h --output" ;;
       projects|project) candidates="list ls versions info install stage-local" ;;
       backups) candidates="add list ls" ;;
       tree) candidates="--format --no-pager" ;;
       debug) candidates="python" ;;
       retro-go) candidates="list ls source install build config" ;;
       retro-go:source) candidates="add remove list ls default" ;;
-      gwemu) candidates="start stop pause resume ps screenshot profile diagnose watch run debug" ;;
+      gwemu) candidates="start stop ps profile diagnose watch run debug" ;;
       ofw) candidates="patch" ;;
       media) candidates="frogfs littlefs inventory compare" ;;
       sdcard|sd) candidates="list ls add remove rm create compose" ;;
-      input) candidates="tap" ;;
+      input) candidates="tap $(_gwprov_device_names)" ;;
       report) candidates="render" ;;
       profile) candidates="create duplicate edit list ls show apply $(_gwprov_profile_names)" ;;
         perf) candidates="hardware" ;;
@@ -3208,29 +2843,29 @@ _gwprov_complete() {
     candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == debug && "${COMP_WORDS[2]-}" == python && "$cur" != -* ]]; then
     candidates=$(_gwprov_device_names)
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == input && "${COMP_WORDS[2]-}" != tap && "$cur" != -* ]]; then
+    candidates="tap"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == retro-go && "${COMP_WORDS[2]-}" == config && "$cur" != -* ]]; then
     candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "$cur" != -* ]]; then
     candidates="$(_gwprov_profile_names)"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == apply && "$cur" != -* ]]; then
     candidates="$(_gwprov_profile_names)"
+  elif (( COMP_CWORD == 4 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == apply && "$cur" != -* ]]; then
+    candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" != create && "${COMP_WORDS[2]-}" != duplicate && "${COMP_WORDS[2]-}" != edit && "${COMP_WORDS[2]-}" != list && "${COMP_WORDS[2]-}" != ls && "${COMP_WORDS[2]-}" != show && "${COMP_WORDS[2]-}" != apply && "$cur" != -* ]]; then
     candidates="show apply edit list ls"
   elif (( COMP_CWORD == 4 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "$cur" != -* ]]; then
     candidates="add remove"
   elif (( COMP_CWORD == 5 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == edit && "${COMP_WORDS[4]-}" == add && "$cur" != -* ]]; then
     candidates="bank1 bank2 bank0 extflash"
-  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == config && "$cur" != -* ]]; then
-    candidates="show"
-  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == active && "$cur" != -* ]]; then
+  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == config && "${COMP_WORDS[2]-}" == show && "$cur" != -* ]]; then
+    candidates=$(_gwprov_device_names)
+  elif (( COMP_CWORD == 4 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[3]-}" == apply && "$cur" != -* ]]; then
     candidates=$(_gwprov_device_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == backups && "${COMP_WORDS[2]-}" == add && "$cur" != -* ]]; then
     _gwprov_complete_dirs "$cur"
     return
-  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == profile && "$cur" != -* ]]; then
-    candidates="$(_gwprov_profile_names) clear none"
-  elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == set && "${COMP_WORDS[2]-}" == sdcard && "$cur" != -* ]]; then
-    candidates="$(_gwprov_sdcard_names) clear none"
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == show && "$cur" != -* ]]; then
     candidates=$(_gwprov_profile_names)
   elif (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[1]-}" == profile && "${COMP_WORDS[2]-}" == duplicate && "$cur" != -* ]]; then
@@ -3248,6 +2883,7 @@ _gwprov_complete() {
     case "$context" in
       ps:*) candidates="--output --no-pager --profile" ;;
       config:show) candidates="--output" ;;
+      screenshot:*) candidates="--output" ;;
       duplicate:*) candidates="--gwemu --part --name --output-dir --output --headless --gdb-port" ;;
       deploy:plan) candidates="--region -o --output" ;;
       deploy:apply) candidates="--probe-id --programmer --remote-url --remote-origin --region --start --bank -o --output" ;;
@@ -3264,9 +2900,7 @@ _gwprov_complete() {
       retro-go:config) candidates="--profile --output --format --auto-start --no-auto-start --rom --timeout --menu-timeout --oc-level --selected-tab --cursor --browse-subpath --yes --force" ;;
       gwemu:start) candidates="--profile --gdb-port --audio --headless --timeline --record-timeline --timing-mode --icount --rtc-epoch --gwemu-bin" ;;
       gwemu:stop) candidates="--profile --pid --timeout" ;;
-      gwemu:pause|gwemu:resume) candidates="--profile --pid" ;;
       gwemu:ps) candidates="--output --no-pager" ;;
-      gwemu:screenshot) candidates="--profile --pid --output" ;;
       gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --progress-interval --stall-threshold --rebase --debug-config --output --format --top" ;;
       gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes --value --ring --debug-config" ;;
       gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --value --ring --interval --stall-after --duration --output --debug-config" ;;
@@ -3358,7 +2992,7 @@ _gwprov() {
       case "$context" in
         profile:list|profile:ls|sdcard:list|sdcard:ls) compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=names"; return ;;
         profile:duplicate) compadd -- "${cur%%=*}=text" "${cur%%=*}=json"; return ;;
-        apply:|deploy:plan|deploy:apply)
+        deploy:plan|deploy:apply)
           compadd -- "${cur%%=*}=text" "${cur%%=*}=json" "${cur%%=*}=yaml"; return ;;
         ps:*|projects:list|project:list|projects:ls|project:ls|projects:versions|project:versions|projects:info|project:info|devices|adapters:list|adapters:ls|gwemu:ps)
           compadd -- "${cur%%=*}=text" "${cur%%=*}=json"; return ;;
@@ -3368,7 +3002,7 @@ _gwprov() {
   esac
   case "$prev" in
     --profile) _gwprov_profile_complete "$cur"; return ;;
-    --device) compadd -- active "${(@f)$(_gwprov_device_names)}"; return ;;
+    --device) compadd -- "${(@f)$(_gwprov_device_names)}"; return ;;
     --probe-id) compadd -- "${(@f)$(_gwprov_probe_names)}"; return ;;
     -r|--retro-go) compadd -- "${(@f)$(_gwprov_retro_releases)}"; return ;;
     --input|--input-dir|--firmware|--bios|--firmware-dir|--bios-dir|--game|--game-dir|--content|--source|--profile|--output|-o|--output-dir|--bootloader-file|--sd-bootloader-file|--backup-dir|--source-tree|--image|--shared-sd-root|--retro-go-root|--rom|--rom-dir|--config|--timeline|--record-timeline|--bank1|--bank2|--extflash|--sdcard|--symbols|--debug-config|--app-symbols|--gdb|--gwemu-bin)
@@ -3384,7 +3018,7 @@ _gwprov() {
     --format:retro-go:config) compadd -- text json; return ;;
     --output:profile:list|--output:profile:ls|--output:sdcard:list|--output:sdcard:ls) compadd -- text json names; return ;;
     --output:profile:duplicate) compadd -- text json; return ;;
-    --output:apply:|--output:deploy:plan|--output:deploy:apply|-o:apply:|-o:deploy:plan|-o:deploy:apply) compadd -- text json yaml; return ;;
+    --output:deploy:plan|--output:deploy:apply|-o:deploy:plan|-o:deploy:apply) compadd -- text json yaml; return ;;
     --output:ps:*|--output:projects:list|--output:project:list|--output:projects:ls|--output:project:ls|--output:projects:versions|--output:project:versions|--output:projects:info|--output:project:info|--output:gwemu:ps) compadd -- text json; return ;;
     --region:deploy:plan|--region:deploy:apply) compadd -- bank1 bank2 frogfs littlefs extflash sd; return ;;
     --programmer:deploy:apply|--programmer:debug:python|--programmer:profile:hardware|--programmer:perf:hardware) compadd -- stlink jlink cmsis-dap rpi-gpio; return ;;
@@ -3395,7 +3029,6 @@ _gwprov() {
     --timing-mode:gwemu:start|--timing-mode:gwemu:run) compadd -- default baseline experimental-m7; return ;;
     --bank:retro-go:build|--bank:gwemu:run) compadd -- 1 2; return ;;
     --bank:deploy:apply) compadd -- 1 2; return ;;
-    --bank:apply) compadd -- 1 2; return ;;
     --bank:projects:install|--bank:project:install) compadd -- 1 2; return ;;
     --oc-level:retro-go:config) compadd -- 0 1 2 3; return ;;
     --filesystem:media:inventory) compadd -- frogfs littlefs fatfs; return ;;
@@ -3414,26 +3047,25 @@ _gwprov() {
       completion) candidates="bash zsh" ;;
       adapters) candidates="list ls add remove rm" ;;
       start) candidates="${(@f)$(_gwprov_profile_names)}" ;;
-      recover|pause|halt|resume|reset|logs|duplicate) candidates="${(@f)$(_gwprov_device_names)}" ;;
-      devices|device) candidates="--help -h --output" ;;
+      recover|pause|halt|resume|reset|screenshot|logs|duplicate) candidates="${(@f)$(_gwprov_device_names)}" ;;
+      devices) candidates="--help -h --output" ;;
       projects|project) candidates="list ls versions info install stage-local" ;;
       backups) candidates="add list ls" ;;
       tree) candidates="--format --no-pager" ;;
       debug) candidates="python" ;;
       retro-go) candidates="list ls source install build config" ;;
       retro-go:source) candidates="add remove list ls default" ;;
-      gwemu) candidates="start stop pause resume ps screenshot profile diagnose watch run debug" ;;
+      gwemu) candidates="start stop ps profile diagnose watch run debug" ;;
       ofw) candidates="patch" ;;
       media) candidates="frogfs littlefs inventory compare" ;;
       sdcard|sd) candidates="list ls add remove rm create compose" ;;
-      input) candidates="tap" ;;
+      input) candidates="tap ${(@f)$(_gwprov_device_names)}" ;;
       report) candidates="render" ;;
       profile) candidates="create duplicate edit list ls show apply ${(@f)$(_gwprov_profile_names)}" ;;
       perf) candidates="hardware" ;;
       filesystem|fs) candidates="create ls tree add delete del remove rm" ;;
       show) candidates="adapters devices projects profile perf sdcard" ;;
         config) candidates="show" ;;
-      set) candidates="active profile sdcard name" ;;
       *) candidates="" ;;
     esac
   elif (( CURRENT == 4 )) && [[ ( ${words[2]} == sdcard || ${words[2]} == sd ) && ${words[3]} == add && "$cur" != -* ]]; then
@@ -3459,29 +3091,29 @@ _gwprov() {
     candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == debug && ${words[3]} == python && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_device_names)}"
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == input && ${words[3]} != tap && "$cur" != -* ]]; then
+    candidates="tap"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == retro-go && ${words[3]} == config && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == edit && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_profile_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == apply && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_profile_names)}"
+  elif (( CURRENT == 5 )) && [[ ${words[2]} == profile && ${words[3]} == apply && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} != create && ${words[3]} != duplicate && ${words[3]} != edit && ${words[3]} != list && ${words[3]} != ls && ${words[3]} != show && ${words[3]} != apply && "$cur" != -* ]]; then
     candidates="show apply edit list ls"
   elif (( CURRENT == 5 )) && [[ ${words[2]} == profile && ${words[3]} == edit && "$cur" != -* ]]; then
     candidates="add remove"
   elif (( CURRENT == 6 )) && [[ ${words[2]} == profile && ${words[3]} == edit && ${words[5]} == add && "$cur" != -* ]]; then
     candidates="bank1 bank2 bank0 extflash"
-  elif (( CURRENT == 4 )) && [[ ${words[2]} == config && "$cur" != -* ]]; then
-    candidates="show"
-  elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == active && "$cur" != -* ]]; then
+  elif (( CURRENT == 4 )) && [[ ${words[2]} == config && ${words[3]} == show && "$cur" != -* ]]; then
+    candidates="${(@f)$(_gwprov_device_names)}"
+  elif (( CURRENT == 5 )) && [[ ${words[2]} == profile && ${words[4]} == apply && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_device_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == backups && ${words[3]} == add && "$cur" != -* ]]; then
     _files
     return
-  elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == profile && "$cur" != -* ]]; then
-    candidates="${(@f)$(_gwprov_profile_names)} clear none"
-  elif (( CURRENT == 4 )) && [[ ${words[2]} == set && ${words[3]} == sdcard && "$cur" != -* ]]; then
-    candidates="${(@f)$(_gwprov_sdcard_names)} clear none"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == show && "$cur" != -* ]]; then
     candidates="${(@f)$(_gwprov_profile_names)}"
   elif (( CURRENT == 4 )) && [[ ${words[2]} == profile && ${words[3]} == duplicate && "$cur" != -* ]]; then
@@ -3498,10 +3130,10 @@ _gwprov() {
     case "$context" in
       ps:*) candidates="--output --no-pager --profile" ;;
       config:show) candidates="--output" ;;
+      screenshot:*) candidates="--output" ;;
       duplicate:*) candidates="--gwemu --part --name --output-dir --output --headless --gdb-port" ;;
       deploy:plan) candidates="--region -o --output" ;;
       deploy:apply) candidates="--probe-id --programmer --remote-url --remote-origin --region --start --bank -o --output" ;;
-      apply) candidates="--help -h -y --yes -f --force --start --bank -o --output" ;;
       projects:list|project:list|projects:ls|project:ls) candidates="--firmware-repo --output" ;;
       projects:versions|project:versions) candidates="--output" ;;
       projects:info|project:info) candidates="--version --output" ;;
@@ -3515,9 +3147,7 @@ _gwprov() {
       retro-go:config) candidates="--profile --output --format --auto-start --no-auto-start --rom --timeout --menu-timeout --oc-level --selected-tab --cursor --browse-subpath --yes --force" ;;
       gwemu:start) candidates="--profile --gdb-port --audio --headless --timeline --record-timeline --timing-mode --icount --rtc-epoch --gwemu-bin" ;;
       gwemu:stop) candidates="--profile --pid --timeout" ;;
-      gwemu:pause|gwemu:resume) candidates="--profile --pid" ;;
       gwemu:ps) candidates="--output --no-pager" ;;
-      gwemu:screenshot) candidates="--profile --pid --output" ;;
       gwemu:profile) candidates="--profile --symbols --duration --interval --progress-symbol --progress-interval --stall-threshold --rebase --debug-config --output --format --top" ;;
       gwemu:diagnose) candidates="--profile --symbols --output --max-frames --u32 --deref --bytes --value --ring --debug-config" ;;
       gwemu:watch) candidates="--profile --symbols --progress-symbol --guest-pc-symbol --rebase --u32 --deref --bytes --value --ring --interval --stall-after --duration --output --debug-config" ;;
@@ -3646,9 +3276,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "Run `gwprov COMMAND --help` for command options and examples."),
     )
     parser.help_categories = (
-        ("Overview and selection", ("show", "set", "ps")),
+        ("Overview", ("show", "ps")),
         ("All devices and adapters", ("devices", "adapters")),
-        ("Selected-device controls", ("start", "recover", "pause", "halt", "resume", "reset", "logs", "duplicate", "apply", "gwemu", "input", "deploy", "perf", "config")),
+        ("Device controls", ("start", "recover", "pause", "halt", "resume", "reset", "screenshot", "logs", "duplicate", "gwemu", "input", "deploy", "perf", "config")),
         ("Profiles and storage", ("profile", "filesystem", "media", "sdcard")),
         ("Project catalog", ("projects",)),
         ("File workflows not yet device-scoped", ("retro-go", "ofw")),
@@ -3706,8 +3336,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_profile.add_argument("--gwemu-bin")
     start_profile.set_defaults(handler=_start_profile)
     recover = commands.add_parser("recover", help="start or synchronize with a hardware recovery flasher")
-    recover.add_argument("device", nargs="?", metavar="DEVICE",
-                         help="hardware device name or stable ID; defaults to the legacy active device")
+    recover.add_argument("device", metavar="DEVICE", help="hardware device name or stable ID")
     recover.set_defaults(handler=_device_recover)
     for action, help_text in (("pause", "pause a managed GWemu device"),
                               ("halt", "halt a managed GWemu device"),
@@ -3721,6 +3350,10 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--lines", type=int, default=80, help="number of trailing lines (default: 80)")
     logs.add_argument("--follow", "-f", action="store_true", help="follow until the managed process exits")
     logs.set_defaults(handler=_device_logs)
+    screenshot = commands.add_parser("screenshot", help="capture a managed GWemu device screen")
+    screenshot.add_argument("device", metavar="DEVICE", help="managed GWemu device name or ID")
+    screenshot.add_argument("--output", required=True, help="PNG destination")
+    screenshot.set_defaults(handler=_device_screenshot)
     duplicate_device = commands.add_parser("duplicate", help="clone a device or copy one of its flash parts")
     duplicate_device.add_argument("device", metavar="DEVICE", help="source device name or ID")
     duplicate_kind = duplicate_device.add_mutually_exclusive_group(required=True)
@@ -3734,25 +3367,12 @@ def build_parser() -> argparse.ArgumentParser:
     duplicate_device.add_argument("--headless", action="store_true")
     duplicate_device.add_argument("--gdb-port", type=int)
     duplicate_device.set_defaults(handler=_duplicate_device)
-    device_config = commands.add_parser("config", help="inspect configuration stored on the active device")
+    device_config = commands.add_parser("config", help="inspect configuration stored on a device")
     config_commands = device_config.add_subparsers(dest="device_config_command", required=True)
     config_show = config_commands.add_parser("show", help="read and decode Retro-Go's current /CONFIG")
-    config_show.add_argument("device", nargs="?", metavar="DEVICE")
+    config_show.add_argument("device", metavar="DEVICE")
     config_show.add_argument("--output", choices=("text", "json"), default="text")
     config_show.set_defaults(handler=_device_config)
-    set_command = commands.add_parser("set", help="choose the device focused by device commands")
-    set_commands = set_command.add_subparsers(dest="set_command", required=True)
-    active = set_commands.add_parser("active", help="show or select the active device")
-    active.add_argument("device", nargs="?", help="device ID shown by `gwprov show devices`")
-    active.add_argument("--remote-origin", help="Origin required by a selected WebSocket server")
-    active.set_defaults(handler=_set_active)
-    for field, help_text in (("profile", "assign a device profile to the active device"),
-                             ("sdcard", "assign a registered SD card to the active device"),
-                             ("name", "set a display name for the active device")):
-        assignment = set_commands.add_parser(field, help=help_text)
-        assignment.add_argument("value", nargs="?", metavar="VALUE",
-                                help="new value; use clear to remove the assignment")
-        assignment.set_defaults(handler=_set_assignment)
     sdcard = commands.add_parser("sdcard", aliases=("sd",),
                                  help="manage mounted SD cards and card images")
     sdcard_commands = sdcard.add_subparsers(dest="sdcard_command", required=True)
@@ -3781,19 +3401,6 @@ def build_parser() -> argparse.ArgumentParser:
     sdcard_compose.add_argument("--rom-dir", default="dos")
     sdcard_compose.add_argument("--config")
     sdcard_compose.set_defaults(handler=_sd_compose)
-    apply = commands.add_parser(
-        "apply", help="apply the assigned profile to the active device",
-        description="Apply the assigned profile to the active device.",
-        epilog="Examples:\n  gwprov apply\n  gwprov apply --yes\n  gwprov apply -o json --force\n  gwprov apply -o yaml --force")
-    apply.add_argument("-y", "--yes", "-f", "--force", dest="yes", action="store_true",
-                       help="skip the confirmation prompt")
-    apply.add_argument("--start", action="store_true",
-                       help="start firmware after writing; otherwise leave the RAM flasher running")
-    apply.add_argument("--bank", type=int, choices=(1, 2), default=1,
-                       help="bank to start with --start (default: 1)")
-    apply.add_argument("-o", "--output", choices=("text", "json", "yaml"), default="text",
-                       help="show progress, or emit a JSON/YAML result")
-    apply.set_defaults(handler=_apply_parser)
     ps = commands.add_parser("ps", help="show live GWemu and hardware state")
     ps.add_argument("--output", choices=("text", "json"), default="text")
     ps.add_argument("--no-pager", action="store_true", help="write directly to the terminal")
@@ -3815,7 +3422,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_apply.add_argument("profile", metavar="PROFILE",
                               help="profile name or path to deploy")
     deploy_apply.add_argument("device_positional", nargs="?", metavar="DEVICE",
-                              help="hardware device name or ID; defaults to the legacy active device")
+                              help="hardware device name or ID; omit only with an explicit adapter option")
     deploy_target = deploy_apply.add_mutually_exclusive_group()
     deploy_target.add_argument("--probe-id", help="select a local PyOCD probe by unique ID")
     deploy_target.add_argument("--programmer", choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"),
@@ -3848,17 +3455,17 @@ def build_parser() -> argparse.ArgumentParser:
     debug_commands = debug_tools.add_subparsers(dest="debug_command", required=True)
     python_debug = debug_commands.add_parser(
         "python", help="attach a persistent Python console to a selected device",
-        description="Attach to a named or active device. Hardware autostart can be skipped with --attach-only.",
-        epilog="Examples:\n  gwprov debug python\n  gwprov debug python --attach-only\n  gwprov debug python --attach-only --no-watchdog-freeze\n  gwprov debug python --autostart-timeout 20\n  gwprov debug python probe:290077000E0000513751594E\n  gwprov debug python 'GWemu pid 12345'\n  gwprov debug python --target hardware --probe-id 290077000E0000513751594E")
-    python_debug.add_argument("device", nargs="?", help="device name or ID; defaults to the active device")
+        description="Attach to a named device or an explicitly selected adapter. Hardware autostart can be skipped with --attach-only.",
+        epilog="Examples:\n  gwprov debug python DEVICE\n  gwprov debug python DEVICE --attach-only\n  gwprov debug python DEVICE --attach-only --no-watchdog-freeze\n  gwprov debug python DEVICE --autostart-timeout 20\n  gwprov debug python probe:290077000E0000513751594E\n  gwprov debug python 'GWemu pid 12345'\n  gwprov debug python --target hardware --probe-id 290077000E0000513751594E")
+    python_debug.add_argument("device", nargs="?", help="device name or ID; required unless an explicit adapter is supplied")
     python_debug.add_argument("--target", choices=("gwemu", "hardware"),
-                              help="target kind when using an explicit backend or the active device")
+                              help="target kind when using an explicit adapter")
     python_debug.add_argument("--host", default="127.0.0.1")
     python_debug.add_argument("--port", type=int,
                               help="GWemu GDB port; inferred for a managed instance")
     python_debug.add_argument("--openocd-port", type=int, default=6666)
     python_debug.add_argument("--probe-id", action="append", default=[],
-                              help="select a local PyOCD probe by unique ID (repeatable; defaults to the active device)")
+                              help="select a local PyOCD probe by unique ID (repeatable)")
     python_debug.add_argument("--programmer", action="append", default=[],
                               choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"),
                               help="start an explicit OpenOCD adapter session (repeatable by type)")
@@ -3907,7 +3514,7 @@ def build_parser() -> argparse.ArgumentParser:
                      "See docs/PROFILES.md for the bundle format and examples.\n\n"
                      "Examples:\n"
                      "  gwprov project install doom --profile demo\n"
-                     "  gwprov project install ./doom.zip --device --yes"))
+                     "  gwprov project install ./doom.zip --device DEVICE --yes"))
     install.add_argument("repo", help="curated project, owner/repo, or path to a GWRG bundle ZIP")
     install.add_argument("--version", help="published tag; defaults to newest")
     install.add_argument("--target", help="target id when the manifest publishes more than one")
@@ -3918,8 +3525,8 @@ def build_parser() -> argparse.ArgumentParser:
     install_target = install.add_mutually_exclusive_group()
     install_target.add_argument("--output", help="staging root directory")
     install_target.add_argument("--profile", help="install into a managed profile for a later apply")
-    install_target.add_argument("--device", nargs="?", const="active", metavar="DEVICE",
-                                help="install to a physical device with an assigned profile; `active` is retained for compatibility")
+    install_target.add_argument("--device", metavar="DEVICE",
+                                help="install to a physical device with an assigned profile")
     install.add_argument("--input", action="append", default=[], metavar="SLOT=FILE",
                          help="converter input file; repeat for multiple files")
     install.add_argument("--input-dir", action="append", default=[], metavar="SLOT=DIR|DIR",
@@ -4061,34 +3668,14 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--timeout", type=float, default=10.0)
     stop.set_defaults(handler=_gwemu_stop)
 
-    pause = gwemu_commands.add_parser("pause", help="pause a GWemu instance through the daemon")
-    pause_target = pause.add_mutually_exclusive_group()
-    pause_target.add_argument("--profile", help="override the active GWemu device")
-    pause_target.add_argument("--pid", type=int, help="select a GWemu process explicitly")
-    pause.set_defaults(handler=_gwemu_pause)
-
-    resume = gwemu_commands.add_parser("resume", help="resume a paused GWemu instance through the daemon")
-    resume_target = resume.add_mutually_exclusive_group()
-    resume_target.add_argument("--profile", help="override the active GWemu device")
-    resume_target.add_argument("--pid", type=int, help="select a GWemu process explicitly")
-    resume.set_defaults(handler=_gwemu_resume)
-
     ps = gwemu_commands.add_parser("ps", help="list GWemu instances and execution state")
     ps.add_argument("--output", choices=("text", "json"), default="text")
     ps.add_argument("--no-pager", action="store_true", help="write directly to the terminal")
     ps.set_defaults(handler=_gwemu_ps)
 
-    screenshot = gwemu_commands.add_parser(
-        "screenshot", help="capture a GWemu PNG and report whether the frame is black")
-    screenshot_target = screenshot.add_mutually_exclusive_group(required=False)
-    screenshot_target.add_argument("--profile", help="profile directory of the instance")
-    screenshot_target.add_argument("--pid", type=int, help="GWemu process id")
-    screenshot.add_argument("--output", help="PNG path; defaults under the profile runtime directory")
-    screenshot.set_defaults(handler=_gwemu_screenshot)
-
     profiler = gwemu_commands.add_parser(
         "profile", help="sample native hot functions through the GWProv daemon while the app runs")
-    profiler.add_argument("--profile", help="override the active GWemu device")
+    profiler.add_argument("--profile", help="select the managed GWemu profile")
     profiler.add_argument("--symbols", action="append", default=[], metavar="ELF",
                           help="additional symbols; bundled firmware/app ELFs load automatically")
     profiler.add_argument("--debug-config", help="local ELF/map, relocation and counter descriptor")
@@ -4111,7 +3698,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     diagnose = gwemu_commands.add_parser(
         "diagnose", help="capture a running profile's screen and symbol-resolved call stack")
-    diagnose.add_argument("--profile", help="override the active GWemu device")
+    diagnose.add_argument("--profile", help="select the managed GWemu profile")
     diagnose.add_argument("--symbols", action="append", default=[], metavar="ELF",
                           help="additional app ELF symbols (repeatable)")
     diagnose.add_argument("--debug-config", help="shared local port debug descriptor")
@@ -4131,7 +3718,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     watch = gwemu_commands.add_parser(
         "watch", help="watch app progress and capture a report when it stalls")
-    watch.add_argument("--profile", help="override the active GWemu device")
+    watch.add_argument("--profile", help="select the managed GWemu profile")
     watch.add_argument("--symbols", action="append", default=[], metavar="ELF",
                        help="app or firmware ELF symbols (repeatable; firmware is loaded from profile)")
     watch.add_argument("--debug-config", help="shared local port debug descriptor")
@@ -4185,7 +3772,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.set_defaults(handler=_run_gwemu)
 
     debug = gwemu_commands.add_parser("debug", help="run GWemu under GDB with bundled firmware symbols")
-    debug.add_argument("--profile", help="override the active GWemu device")
+    debug.add_argument("--profile", help="select the managed GWemu profile")
     debug.add_argument("--gdb-port", type=int,
                        help="GDB port; automatic allocation starts at 1235")
     debug.add_argument("--headless", action="store_true",
@@ -4294,6 +3881,7 @@ def build_parser() -> argparse.ArgumentParser:
                            help="raw source for every retained mapped XiP file when rebuilding FrogFS")
 
     input_group = commands.add_parser("input", help="send controller input to a target")
+    input_group.add_argument("device", metavar="DEVICE", help="hardware device name or stable ID")
     input_commands = input_group.add_subparsers(dest="input_command", required=True)
     tap = input_commands.add_parser("tap", help="tap a button or chord over the probe")
     tap.add_argument("buttons", help="button name or chord, such as LEFT+GAME")
@@ -4304,7 +3892,6 @@ def build_parser() -> argparse.ArgumentParser:
     input_target.add_argument("--probe-id", help="select a local PyOCD probe")
     input_target.add_argument("--programmer", choices=("stlink", "jlink", "cmsis-dap", "rpi-gpio"))
     input_target.add_argument("--remote-url", help="gnwmanager websocket URL")
-    tap.add_argument("--device", metavar="DEVICE", help="named hardware device or stable ID")
     tap.add_argument("--remote-origin", help="Origin required by the remote server")
     tap.set_defaults(handler=_input_tap)
 
@@ -4419,18 +4006,6 @@ def _normalize_profile_object_form(argv: list[str] | None) -> list[str] | None:
     """Accept ``profile PROFILE ACTION`` while keeping parser actions simple."""
     if argv is None:
         return None
-    if argv and argv[0] == "device":
-        # ``devices`` is the one canonical device resource command. Keep the
-        # old singular spelling as a compatibility alias, including the old
-        # nested recovery form, without exposing a second command concept.
-        if len(argv) >= 2 and argv[1] == "recover":
-            return ["recover", *argv[2:]]
-        return ["devices", *argv[1:]]
-    if argv and argv[0] == "input" and len(argv) >= 4:
-        # Canonical object-first form: input DEVICE tap BUTTON.  Internally
-        # retain the historical input tap BUTTON parser shape.
-        if argv[1] not in {"tap"} and argv[2] == "tap":
-            return ["input", "tap", argv[3], "--device", argv[1], *argv[4:]]
     if len(argv) < 3 or argv[0] not in {"profile"}:
         return argv
     if len(argv) >= 4 and argv[2] == "filesystem" and argv[3] in {"tree", "ls"}:

@@ -3,12 +3,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 
 def _path() -> Path:
-    from .active_device import _state_path
-    return _state_path().with_name("device-assignments.json")
+    override = os.environ.get("GWPROV_STATE_DIR")
+    if override:
+        return Path(override).expanduser() / "device-assignments.json"
+    if os.name == "nt":
+        root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library/Application Support"
+    else:
+        root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return root / "gwprov" / "device-assignments.json"
 
 
 def assignments() -> dict[str, dict[str, str]]:

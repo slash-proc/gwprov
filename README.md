@@ -842,12 +842,12 @@ is busy or cannot be confirmed idle is left alone. `gwprov ps` reports `BUSY`
 while a substantial operation owns the target. Otherwise, the daemon continues
 its five-second state poll, including while the verified idle RAM flasher is
 running. Without `--start`, deployment leaves that flasher ready for another
-command. The `gwprov device recover` command starts the RAM flasher if needed
+command. The `gwprov recover DEVICE` command starts the RAM flasher if needed
 or attaches to a live idle stub and synchronizes its mailbox counter. It leaves
 the flasher running; it does not boot bank 1:
 
 ```sh
-gwprov device recover
+gwprov recover DEVICE
 ```
 
 That command requires the active hardware device. If no flasher is running,

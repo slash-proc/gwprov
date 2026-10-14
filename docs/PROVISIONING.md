@@ -118,7 +118,7 @@ stale `IDLE` value while application firmware runs, so it cannot identify the
 stub by itself. A resident stub blocks an implicit reset/load by flows that
 need to start the service. `gwprov apply` can attach to an already-running idle
 stub.
-`gwprov device recover` starts the RAM flasher when absent, or attaches and
+`gwprov recover DEVICE` starts the RAM flasher when absent, or attaches and
 synchronizes its context counter when already live and idle. It restarts an
 idle but halted or terminal-error stub; it refuses a busy or unreadable
 resident service. Recovery leaves the device in Recovery Mode ready for commands.

@@ -957,21 +957,21 @@ def _device_recover(args) -> int:
     row = _resolve_device_selector(selected) if selected else None
     device_id = row["id"] if row else get_active()
     if not device_id:
-        raise ValueError("device recover requires DEVICE (or a legacy active device selection)")
+        raise ValueError("recover requires DEVICE (or a legacy active device selection)")
     if device_id.startswith("probe:"):
         from gwprov.backends import SelectedPyOCDBackend
         backend = SelectedPyOCDBackend(device_id.removeprefix("probe:"),
-                                       operation="gwprov device recover", lease_wait=0,
+                                       operation="gwprov recover", lease_wait=0,
                                        allow_recovery_marker=True,
                                        resume_on_disconnect=False)
     elif device_id.startswith("remote:"):
         from gwprov.backends import WebSocketBackend
         backend = WebSocketBackend(device_id.removeprefix("remote:"),
                                    origin=(row or {}).get("remoteOrigin") or get_active_origin(),
-                                   operation="gwprov device recover", lease_wait=0,
+                                   operation="gwprov recover", lease_wait=0,
                                    allow_recovery_marker=True)
     else:
-        raise ValueError("device recover requires an active physical device")
+        raise ValueError("recover requires an active physical device")
 
     from gwprov.hw_lifecycle import recover_flasher
     try:
@@ -3163,7 +3163,7 @@ _gwprov_complete() {
       adapters) candidates="list ls add remove rm" ;;
       start) candidates=$(_gwprov_profile_names) ;;
       recover|pause|halt|resume|reset|logs|duplicate) candidates=$(_gwprov_device_names) ;;
-      device) candidates="recover" ;;
+      devices|device) candidates="--help -h --output" ;;
       projects|project) candidates="list ls versions info install stage-local" ;;
       backups) candidates="add list ls" ;;
       tree) candidates="--format --no-pager" ;;
@@ -3415,7 +3415,7 @@ _gwprov() {
       adapters) candidates="list ls add remove rm" ;;
       start) candidates="${(@f)$(_gwprov_profile_names)}" ;;
       recover|pause|halt|resume|reset|logs|duplicate) candidates="${(@f)$(_gwprov_device_names)}" ;;
-      device) candidates="recover" ;;
+      devices|device) candidates="--help -h --output" ;;
       projects|project) candidates="list ls versions info install stage-local" ;;
       backups) candidates="add list ls" ;;
       tree) candidates="--format --no-pager" ;;
@@ -3559,10 +3559,12 @@ def _command_tree(args) -> int:
                if isinstance(action, argparse._SubParsersAction)]
     if args.format == "names":
         choices = actions[0].choices if actions else {}
+        canonical = {choice.dest for choice in actions[0]._choices_actions} if actions else set()
         ordered = [name for _, group in getattr(parser, "help_categories", ())
-                   for name in group if name in choices]
+                   for name in group if name in choices and name in canonical]
         ordered_set = set(ordered)
-        ordered.extend(name for name in choices if name not in ordered_set)
+        ordered.extend(name for name in choices
+                       if name not in ordered_set and name in canonical)
         for name in ordered:
             print(name)
         return 0
@@ -3575,7 +3577,9 @@ def _command_tree(args) -> int:
             if not isinstance(action, argparse._SubParsersAction):
                 continue
             descriptions = {choice.dest: choice.help for choice in action._choices_actions}
-            names = selected if selected is not None else list(action.choices)
+            canonical = {choice.dest for choice in action._choices_actions}
+            names = selected if selected is not None else [name for name in action.choices
+                                                           if name in canonical]
             added_parsers = set()
             for name in names:
                 child = action.choices.get(name)
@@ -3644,7 +3648,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.help_categories = (
         ("Overview and selection", ("show", "set", "ps")),
         ("All devices and adapters", ("devices", "adapters")),
-        ("Selected-device controls", ("start", "recover", "pause", "halt", "resume", "reset", "logs", "duplicate", "apply", "device", "gwemu", "input", "deploy", "perf", "config")),
+        ("Selected-device controls", ("start", "recover", "pause", "halt", "resume", "reset", "logs", "duplicate", "apply", "gwemu", "input", "deploy", "perf", "config")),
         ("Profiles and storage", ("profile", "filesystem", "media", "sdcard")),
         ("Project catalog", ("projects",)),
         ("File workflows not yet device-scoped", ("retro-go", "ofw")),
@@ -3683,7 +3687,7 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_remove = adapter_commands.add_parser("remove", aliases=("rm",), help="remove a registered remote adapter")
     adapter_remove.add_argument("name_or_url", metavar="NAME_OR_URL")
     adapter_remove.set_defaults(handler=_adapters_remove)
-    devices = commands.add_parser("devices", help="list GWemu and physical G&W devices")
+    devices = commands.add_parser("devices", help="list and inspect GWemu and physical G&W devices")
     devices.add_argument("--output", choices=("text", "json"), default="text")
     devices.add_argument("--ids-only", action="store_true", help=argparse.SUPPRESS)
     devices.set_defaults(handler=_devices_command)
@@ -3701,15 +3705,9 @@ def build_parser() -> argparse.ArgumentParser:
     start_profile.add_argument("--rtc-epoch", type=int)
     start_profile.add_argument("--gwemu-bin")
     start_profile.set_defaults(handler=_start_profile)
-    device = commands.add_parser("device", help="inspect or recover the active physical device")
-    device_commands = device.add_subparsers(dest="device_command", required=True)
-    device_recover = device_commands.add_parser(
-        "recover", help="start or synchronize with the gnwmanager RAM flasher")
-    device_recover.add_argument("device", nargs="?", metavar="DEVICE",
-                                help="hardware device name or stable ID")
-    device_recover.set_defaults(handler=_device_recover)
     recover = commands.add_parser("recover", help="start or synchronize with a hardware recovery flasher")
-    recover.add_argument("device", metavar="DEVICE", help="hardware device name or stable ID")
+    recover.add_argument("device", nargs="?", metavar="DEVICE",
+                         help="hardware device name or stable ID; defaults to the legacy active device")
     recover.set_defaults(handler=_device_recover)
     for action, help_text in (("pause", "pause a managed GWemu device"),
                               ("halt", "halt a managed GWemu device"),
@@ -4421,6 +4419,13 @@ def _normalize_profile_object_form(argv: list[str] | None) -> list[str] | None:
     """Accept ``profile PROFILE ACTION`` while keeping parser actions simple."""
     if argv is None:
         return None
+    if argv and argv[0] == "device":
+        # ``devices`` is the one canonical device resource command. Keep the
+        # old singular spelling as a compatibility alias, including the old
+        # nested recovery form, without exposing a second command concept.
+        if len(argv) >= 2 and argv[1] == "recover":
+            return ["recover", *argv[2:]]
+        return ["devices", *argv[1:]]
     if argv and argv[0] == "input" and len(argv) >= 4:
         # Canonical object-first form: input DEVICE tap BUTTON.  Internally
         # retain the historical input tap BUTTON parser shape.

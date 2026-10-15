@@ -1,4 +1,5 @@
 """Stage an unpublished local project build into a gwprov content tree."""
+
 from __future__ import annotations
 
 import hashlib
@@ -34,9 +35,11 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
     if not isinstance(target, dict) or not isinstance(target.get("id"), str) or not target["id"]:
         raise ValueError("local project manifest needs a target object with an id")
     requires_abi = target.get("requiresAbi")
-    if requires_abi is not None and (not isinstance(requires_abi, dict) or
-            not isinstance(requires_abi.get("version"), int) or
-            not isinstance(requires_abi.get("minSize"), int)):
+    if requires_abi is not None and (
+        not isinstance(requires_abi, dict)
+        or not isinstance(requires_abi.get("version"), int)
+        or not isinstance(requires_abi.get("minSize"), int)
+    ):
         raise ValueError("target requiresAbi must contain integer version and minSize")
     entries = target.get("files")
     if not isinstance(entries, list) or not entries:
@@ -50,7 +53,8 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
     if firmware_metadata.get("variant") != variant:
         raise ValueError(
             f"local project variant {variant!r} does not match content root variant "
-            f"{firmware_metadata.get('variant')!r}")
+            f"{firmware_metadata.get('variant')!r}"
+        )
     project_root = manifest_file.parent
     planned: list[tuple[Path, bytes, dict[str, Any]]] = []
     symbol_files: list[tuple[Path, bytes]] = []
@@ -68,11 +72,19 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
         destination = _safe_relpath(entry.get("path", ""))
         if variant == "flash":
             if len(destination.parts) < 2 or destination.parts[0] not in {"frogfs", "littlefs"}:
-                raise ValueError(f"flash destination must start with frogfs/ or littlefs/: {destination}")
-            if destination.parts[0] == "littlefs" and destination.parts[1] not in {"cores", "lang", "data"}:
+                raise ValueError(
+                    f"flash destination must start with frogfs/ or littlefs/: {destination}"
+                )
+            if destination.parts[0] == "littlefs" and destination.parts[1] not in {
+                "cores",
+                "lang",
+                "data",
+            }:
                 raise ValueError(f"unsupported LittleFS destination: {destination}")
         elif destination.parts[0] in {"frogfs", "littlefs"}:
-            raise ValueError(f"SD destination is relative to the card root; remove {destination.parts[0]!r}: {destination}")
+            raise ValueError(
+                f"SD destination is relative to the card root; remove {destination.parts[0]!r}: {destination}"
+            )
         if variant == "sd" and destination.parts[0] == ".gwprov-projects.json":
             raise ValueError("SD destination conflicts with gwprov's project ownership marker")
         key = destination.as_posix().casefold()
@@ -87,11 +99,16 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
         map_info = entry.get("mapped")
         metadata: dict[str, Any] = {"path": destination.as_posix(), "sha256": digest}
         if map_info is not None:
-            mapped_path = (destination.parts[1:]
-                           if variant == "flash" and destination.parts[0] == "frogfs"
-                           else destination.parts if variant == "sd" else ())
-            if (not isinstance(map_info, dict) or not mapped_path or
-                    mapped_path[0] not in {"cores", "homebrews"}):
+            mapped_path = (
+                destination.parts[1:]
+                if variant == "flash" and destination.parts[0] == "frogfs"
+                else destination.parts if variant == "sd" else ()
+            )
+            if (
+                not isinstance(map_info, dict)
+                or not mapped_path
+                or mapped_path[0] not in {"cores", "homebrews"}
+            ):
                 raise ValueError(
                     "mapped artifacts must be files under FrogFS/cores, "
                     "FrogFS/homebrews, SD cores/, or SD homebrews/"
@@ -134,8 +151,7 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
             raise ValueError(f"local project symbol checksum mismatch: {source}")
         if filename.lower().endswith(".elf") and not data.startswith(b"\x7fELF"):
             raise ValueError(f"local project debug symbols are not an ELF file: {source}")
-        relative = _safe_relpath(
-            f"projects/{identity.as_posix()}/{target['id']}/{filename}")
+        relative = _safe_relpath(f"projects/{identity.as_posix()}/{target['id']}/{filename}")
         if any(path == relative for path, _ in symbol_files):
             raise ValueError(f"duplicate target debug symbol destination: {relative}")
         symbol_files.append((relative, data))
@@ -150,9 +166,16 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
     if existing is None:
         # Older local staging markers used repo/target identity under a
         # different key spelling. Recognize that identity when updating.
-        existing_key = next((key for key, item in ownership.items()
-                             if isinstance(item, dict) and item.get("repo") == repo
-                             and item.get("target") == target["id"]), project_key)
+        existing_key = next(
+            (
+                key
+                for key, item in ownership.items()
+                if isinstance(item, dict)
+                and item.get("repo") == repo
+                and item.get("target") == target["id"]
+            ),
+            project_key,
+        )
         existing = ownership.get(existing_key, {})
 
     def content_key(value: str) -> str:
@@ -199,8 +222,8 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
         keep = {content_key(name) for name in files}
         other_owned = {
             content_key(str(name))
-            for key, item in ownership.items() if key not in {existing_key, project_key}
-            and isinstance(item, dict)
+            for key, item in ownership.items()
+            if key not in {existing_key, project_key} and isinstance(item, dict)
             for name in item.get("files", [])
         }
         stale: list[Path] = []
@@ -209,7 +232,11 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
             # Early local manifests recorded flash paths without their partition.
             # Leave those ambiguous legacy files alone; new markers retain the
             # complete path so stale files can be removed safely.
-            if variant == "flash" and old_path.parts and old_path.parts[0] not in {"frogfs", "littlefs"}:
+            if (
+                variant == "flash"
+                and old_path.parts
+                and old_path.parts[0] not in {"frogfs", "littlefs"}
+            ):
                 continue
             if content_key(str(old_path)) in keep or content_key(str(old_path)) in other_owned:
                 continue
@@ -240,13 +267,25 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
         if existing_key != project_key:
             ownership.pop(existing_key, None)
         ownership[project_key] = {
-            "repo": repo, "tag": tag, "project": project,
-            "target": target["id"], "variant": variant,
-            "files": files, "requiresAbi": requires_abi,
-            "mapped": mapped, "inputs": [], "symbols": sorted(new_symbols),
+            "repo": repo,
+            "tag": tag,
+            "project": project,
+            "target": target["id"],
+            "variant": variant,
+            "files": files,
+            "requiresAbi": requires_abi,
+            "mapped": mapped,
+            "inputs": [],
+            "symbols": sorted(new_symbols),
         }
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps(ownership, indent=2) + "\n", encoding="utf-8")
-    return {"repo": repo, "tag": tag, "target": target["id"],
-            "variant": variant, "files": files, "mapped": mapped,
-            "symbols": sorted(new_symbols)}
+    return {
+        "repo": repo,
+        "tag": tag,
+        "target": target["id"],
+        "variant": variant,
+        "files": files,
+        "mapped": mapped,
+        "symbols": sorted(new_symbols),
+    }

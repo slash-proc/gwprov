@@ -14,8 +14,9 @@ class FakeSocket:
 
     def recv(self, timeout=None):
         if not self.requests:
-            return json.dumps({"type": "hello", "version": 1, "backend": "gnwmanager",
-                               "targetControl": "arm"})
+            return json.dumps(
+                {"type": "hello", "version": 1, "backend": "gnwmanager", "targetControl": "arm"}
+            )
         request = self.requests[-1]
         method = request["method"]
         if method == "read_memory":
@@ -57,7 +58,9 @@ def fake_websockets(monkeypatch, tmp_path):
 
 def test_websocket_backend_selects_origin_and_chunks_memory(monkeypatch, tmp_path):
     socket, called = fake_websockets(monkeypatch, tmp_path)
-    backend = WebSocketBackend("wss://debug.example:8765/gdb", origin="https://gwprov.local")
+    backend = WebSocketBackend(
+        "wss://debug.example:8765/gdb", origin="https://gwprov.local", daemon_managed=True
+    )
     backend.MAX_MEMORY = 3
     backend.open()
     assert called["origin"] == "https://gwprov.local"
@@ -66,7 +69,10 @@ def test_websocket_backend_selects_origin_and_chunks_memory(monkeypatch, tmp_pat
     assert backend.read_memory(0x20000000, 8) == bytes(8)
     reads = [request for request in socket.requests if request["method"] == "read_memory"]
     assert [request["args"] for request in reads] == [
-        [0x20000000, 3], [0x20000003, 3], [0x20000006, 2]]
+        [0x20000000, 3],
+        [0x20000003, 3],
+        [0x20000006, 2],
+    ]
 
     backend.write_memory(0x20000000, b"abcdefgh")
     backend.reset()
@@ -79,9 +85,10 @@ def test_websocket_backend_selects_origin_and_chunks_memory(monkeypatch, tmp_pat
 
 def test_websocket_backend_rejects_unexpected_protocol(monkeypatch, tmp_path):
     socket, _ = fake_websockets(monkeypatch, tmp_path)
-    socket.recv = lambda timeout=None: json.dumps({"type": "hello", "version": 2,
-                                                    "backend": "gnwmanager"})
-    backend = WebSocketBackend("ws://localhost:8765/gdb")
+    socket.recv = lambda timeout=None: json.dumps(
+        {"type": "hello", "version": 2, "backend": "gnwmanager"}
+    )
+    backend = WebSocketBackend("ws://localhost:8765/gdb", daemon_managed=True)
     with pytest.raises(RuntimeError, match="unsupported gnwmanager"):
         backend.open()
     assert socket.closed
@@ -95,9 +102,18 @@ def test_websocket_backend_requires_gnwmanager_path():
 def test_unverified_device_inventory_returns_nonzero(monkeypatch, capsys):
     from gwprov import devices
 
-    monkeypatch.setattr(devices, "device_rows", lambda profile=None: [{
-        "id": "probe:*", "kind": "hardware", "status": "unknown",
-        "application": "Unknown", "name": "Probe inventory",
-    }])
+    monkeypatch.setattr(
+        devices,
+        "device_rows",
+        lambda profile=None, **kwargs: [
+            {
+                "id": "probe:*",
+                "kind": "hardware",
+                "status": "unknown",
+                "application": "Unknown",
+                "name": "Probe inventory",
+            }
+        ],
+    )
     assert devices.show_devices(output="json") == 2
     assert '"status": "unknown"' in capsys.readouterr().out

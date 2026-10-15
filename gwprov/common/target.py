@@ -34,27 +34,33 @@ from gnwmanager.gnw import GnW
 from gnwmanager.ocdbackend.gdb_backend import GDBBackend
 from ..backends import AutoOpenOCDBackend
 
-from .sdcard import (HardwarePhysicalSDCardManager, HardwareProbeSDCardManager,
-                     QemuSDCardManager)
-from .timeline import (ShadowWordPlayer, TimelineError, parse,
-                       quit_time as timeline_quit)
+from .sdcard import HardwarePhysicalSDCardManager, HardwareProbeSDCardManager, QemuSDCardManager
+from .timeline import ShadowWordPlayer, TimelineError, parse, quit_time as timeline_quit
 
 # gwemu key map (gnw-input.ini), per the firmware's docs/gwemu.md.
 KEYS = {
-    "A": "x", "B": "z", "GAME": "g", "TIME": "t",
-    "PAUSE": "esc", "POWER": "p", "START": "ret", "SELECT": "shift_r",
-    "UP": "up", "DOWN": "down", "LEFT": "left", "RIGHT": "right",
+    "A": "x",
+    "B": "z",
+    "GAME": "g",
+    "TIME": "t",
+    "PAUSE": "esc",
+    "POWER": "p",
+    "START": "ret",
+    "SELECT": "shift_r",
+    "UP": "up",
+    "DOWN": "down",
+    "LEFT": "left",
+    "RIGHT": "right",
 }
-HOLD_MS = 600   # 200 is too short for the launcher to register; do not lower
+HOLD_MS = 600  # 200 is too short for the launcher to register; do not lower
 
-BANK_SIZE = 256 * 1024   # gwemu refuses anything else
+BANK_SIZE = 256 * 1024  # gwemu refuses anything else
 
 # Run scratch lives in the PROJECT, never /tmp. Each gwemu run copies the SD
 # image and extflash (100s of MB) into its own directory; on a tmpfs box that
 # is RAM, and leaking a few dozen runs fills it. Always deleted -- pass
 # keep_temp / --keep-temp only when you need the artifacts to look at.
-RUN_ROOT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "dev-local", "runs")
+RUN_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "dev-local", "runs")
 
 
 def _make_run_dir():
@@ -108,13 +114,14 @@ class GDBPipeBackend(GDBBackend):
 @dataclass
 class Image:
     """The bytes to boot. bank1/bank2 are internal flash; the rest optional."""
+
     bank1: str
     bank2: str = ""
     extflash: str = ""
     sdcard: str = ""
-    elf: str = ""            # for symbol lookup
-    intflash_bank: int = 1   # which bank the firmware was LINKED for
-    intflash: str = ""       # HARDWARE image; see hw_primary
+    elf: str = ""  # for symbol lookup
+    intflash_bank: int = 1  # which bank the firmware was LINKED for
+    intflash: str = ""  # HARDWARE image; see hw_primary
 
     @property
     def hw_primary(self):
@@ -157,7 +164,6 @@ def timeline_quit_time(path):
 class QMP:
     """Minimal QMP client. Used for screendump; input goes via timelines."""
 
-
     def __init__(self, port, timeout=20.0):
         deadline = time.time() + timeout
         last = None
@@ -193,9 +199,11 @@ class QMP:
         return self._read()
 
     def send_key(self, name, hold_ms=HOLD_MS):
-        return self._cmd("send-key",
-                         keys=[{"type": "qcode", "data": KEYS[name.upper()]}],
-                         **{"hold-time": hold_ms})
+        return self._cmd(
+            "send-key",
+            keys=[{"type": "qcode", "data": KEYS[name.upper()]}],
+            **{"hold-time": hold_ms},
+        )
 
     def screendump(self, path):
         return self._cmd("screendump", filename=os.path.abspath(path))
@@ -231,6 +239,7 @@ class _SerialBackend:
         def locked(*a, **kw):
             with lock:
                 return attr(*a, **kw)
+
         return locked
 
     def __setattr__(self, name, value):
@@ -264,9 +273,19 @@ class GwemuTarget(Target):
 
     timeline_is_builtin = True
 
-    def __init__(self, image, display=False, audio=False, icount=None,
-                 timeline=None, record=None, port=None, qmp_port=None,
-                 keep_temp=False, stdio_gdb=False):
+    def __init__(
+        self,
+        image,
+        display=False,
+        audio=False,
+        icount=None,
+        timeline=None,
+        record=None,
+        port=None,
+        qmp_port=None,
+        keep_temp=False,
+        stdio_gdb=False,
+    ):
         super().__init__(image)
         self.display = display
         self.audio = audio
@@ -280,8 +299,8 @@ class GwemuTarget(Target):
             self._allocated_ports = ()
         else:
             from ..ports import allocate_gwemu_ports
-            self.port, self.qmp_port = allocate_gwemu_ports(
-                gdb_port=port, qmp_port=qmp_port)
+
+            self.port, self.qmp_port = allocate_gwemu_ports(gdb_port=port, qmp_port=qmp_port)
             self._allocated_ports = (self.port, self.qmp_port)
         self.proc = None
         self.qmp = None
@@ -308,36 +327,50 @@ class GwemuTarget(Target):
         try:
             self._start()
         except Exception:
-            self.stop()          # never leave a populated run dir behind
+            self.stop()  # never leave a populated run dir behind
             raise
 
     def _start(self):
         img = self.image
         self._pad_bank(img.bank1, "qemu_bank1.bin")
         self._pad_bank(img.bank2, "qemu_bank2.bin")
-        for src, name in ((img.extflash, "extflash.bin"),
-                          (img.sdcard, "sdcard.img")):
+        for src, name in ((img.extflash, "extflash.bin"), (img.sdcard, "sdcard.img")):
             if src and os.path.exists(src):
                 shutil.copy(src, os.path.join(self.tmpdir, name))
 
-        cmd = ["gwemu", "-machine", "gnw-h7b0",
-               "-global", "gnw-h7b0-soc.bank1-image=qemu_bank1.bin",
-               "-global", "gnw-h7b0-soc.bank2-image=qemu_bank2.bin"]
+        cmd = [
+            "gwemu",
+            "-machine",
+            "gnw-h7b0",
+            "-global",
+            "gnw-h7b0-soc.bank1-image=qemu_bank1.bin",
+            "-global",
+            "gnw-h7b0-soc.bank2-image=qemu_bank2.bin",
+        ]
         if os.path.exists(os.path.join(self.tmpdir, "extflash.bin")):
             cmd += ["-global", "gnw-h7b0-soc.extflash-image=extflash.bin"]
         # Silent by default: these run in the background repeatedly.
         # sdl3, not sdl: gwemu is built against SDL3 and the older backend
         # name makes it fail SDL audio init and exit before QMP ever opens.
-        cmd += ["-audiodev", ("sdl3,id=snd0" if self.audio else "none,id=snd0"),
-                "-global", "gnw-h7b0-sai1.audiodev=snd0"]
+        cmd += [
+            "-audiodev",
+            ("sdl3,id=snd0" if self.audio else "none,id=snd0"),
+            "-global",
+            "gnw-h7b0-sai1.audiodev=snd0",
+        ]
         if os.path.exists(os.path.join(self.tmpdir, "sdcard.img")):
             cmd += ["-drive", "if=sd,format=raw,file=sdcard.img"]
         cmd += ["-display", "gwemu" if self.display else "none"]
         if self.stdio_gdb:
             cmd += ["-gdb", "stdio", "-S"]
         else:
-            cmd += ["-qmp", f"tcp:127.0.0.1:{self.qmp_port},server=on,wait=off",
-                    "-gdb", f"tcp:127.0.0.1:{self.port}", "-S"]
+            cmd += [
+                "-qmp",
+                f"tcp:127.0.0.1:{self.qmp_port},server=on,wait=off",
+                "-gdb",
+                f"tcp:127.0.0.1:{self.port}",
+                "-S",
+            ]
         if self.icount is not None:
             # Without -icount, virtual time follows host wall-clock and DWT
             # counts vary ~14% run to run. See docs/06.
@@ -346,18 +379,24 @@ class GwemuTarget(Target):
         # Pipe mode has no QMP, so use the timeline's own quit event as the
         # process lifetime bound instead of leaving a background emulator.
         if self.stdio_gdb and not self.timeline:
-            env_timeline = os.path.join(os.path.dirname(__file__), "..", "..",
-                                        "timelines", "probe-quit.tl")
+            env_timeline = os.path.join(
+                os.path.dirname(__file__), "..", "..", "timelines", "probe-quit.tl"
+            )
             self.timeline = os.path.abspath(env_timeline)
 
         env = dict(os.environ)
         from ..timeline_launch import configure_timeline
-        configure_timeline(env, timeline=self.timeline, record_timeline=self.record,
-                           headless=not self.display)
+
+        configure_timeline(
+            env, timeline=self.timeline, record_timeline=self.record, headless=not self.display
+        )
         self.proc = subprocess.Popen(
-            cmd, cwd=self.tmpdir, env=env,
+            cmd,
+            cwd=self.tmpdir,
+            env=env,
             stdin=subprocess.PIPE if self.stdio_gdb else None,
-            stdout=subprocess.PIPE if self.stdio_gdb else None)
+            stdout=subprocess.PIPE if self.stdio_gdb else None,
+        )
         time.sleep(1.0)
         if self.stdio_gdb:
             self.qmp = None
@@ -379,8 +418,7 @@ class GwemuTarget(Target):
         out = []
         for name in sorted(os.listdir(self.tmpdir)):
             if name.endswith((".png", ".ppm")):
-                shutil.copy(os.path.join(self.tmpdir, name),
-                            os.path.join(dest, name))
+                shutil.copy(os.path.join(self.tmpdir, name), os.path.join(dest, name))
                 out.append(os.path.join(dest, name))
         if out:
             print(f"artifacts -> {dest}/ ({len(out)} files)")
@@ -407,6 +445,7 @@ class GwemuTarget(Target):
         finally:
             if self._allocated_ports:
                 from ..ports import release_ports
+
                 release_ports(*self._allocated_ports)
                 self._allocated_ports = ()
             if self.keep_temp:
@@ -426,9 +465,16 @@ class GwemuTarget(Target):
 class HardwareTarget(Target):
     """Boot an Image on the real device over a debug probe."""
 
-    def __init__(self, image, physical_sdcard=None, no_flash=False,
-                 hard_reset=False, erase_first=False, precise_faults=False,
-                 timeline=None):
+    def __init__(
+        self,
+        image,
+        physical_sdcard=None,
+        no_flash=False,
+        hard_reset=False,
+        erase_first=False,
+        precise_faults=False,
+        timeline=None,
+    ):
         super().__init__(image)
         self.physical_sdcard = physical_sdcard
         self.no_flash = no_flash
@@ -445,7 +491,8 @@ class HardwareTarget(Target):
     def start(self):
         print("Attaching to hardware via OpenOCD...")
         self.backend = _SerialBackend(
-            AutoOpenOCDBackend(operation="gwprov hardware target"), threading.Lock())
+            AutoOpenOCDBackend(operation="gwprov hardware target"), threading.Lock()
+        )
         self.backend.open()
 
         # OBSERVE-ONLY: attach without disturbing what is running.
@@ -463,10 +510,9 @@ class HardwareTarget(Target):
             # destructive on this part (see erase_first): once a good image is
             # on there, the way to boot it is a reset, not another flash.
             if self.hard_reset:
-                print("--no-flash --hard-reset: resetting the device, "
-                      "leaving flash untouched")
-                from ..hw_lifecycle import (_freeze_h7_watchdogs,
-                                            _restore_h7_watchdogs)
+                print("--no-flash --hard-reset: resetting the device, " "leaving flash untouched")
+                from ..hw_lifecycle import _freeze_h7_watchdogs, _restore_h7_watchdogs
+
                 watchdog_freezes = _freeze_h7_watchdogs(self.backend)
                 self.backend.reset_and_halt()
                 if self.precise_faults:
@@ -475,14 +521,18 @@ class HardwareTarget(Target):
                 _restore_h7_watchdogs(self.backend, watchdog_freezes)
                 self._start_timeline()
                 return
-            print("--no-flash: observing the device WITHOUT reset "
-                  "(no gnwmanager, no flash, no SD)")
+            print(
+                "--no-flash: observing the device WITHOUT reset " "(no gnwmanager, no flash, no SD)"
+            )
             self._start_timeline()
             return
 
-        from ..hw_lifecycle import (assert_application_mode,
-                                    mark_backend_recovery_required,
-                                    start_gnwmanager_verified)
+        from ..hw_lifecycle import (
+            assert_application_mode,
+            mark_backend_recovery_required,
+            start_gnwmanager_verified,
+        )
+
         assert_application_mode(self.backend, operation="start a hardware target")
         mark_backend_recovery_required(self.backend, "starting gnwmanager RAM programmer")
         self.gnw = GnW(self.backend)
@@ -510,13 +560,14 @@ class HardwareTarget(Target):
         with open(src, "rb") as fh:
             self.gnw.flash(bank, 0, fh.read())
 
-        self.sdcard = (HardwarePhysicalSDCardManager(self.physical_sdcard)
-                       if self.physical_sdcard
-                       else HardwareProbeSDCardManager(self.gnw))
+        self.sdcard = (
+            HardwarePhysicalSDCardManager(self.physical_sdcard)
+            if self.physical_sdcard
+            else HardwareProbeSDCardManager(self.gnw)
+        )
 
         self._start_firmware()
         self._start_timeline()
-
 
     # SCB->CCR bit 1 (DISDEFWBUF) turns off the write buffer, which makes bus
     # faults PRECISE: BFAR and the stacked PC then point at the instruction
@@ -531,8 +582,10 @@ class HardwareTarget(Target):
         ccr = self.backend.read_uint32(self.CCR_ADDR)
         self.backend.write_uint32(self.CCR_ADDR, ccr | self.DISDEFWBUF)
         got = self.backend.read_uint32(self.CCR_ADDR)
-        print(f"precise faults: SCB->CCR 0x{ccr:08x} -> 0x{got:08x} "
-              f"(DISDEFWBUF {'set' if got & self.DISDEFWBUF else 'FAILED'})")
+        print(
+            f"precise faults: SCB->CCR 0x{ccr:08x} -> 0x{got:08x} "
+            f"(DISDEFWBUF {'set' if got & self.DISDEFWBUF else 'FAILED'})"
+        )
 
     def _start_firmware(self):
         """Boot the flashed firmware, the way `gnwmanager start` does it.
@@ -556,8 +609,8 @@ class HardwareTarget(Target):
         # device must start from the same state a power cycle gives it.
         if self.hard_reset:
             print("hard reset: resetting the CPU and every peripheral")
-            from ..hw_lifecycle import (_freeze_h7_watchdogs,
-                                        _restore_h7_watchdogs)
+            from ..hw_lifecycle import _freeze_h7_watchdogs, _restore_h7_watchdogs
+
             watchdog_freezes = _freeze_h7_watchdogs(self.backend)
             self.gnw.reset_and_halt()
             if self.precise_faults:
@@ -568,8 +621,8 @@ class HardwareTarget(Target):
             return
 
         base = 0x08100000 if self.image.intflash_bank == 2 else 0x08000000
-        from ..hw_lifecycle import (_reset_and_halt_for_stub,
-                                    _resume_after_stub_transition)
+        from ..hw_lifecycle import _reset_and_halt_for_stub, _resume_after_stub_transition
+
         watchdog_freezes = _reset_and_halt_for_stub(self.backend, self.gnw)
         self.backend.write_register("msp", self.gnw.read_uint32(base))
         self.backend.write_register("pc", self.gnw.read_uint32(base + 4))
@@ -577,14 +630,14 @@ class HardwareTarget(Target):
         self._confirm_application_running()
 
     def _confirm_application_running(self):
-        from ..hw_lifecycle import (clear_backend_recovery_required,
-                                    inspect_target_mode)
+        from ..hw_lifecycle import clear_backend_recovery_required, inspect_target_mode
+
         state = inspect_target_mode(self.backend)
         if state["halted"] or state["stubResident"]:
             raise RuntimeError(
                 "firmware did not leave gnwmanager Recovery Mode; GWProv is "
                 "holding the target traffic guard. Check `gwprov ps` and use "
-                "`gwprov device recover` when the mailbox is idle."
+                "`gwprov device DEVICE recover` when the mailbox is idle."
             )
         clear_backend_recovery_required(self.backend)
 
@@ -600,8 +653,10 @@ class HardwareTarget(Target):
             return
         events = parse(self.timeline)
         self.player = ShadowWordPlayer(self.backend, events)
-        print(f"[timeline] replaying {self.timeline} on hardware "
-              f"(needs a REMOTE_INPUT=1 firmware)")
+        print(
+            f"[timeline] replaying {self.timeline} on hardware "
+            f"(needs a REMOTE_INPUT=1 firmware)"
+        )
         self.player.start()
 
     def stop(self):
@@ -618,67 +673,100 @@ def add_target_args(parser):
     """Shared CLI surface. Every harness gets the same switches."""
     # "qemu" is accepted as an alias for "gwemu": existing harnesses and docs
     # use it, and the emulator is a QEMU fork.
-    parser.add_argument("--target", choices=["gwemu", "qemu", "hardware"],
-                        default="gwemu", help="where to run")
-    parser.add_argument("--gui", action="store_true",
-                        help="show the gwemu window")
-    parser.add_argument("--audio", action="store_true",
-                        help="enable host audio (silent by default)")
-    parser.add_argument("--icount", default=None,
-                        help="gwemu -icount shift; makes DWT counts "
-                             "reproducible (see docs/06)")
-    parser.add_argument("--timeline", default=None,
-                        help="input timeline (.tl) to replay. gwemu replays it "
-                             "itself; on hardware it is injected through the "
-                             "REMOTE_INPUT shadow word, so the same file drives "
-                             "both tiers")
-    parser.add_argument("--record", default=None, metavar="FILE.tl",
-                        help="RECORD an input timeline from an interactive "
-                             "session. Implies a window; quit gwemu cleanly or "
-                             "nothing is written")
-    parser.add_argument("--physical-sdcard", default=None,
-                        help="mounted SD path for bulk hardware copies")
-    parser.add_argument("--precise-faults", action="store_true",
-                        help="disable the write buffer (SCB->CCR DISDEFWBUF) "
-                             "at reset so bus faults are PRECISE and BFAR/PC "
-                             "identify the faulting instruction. Slower; use "
-                             "it to localise an imprecise fault")
-    parser.add_argument("--erase-first", action="store_true",
-                        help="erase internal flash before programming it. "
-                             "Programming H7 flash that was not erased leaves "
-                             "an uncorrectable ECC error whose READ raises a "
-                             "bus fault -- and which survives reflashing")
-    parser.add_argument("--hard-reset", action="store_true",
-                        help="start the device with a REAL reset (CPU and "
-                             "peripherals) instead of jumping to the reset "
-                             "vector. Use when peripheral state left by a "
-                             "previous session may be poisoning the boot")
-    parser.add_argument("--no-flash", action="store_true",
-                        help="attach to hardware WITHOUT flashing or resetting "
-                             "-- observe what is already running")
-    parser.add_argument("--keep-temp", action="store_true",
-                        help="keep the run directory under build/run/ for "
-                             "analysis (deleted by default -- each run copies "
-                             "the SD image and extflash)")
-    parser.add_argument("--stdio-gdb", action="store_true",
-                        help="use gwemu GDB over subprocess pipes when local "
-                             "sockets are unavailable")
+    parser.add_argument(
+        "--target", choices=["gwemu", "qemu", "hardware"], default="gwemu", help="where to run"
+    )
+    parser.add_argument("--gui", action="store_true", help="show the gwemu window")
+    parser.add_argument(
+        "--audio", action="store_true", help="enable host audio (silent by default)"
+    )
+    parser.add_argument(
+        "--icount",
+        default=None,
+        help="gwemu -icount shift; makes DWT counts " "reproducible (see docs/06)",
+    )
+    parser.add_argument(
+        "--timeline",
+        default=None,
+        help="input timeline (.tl) to replay. gwemu replays it "
+        "itself; on hardware it is injected through the "
+        "REMOTE_INPUT shadow word, so the same file drives "
+        "both tiers",
+    )
+    parser.add_argument(
+        "--record",
+        default=None,
+        metavar="FILE.tl",
+        help="RECORD an input timeline from an interactive "
+        "session. Implies a window; quit gwemu cleanly or "
+        "nothing is written",
+    )
+    parser.add_argument(
+        "--physical-sdcard", default=None, help="mounted SD path for bulk hardware copies"
+    )
+    parser.add_argument(
+        "--precise-faults",
+        action="store_true",
+        help="disable the write buffer (SCB->CCR DISDEFWBUF) "
+        "at reset so bus faults are PRECISE and BFAR/PC "
+        "identify the faulting instruction. Slower; use "
+        "it to localise an imprecise fault",
+    )
+    parser.add_argument(
+        "--erase-first",
+        action="store_true",
+        help="erase internal flash before programming it. "
+        "Programming H7 flash that was not erased leaves "
+        "an uncorrectable ECC error whose READ raises a "
+        "bus fault -- and which survives reflashing",
+    )
+    parser.add_argument(
+        "--hard-reset",
+        action="store_true",
+        help="start the device with a REAL reset (CPU and "
+        "peripherals) instead of jumping to the reset "
+        "vector. Use when peripheral state left by a "
+        "previous session may be poisoning the boot",
+    )
+    parser.add_argument(
+        "--no-flash",
+        action="store_true",
+        help="attach to hardware WITHOUT flashing or resetting "
+        "-- observe what is already running",
+    )
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="keep the run directory under build/run/ for "
+        "analysis (deleted by default -- each run copies "
+        "the SD image and extflash)",
+    )
+    parser.add_argument(
+        "--stdio-gdb",
+        action="store_true",
+        help="use gwemu GDB over subprocess pipes when local " "sockets are unavailable",
+    )
 
 
 def open_target(args, image):
     """Build the Target an argparse namespace asks for."""
     if getattr(args, "target", "gwemu") == "hardware":
-        return HardwareTarget(image, physical_sdcard=args.physical_sdcard,
-                              no_flash=getattr(args, "no_flash", False),
-                              hard_reset=getattr(args, "hard_reset", False),
-                              erase_first=getattr(args, "erase_first", False),
-                              precise_faults=getattr(args, "precise_faults",
-                                                     False),
-                              timeline=getattr(args, "timeline", None))
-    return GwemuTarget(image, display=getattr(args, "gui", False),
-                       audio=getattr(args, "audio", False),
-                       icount=getattr(args, "icount", None),
-                       timeline=getattr(args, "timeline", None),
-                       record=getattr(args, "record", None),
-                       keep_temp=getattr(args, "keep_temp", False),
-                       stdio_gdb=getattr(args, "stdio_gdb", False))
+        return HardwareTarget(
+            image,
+            physical_sdcard=args.physical_sdcard,
+            no_flash=getattr(args, "no_flash", False),
+            hard_reset=getattr(args, "hard_reset", False),
+            erase_first=getattr(args, "erase_first", False),
+            precise_faults=getattr(args, "precise_faults", False),
+            timeline=getattr(args, "timeline", None),
+        )
+    return GwemuTarget(
+        image,
+        display=getattr(args, "gui", False),
+        audio=getattr(args, "audio", False),
+        icount=getattr(args, "icount", None),
+        timeline=getattr(args, "timeline", None),
+        record=getattr(args, "record", None),
+        keep_temp=getattr(args, "keep_temp", False),
+        stdio_gdb=getattr(args, "stdio_gdb", False),
+    )

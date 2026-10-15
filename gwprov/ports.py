@@ -11,7 +11,6 @@ from __future__ import annotations
 import socket
 from collections.abc import Iterable
 
-
 # These are the conventional bases, not ports that automatic allocation uses.
 # The first automatic GDB and QMP candidates are therefore 1235 and 4445.
 DEFAULT_GDB_PORT = 1234
@@ -37,8 +36,7 @@ def port_is_available(port: int, *, host: str = "127.0.0.1") -> bool:
     return True
 
 
-def find_free_port(default: int, *, host: str = "127.0.0.1",
-                   reserved: Iterable[int] = ()) -> int:
+def find_free_port(default: int, *, host: str = "127.0.0.1", reserved: Iterable[int] = ()) -> int:
     """Find a free port beginning at ``default + 1``.
 
     ``reserved`` keeps two services selected during one launch from receiving
@@ -54,8 +52,9 @@ def find_free_port(default: int, *, host: str = "127.0.0.1",
     raise RuntimeError(f"no free TCP port found after {host}:{default}")
 
 
-def validate_requested_port(port: int, *, host: str = "127.0.0.1",
-                            reserved: Iterable[int] = ()) -> int:
+def validate_requested_port(
+    port: int, *, host: str = "127.0.0.1", reserved: Iterable[int] = ()
+) -> int:
     """Validate an explicit launch port and fail before starting GWemu."""
     _validate_port(port)
     if port in (_RESERVED_PORTS | set(reserved)):
@@ -65,20 +64,18 @@ def validate_requested_port(port: int, *, host: str = "127.0.0.1",
     return port
 
 
-def allocate_gwemu_ports(*, gdb_port: int | None = None,
-                         qmp_port: int | None = None,
-                         host: str = "127.0.0.1") -> tuple[int, int]:
+def allocate_gwemu_ports(
+    *, gdb_port: int | None = None, qmp_port: int | None = None, host: str = "127.0.0.1"
+) -> tuple[int, int]:
     """Choose distinct GDB and QMP ports for a direct GWemu launch."""
     if gdb_port is None:
         selected_gdb = find_free_port(DEFAULT_GDB_PORT, host=host)
     else:
         selected_gdb = validate_requested_port(gdb_port, host=host)
     if qmp_port is None:
-        selected_qmp = find_free_port(DEFAULT_QMP_PORT, host=host,
-                                      reserved=(selected_gdb,))
+        selected_qmp = find_free_port(DEFAULT_QMP_PORT, host=host, reserved=(selected_gdb,))
     else:
-        selected_qmp = validate_requested_port(qmp_port, host=host,
-                                               reserved=(selected_gdb,))
+        selected_qmp = validate_requested_port(qmp_port, host=host, reserved=(selected_gdb,))
     _RESERVED_PORTS.update((selected_gdb, selected_qmp))
     return selected_gdb, selected_qmp
 

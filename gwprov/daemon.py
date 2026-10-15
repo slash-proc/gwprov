@@ -1,4 +1,5 @@
 """Per-user GWProv daemon for managed GWemu and active target leases."""
+
 from __future__ import annotations
 
 import json
@@ -31,9 +32,15 @@ DAEMON_LOG = runtime_directory() / "daemon.log"
 class ManagedVM:
     """A GWemu child whose private QMP stream is carried over stdio."""
 
-    def __init__(self, process: subprocess.Popen, profile: str, headless: bool,
-                 gdb_port: int | None, log_path: Path,
-                 cleanup_path: Path | None = None):
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        profile: str,
+        headless: bool,
+        gdb_port: int | None,
+        log_path: Path,
+        cleanup_path: Path | None = None,
+    ):
         self.process = process
         self.pid = process.pid
         self.profile = profile
@@ -50,8 +57,9 @@ class ManagedVM:
             raise RuntimeError("GWemu QMP stdio was not connected to GWProv")
         self._input = process.stdin
         self._output = process.stdout
-        self._reader = threading.Thread(target=self._read_loop, daemon=True,
-                                        name=f"gwprov-qmp-{self.pid}")
+        self._reader = threading.Thread(
+            target=self._read_loop, daemon=True, name=f"gwprov-qmp-{self.pid}"
+        )
         self._reader.start()
         greeting = self._read_message(timeout=10.0)
         if not isinstance(greeting.get("QMP"), dict):
@@ -60,6 +68,7 @@ class ManagedVM:
         self._send({"execute": "qmp_capabilities", "id": self._request_id})
         self._read_reply(self._request_id, timeout=10.0)
         from .binary_identity import process_binary_identity
+
         self.binary_identity = process_binary_identity(process.pid)
 
     @property
@@ -102,6 +111,7 @@ class ManagedVM:
                 event = response.get("event")
                 if event in {"STOP", "RESUME", "RESET", "SHUTDOWN", "SUSPEND"}:
                     from .qmp import record_control_request
+
                     record_control_request(self.qmp_uri, "qmp-event", str(event))
                 continue
             if response.get("id") != request_id:
@@ -123,22 +133,47 @@ class ManagedVM:
 
     def row(self) -> dict:
         if self.process.poll() is not None:
-            return {"pid": self.pid, "profile": self.profile, "status": "exited",
-                    "running": None, "halted": None, "qmpStatus": "unavailable",
-                    "qmpSocket": self.qmp_uri, "qmpHandle": self.qmp_uri,
-                    "qmpTransport": "daemon-stdio",
-                    "display": "headless" if self.headless else "visible",
-                    "gdbPort": self.gdb_port, "created": self.created, "timing": self.timing, "binaryIdentity": self.binary_identity,
-                    "stateDetail": f"GWemu exited with status {self.process.returncode}"}
+            return {
+                "pid": self.pid,
+                "profile": self.profile,
+                "status": "exited",
+                "running": None,
+                "halted": None,
+                "qmpStatus": "unavailable",
+                "qmpSocket": self.qmp_uri,
+                "qmpHandle": self.qmp_uri,
+                "qmpTransport": "daemon-stdio",
+                "display": "headless" if self.headless else "visible",
+                "gdbPort": self.gdb_port,
+                "gdbEndpoint": f"127.0.0.1:{self.gdb_port}" if self.gdb_port else None,
+                "gdbTransport": "tcp" if self.gdb_port else "unavailable",
+                "gdbPid": self.pid if self.gdb_port else None,
+                "created": self.created,
+                "timing": self.timing,
+                "binaryIdentity": self.binary_identity,
+                "stateDetail": f"GWemu exited with status {self.process.returncode}",
+            }
         result = self.execute("query-status").get("return", {})
         running = result.get("running")
-        return {"pid": self.pid, "profile": self.profile,
-                "status": "running" if running is True else "halted" if running is False else "unknown",
-                "running": running, "halted": not running if isinstance(running, bool) else None,
-                "qmpStatus": result.get("status", "unknown"), "qmpSocket": self.qmp_uri,
-                "qmpHandle": self.qmp_uri, "qmpTransport": "daemon-stdio",
-                "display": "headless" if self.headless else "visible",
-                "gdbPort": self.gdb_port, "created": self.created, "timing": self.timing, "binaryIdentity": self.binary_identity}
+        return {
+            "pid": self.pid,
+            "profile": self.profile,
+            "status": "running" if running is True else "halted" if running is False else "unknown",
+            "running": running,
+            "halted": not running if isinstance(running, bool) else None,
+            "qmpStatus": result.get("status", "unknown"),
+            "qmpSocket": self.qmp_uri,
+            "qmpHandle": self.qmp_uri,
+            "qmpTransport": "daemon-stdio",
+            "display": "headless" if self.headless else "visible",
+            "gdbPort": self.gdb_port,
+            "gdbEndpoint": f"127.0.0.1:{self.gdb_port}" if self.gdb_port else None,
+            "gdbTransport": "tcp" if self.gdb_port else "unavailable",
+            "gdbPid": self.pid if self.gdb_port else None,
+            "created": self.created,
+            "timing": self.timing,
+            "binaryIdentity": self.binary_identity,
+        }
 
 
 class HardwarePoller:
@@ -146,20 +181,38 @@ class HardwarePoller:
 
     def __init__(self, probe: dict):
         self.probe = probe
+        self.is_remote_gdb = bool(probe.get("remoteGdb"))
         self.key = probe.get("key") or (
-            f"remote:{probe['url']}" if probe.get("url") else f"probe:{probe['id']}")
+            f"remote:{probe['url']}" if probe.get("url") else f"probe:{probe['id']}"
+        )
         self.backend = None
-        self.state: dict = {"id": self.key, "kind": "hardware",
-                            "backend": probe.get("backend", "pyocd"),
-                            "name": probe.get("name", "STM32"),
-                            "probeId": probe.get("id"), "vendor": probe.get("vendor", ""),
-                            "status": "unknown", "application": "Unknown",
-                            "installed": "Unknown", "detail": "Waiting for daemon poll"}
+        self.state: dict = {
+            "id": probe.get("deviceId", self.key),
+            "kind": "remote-gdb" if self.is_remote_gdb else "hardware",
+            "backend": "Remote GDB" if self.is_remote_gdb else probe.get("backend", "pyocd"),
+            "name": probe.get("name", "STM32"),
+            "probeId": probe.get("id"),
+            "vendor": probe.get("vendor", ""),
+            "status": "unknown",
+            "application": "Unknown",
+            "installed": "Unknown",
+            "detail": "Waiting for daemon poll",
+        }
+        if self.is_remote_gdb:
+            self.state.update(
+                remoteGdb=True,
+                gdbEndpoint=f"{probe.get('host')}:{probe.get('port')}",
+                gdbHost=probe.get("host"),
+                gdbPort=probe.get("port"),
+                gdbUrl=probe.get("url"),
+            )
         self.state_lock = threading.RLock()
-        if probe.get("url"):
-            self._update_state(backend="gnwmanager WebSocket",
-                               adapterName=probe.get("name"),
-                               remoteOrigin=probe.get("origin"))
+        if probe.get("url") and not self.is_remote_gdb:
+            self._update_state(
+                backend="gnwmanager WebSocket",
+                adapterName=probe.get("name"),
+                remoteOrigin=probe.get("origin"),
+            )
         self.last_poll = 0.0
         self.lock = threading.RLock()
         self.cached_banks: list[dict] | None = None
@@ -178,16 +231,18 @@ class HardwarePoller:
             # A foreground CLI owns the interface while its process-shared
             # lease is held. This also protects a newly started daemon before
             # that CLI has re-registered its lease heartbeat.
-            from .target_leases import (lease_owner, operation_is_busy,
-                                        operation_suppresses_poll)
+            from .target_leases import lease_owner, operation_is_busy, operation_suppresses_poll
+
             owner = lease_owner(self.key)
             active_owner = owner if owner and owner.get("lease_active") else None
             if active_owner:
                 if operation_is_busy(active_owner):
-                    self._update_state(status="busy", busyOwner=active_owner,
-                                       detail=f"{active_owner.get('operation', 'device operation')} in progress")
-                if (operation_suppresses_poll(active_owner)
-                        or not active_owner.get("daemon_owned")):
+                    self._update_state(
+                        status="busy",
+                        busyOwner=active_owner,
+                        detail=f"{active_owner.get('operation', 'device operation')} in progress",
+                    )
+                if operation_suppresses_poll(active_owner) or not active_owner.get("daemon_owned"):
                     # Keep the last known firmware classification visible while
                     # a direct CLI owns the adapter or a write/reset is in
                     # progress, but never contend with it. Daemon-proxied debug
@@ -208,81 +263,129 @@ class HardwarePoller:
                     self.state.pop("interruptedOperation", None)
             if self.backend is None:
                 try:
-                    if self.probe.get("url"):
+                    if self.is_remote_gdb:
+                        from .debug_shell import RemoteGDBBackend
+
+                        self.backend = RemoteGDBBackend(
+                            str(self.probe["host"]),
+                            int(self.probe["port"]),
+                            url=str(self.probe["url"]),
+                            operation="GWProv daemon monitor",
+                            daemon_managed=True,
+                        )
+                    elif self.probe.get("url"):
                         from .backends import WebSocketBackend
+
                         self.backend = WebSocketBackend(
-                            self.probe["url"], origin=self.probe.get("origin"),
-                            operation="GWProv daemon monitor", lease_wait=0,
-                            allow_recovery_marker=True, daemon_managed=True)
+                            self.probe["url"],
+                            origin=self.probe.get("origin"),
+                            operation="GWProv daemon monitor",
+                            lease_wait=0,
+                            allow_recovery_marker=True,
+                            daemon_managed=True,
+                        )
                     else:
                         from .backends import SelectedPyOCDBackend
                         from .target_leases import adapter_for_probe
+
                         self.backend = SelectedPyOCDBackend(
-                            self.probe["id"], operation="GWProv daemon monitor", lease_wait=0,
+                            self.probe["id"],
+                            operation="GWProv daemon monitor",
+                            lease_wait=0,
                             probe_adapter=adapter_for_probe(
-                                f"{self.probe.get('vendor', '')} {self.probe.get('name', '')}"),
-                            allow_recovery_marker=True, daemon_managed=True,
-                            resume_on_disconnect=False)
+                                f"{self.probe.get('vendor', '')} {self.probe.get('name', '')}"
+                            ),
+                            allow_recovery_marker=True,
+                            daemon_managed=True,
+                            resume_on_disconnect=False,
+                        )
                     self.backend.target_key = self.key
                     self.backend.open()
                     self.backend._lease = self.operation_lease
                 except Exception as error:
                     self.backend = None
-                    self._update_state(status="unknown", application="Unknown",
-                                       installed="Unknown", detail=f"Probe poll unavailable: {error}",
-                                       polledAt=time.time())
+                    self._update_state(
+                        status="unknown",
+                        application="Unknown",
+                        installed="Unknown",
+                        detail=f"Probe poll unavailable: {error}",
+                        polledAt=time.time(),
+                    )
                     self.last_poll = time.monotonic()
                     return
             try:
                 from .hw_lifecycle import identify_runtime
-                rescan_banks = (force or self.cached_banks is None or
-                                time.monotonic() - self.banks_scanned_at >= 90.0)
+
+                rescan_banks = (
+                    force
+                    or self.cached_banks is None
+                    or time.monotonic() - self.banks_scanned_at >= 90.0
+                )
                 runtime = identify_runtime(
-                    self.backend,
-                    cached_banks=None if rescan_banks else self.cached_banks)
-                if (runtime.get("locked") is True and not runtime.get("stubDetected")
-                        and active_owner is None):
+                    self.backend, cached_banks=None if rescan_banks else self.cached_banks
+                )
+                if (
+                    runtime.get("locked") is True
+                    and not runtime.get("stubDetected")
+                    and active_owner is None
+                    and not self.is_remote_gdb
+                ):
                     # Starting the RAM flasher resets the target and writes its
                     # image to SRAM. Hold a process-visible substantial-operation
                     # lease around that transition so daemon reload cannot kill
                     # the poller halfway through it.
                     from .target_leases import TargetLease
+
                     startup_lease = TargetLease(
-                        self.key, "gwprov stub start", wait=0,
-                        register_with_daemon=False, owner_pid=os.getpid()).acquire()
-                    self._update_state(status="busy",
-                                       busyOwner={"key": self.key,
-                                                  "operation": "gwprov stub start",
-                                                  "pid": os.getpid()},
-                                       detail="Starting and verifying the RAM flasher")
+                        self.key,
+                        "gwprov stub start",
+                        wait=0,
+                        register_with_daemon=False,
+                        owner_pid=os.getpid(),
+                    ).acquire()
+                    self._update_state(
+                        status="busy",
+                        busyOwner={
+                            "key": self.key,
+                            "operation": "gwprov stub start",
+                            "pid": os.getpid(),
+                        },
+                        detail="Starting and verifying the RAM flasher",
+                    )
                     previous_lease = getattr(self.backend, "_lease", None)
                     self.backend._lease = startup_lease
                     try:
                         runtime = identify_runtime(
-                            self.backend, start_locked_stub=True,
-                            cached_banks=None if rescan_banks else self.cached_banks)
+                            self.backend,
+                            start_locked_stub=True,
+                            cached_banks=None if rescan_banks else self.cached_banks,
+                        )
                     finally:
                         self.backend._lease = previous_lease
                         startup_lease.release()
                 if rescan_banks and runtime.get("banks"):
                     self.cached_banks = runtime["banks"]
                     self.banks_scanned_at = time.monotonic()
-                vtor = runtime.get("vtor")
                 halted = runtime.get("halted")
                 service_state = runtime.get("serviceState")
-                detected_status = ("unknown" if halted is None else
-                                   "halted" if halted else "running")
+                detected_status = "unknown" if halted is None else "halted" if halted else "running"
                 if service_state == "busy":
                     detected_status = "busy"
                 elif service_state == "stalled":
                     detected_status = "unknown"
-                values = dict(status=("busy" if (active_owner and
-                                      operation_is_busy(active_owner)) or
-                                      service_state == "busy" else detected_status),
-                                   application=runtime.get("application", "Unknown"),
-                                   installed=runtime.get("installed", "Unknown"),
-                                   detail=runtime.get("detail"),
-                                   runtime=runtime, polledAt=time.time())
+                values = dict(
+                    status=(
+                        "busy"
+                        if (active_owner and operation_is_busy(active_owner))
+                        or service_state == "busy"
+                        else detected_status
+                    ),
+                    application=runtime.get("application", "Unknown"),
+                    installed=runtime.get("installed", "Unknown"),
+                    detail=runtime.get("detail"),
+                    runtime=runtime,
+                    polledAt=time.time(),
+                )
                 values.pop("externalOwner", None)
                 values.pop("externalSession", None)
                 values.pop("lastObserved", None)
@@ -291,9 +394,13 @@ class HardwarePoller:
                     values["busyOwner"] = active_owner
                 self._update_state(**values)
             except Exception as error:
-                self._update_state(status="unknown", application="Unknown",
-                                   installed="Unknown", detail=f"Device poll failed: {error}",
-                                   polledAt=time.time())
+                self._update_state(
+                    status="unknown",
+                    application="Unknown",
+                    installed="Unknown",
+                    detail=f"Device poll failed: {error}",
+                    polledAt=time.time(),
+                )
                 try:
                     # The target operation lease belongs to Service, even if this
                     # transport connection must be rebuilt after a read failure.
@@ -302,6 +409,16 @@ class HardwarePoller:
                 except Exception:
                     pass
                 self.backend = None
+            if self.is_remote_gdb and self.backend is not None:
+                # Raw GDB servers commonly allow one client at a time. Keep
+                # the heartbeat connection only for the duration of this
+                # sample so other debuggers can use the endpoint between polls.
+                try:
+                    self.backend.close()
+                except Exception:
+                    pass
+                finally:
+                    self.backend = None
             self.last_poll = time.monotonic()
 
     def invalidate_installed(self) -> None:
@@ -321,12 +438,14 @@ class HardwarePoller:
             return False
         with self.lock:
             from .target_leases import adapter_for_probe, external_local_owner, lease_owner
+
             owner = lease_owner(self.key)
             if owner and owner.get("lease_active"):
                 # A foreground GWProv operation owns the target for its duration.
                 return False
             adapter = adapter_for_probe(
-                f"{self.probe.get('vendor', '')} {self.probe.get('name', '')}")
+                f"{self.probe.get('vendor', '')} {self.probe.get('name', '')}"
+            )
             external = external_local_owner(adapter)
             if external is None:
                 if self.external_owner is None:
@@ -334,19 +453,22 @@ class HardwarePoller:
                 # The external owner disappeared. Preserve the last observed
                 # runtime until the normal poll immediately refreshes it.
                 self.external_owner = None
-                self._update_state(externalSession=None,
-                                   detail="External adapter session ended; refreshing device state",
-                                   polledAt=time.time())
+                self._update_state(
+                    externalSession=None,
+                    detail="External adapter session ended; refreshing device state",
+                    polledAt=time.time(),
+                )
                 self.last_poll = 0.0
                 return False
             now = time.time()
-            if (self.external_owner is None
-                    or self.external_owner.get("pid") != external.get("pid")):
+            if self.external_owner is None or self.external_owner.get("pid") != external.get("pid"):
                 external = {**external, "started": now, "lastSeen": now}
             else:
-                external = {**external,
-                            "started": self.external_owner.get("started", now),
-                            "lastSeen": now}
+                external = {
+                    **external,
+                    "started": self.external_owner.get("started", now),
+                    "lastSeen": now,
+                }
             self.external_owner = external
             with self.state_lock:
                 last_observed = {
@@ -355,27 +477,36 @@ class HardwarePoller:
                     if self.state.get(key) is not None
                 }
             last_application = last_observed.get("application")
-            cached_note = (f"; last observed {last_application}"
-                           if last_application else "")
+            cached_note = f"; last observed {last_application}" if last_application else ""
             if self.backend is None:
                 self._update_state(
-                    status="unknown", lastObserved=last_observed,
-                    externalOwner=external, externalSession=external,
-                    detail=(f"Adapter owned by {external.get('operation', 'external debug session')} "
-                            f"(pid {external.get('pid', 'unknown')}); target reads suspended"
-                            f"{cached_note}"),
-                    polledAt=now)
+                    status="unknown",
+                    lastObserved=last_observed,
+                    externalOwner=external,
+                    externalSession=external,
+                    detail=(
+                        f"Adapter owned by {external.get('operation', 'external debug session')} "
+                        f"(pid {external.get('pid', 'unknown')}); target reads suspended"
+                        f"{cached_note}"
+                    ),
+                    polledAt=now,
+                )
                 self.last_poll = time.monotonic()
                 return True
             self.backend.close()
             self.backend = None
             self._update_state(
-                status="unknown", lastObserved=last_observed,
-                externalOwner=external, externalSession=external,
-                detail=(f"Adapter owned by {external.get('operation', 'external debug session')} "
-                        f"(pid {external.get('pid', 'unknown')}); target reads suspended"
-                        f"{cached_note}"),
-                polledAt=now)
+                status="unknown",
+                lastObserved=last_observed,
+                externalOwner=external,
+                externalSession=external,
+                detail=(
+                    f"Adapter owned by {external.get('operation', 'external debug session')} "
+                    f"(pid {external.get('pid', 'unknown')}); target reads suspended"
+                    f"{cached_note}"
+                ),
+                polledAt=now,
+            )
             self.last_poll = time.monotonic()
             return True
 
@@ -411,10 +542,13 @@ class HardwarePoller:
                 self.poll()
             if self.backend is None:
                 raise RuntimeError(self.state.get("detail", "target connection unavailable"))
-            from .target_leases import operation_is_busy
             if method == "read_memory":
                 address, size = arguments
-                if not isinstance(address, int) or not isinstance(size, int) or not 0 <= size <= 4 * 1024 * 1024:
+                if (
+                    not isinstance(address, int)
+                    or not isinstance(size, int)
+                    or not 0 <= size <= 4 * 1024 * 1024
+                ):
                     raise ValueError("target memory reads are limited to 4 MiB per request")
                 return base64.b64encode(self.backend.read_memory(address, size)).decode("ascii")
             if method == "write_memory":
@@ -440,10 +574,12 @@ class HardwarePoller:
                 return None
             if method == "get_state":
                 from pyocd.core.target import Target
+
                 state = self.backend.target.get_state()
                 return getattr(state, "name", str(state))
             if method in {"set_breakpoint", "remove_breakpoint"}:
                 from pyocd.core.target import Target
+
                 address = int(arguments[0])
                 if method == "remove_breakpoint":
                     self.backend.target.remove_breakpoint(address)
@@ -452,6 +588,7 @@ class HardwarePoller:
                 return bool(self.backend.target.set_breakpoint(address, kind))
             if method in {"set_watchpoint", "remove_watchpoint"}:
                 from pyocd.core.target import Target
+
                 address, size = int(arguments[0]), int(arguments[1])
                 kind = Target.WatchpointType[arguments[2]]
                 if method == "remove_watchpoint":
@@ -500,26 +637,33 @@ class Service:
             return {"daemonPid": os.getpid(), "protocol": 1}
         if operation == "ping":
             client_identity = message.get("clientIdentity")
-            reload_required = (client_identity != self.identity
-                               if isinstance(client_identity, dict) else False)
+            reload_required = (
+                client_identity != self.identity if isinstance(client_identity, dict) else False
+            )
             if reload_required:
                 self.draining = True
             self.last_busy = time.monotonic()
             active_leases, blocking_leases = self._lease_counts()
-            active_vms = sum(vm.process.poll() is None
-                             for vm in self.vms.copy().values())
-            return {"daemonPid": os.getpid(), "daemonIdentity": self.identity,
-                    "reloadRequired": reload_required,
-                    "activeVMs": active_vms, "activeLeases": active_leases,
-                    "blockingLeases": blocking_leases,
-                    "capabilities": ["gwemu-bin", "process-binary-inode",
-                                     "timing-experimental-m7"]}
+            active_vms = sum(vm.process.poll() is None for vm in self.vms.copy().values())
+            return {
+                "daemonPid": os.getpid(),
+                "daemonIdentity": self.identity,
+                "reloadRequired": reload_required,
+                "activeVMs": active_vms,
+                "activeLeases": active_leases,
+                "blockingLeases": blocking_leases,
+                "capabilities": [
+                    "gwemu-bin", "process-binary-inode", "timing-experimental-m7",
+                    "timing-pacing",
+                ],
+            }
         if operation in {"daemon-drain", "daemon-force-drain"}:
             self.draining = True
             self.last_busy = time.monotonic()
             cancelled = []
             if operation == "daemon-force-drain":
                 from .target_leases import active_lease_owners, operation_blocks_drain
+
                 for owner in active_lease_owners():
                     if not operation_blocks_drain(owner):
                         continue
@@ -531,9 +675,11 @@ class Service:
                     else:
                         self._cancel_process(pid)
                         cancelled.append(pid)
-            return {"draining": True,
-                    "cancelledPids": sorted(set(cancelled)),
-                    "blockingLeases": self._blocking_lease_count()}
+            return {
+                "draining": True,
+                "cancelledPids": sorted(set(cancelled)),
+                "blockingLeases": self._blocking_lease_count(),
+            }
         if operation == "device-snapshot":
             return self.snapshot_devices(refresh=bool(message.get("refresh", False)))
         with self.lock:
@@ -550,22 +696,40 @@ class Service:
                     try:
                         rows.append(vm.row())
                     except (OSError, RuntimeError, ValueError) as error:
-                        rows.append({"pid": pid, "profile": vm.profile, "status": "unknown",
-                                     "running": None, "halted": None, "qmpStatus": "unavailable",
-                                     "qmpSocket": vm.qmp_uri, "qmpHandle": vm.qmp_uri,
-                                     "qmpTransport": "daemon-stdio",
-                                     "display": "headless" if vm.headless else "visible",
-                                     "gdbPort": vm.gdb_port, "created": vm.created,
-                                     "stateDetail": str(error)})
+                        rows.append(
+                            {
+                                "pid": pid,
+                                "profile": vm.profile,
+                                "status": "unknown",
+                                "running": None,
+                                "halted": None,
+                                "qmpStatus": "unavailable",
+                                "qmpSocket": vm.qmp_uri,
+                                "qmpHandle": vm.qmp_uri,
+                                "qmpTransport": "daemon-stdio",
+                                "display": "headless" if vm.headless else "visible",
+                                "gdbPort": vm.gdb_port,
+                                "created": vm.created,
+                                "stateDetail": str(error),
+                            }
+                        )
                 return {"instances": rows}
             if operation == "qmp":
                 vm = self._vm(message.get("vm"))
                 command = message.get("command")
                 if not isinstance(command, str) or not command:
                     raise ValueError("QMP command must be a non-empty string")
-                if command not in {"query-status", "screendump", "stop", "cont", "quit",
-                                   "system_reset", "input-send-event", "send-key",
-                                   "human-monitor-command"}:
+                if command not in {
+                    "query-status",
+                    "screendump",
+                    "stop",
+                    "cont",
+                    "quit",
+                    "system_reset",
+                    "input-send-event",
+                    "send-key",
+                    "human-monitor-command",
+                }:
                     raise ValueError(f"QMP command is not exposed by GWProv: {command}")
                 arguments = message.get("arguments")
                 if arguments is not None and not isinstance(arguments, dict):
@@ -573,10 +737,12 @@ class Service:
                 if command == "human-monitor-command":
                     command_line = arguments.get("command-line", "") if arguments else ""
                     import re
-                    memory_read = re.fullmatch(
-                        r"xp /([1-9][0-9]*)wx 0x[0-9a-fA-F]+", command_line)
+
+                    memory_read = re.fullmatch(r"xp /([1-9][0-9]*)wx 0x[0-9a-fA-F]+", command_line)
                     if command_line != "info registers" and not memory_read:
-                        raise ValueError("GWProv permits only register reads and bounded word memory reads through HMP")
+                        raise ValueError(
+                            "GWProv permits only register reads and bounded word memory reads through HMP"
+                        )
                     if memory_read and int(memory_read.group(1)) > 16384:
                         raise ValueError("GWProv HMP memory reads are limited to 64 KiB")
                 return vm.execute(command, arguments)
@@ -603,10 +769,12 @@ class Service:
                     raise ValueError("device watch probes must be a list")
                 added = []
                 for probe in probes:
-                    if isinstance(probe, dict) and (isinstance(probe.get("id"), str)
-                                                    or isinstance(probe.get("url"), str)):
-                        key = probe.get("key") or (f"remote:{probe['url']}" if probe.get("url")
-                                                    else f"probe:{probe['id']}")
+                    if isinstance(probe, dict) and (
+                        isinstance(probe.get("id"), str) or isinstance(probe.get("url"), str)
+                    ):
+                        key = probe.get("key") or (
+                            f"remote:{probe['url']}" if probe.get("url") else f"probe:{probe['id']}"
+                        )
                         if key not in self.hardware:
                             self.hardware[key] = HardwarePoller(probe)
                             added.append(self.hardware[key])
@@ -619,24 +787,30 @@ class Service:
                 if self.draining:
                     raise RuntimeError("GWProv daemon is draining to reload updated code")
                 probe = message.get("probe")
-                if (not isinstance(probe, dict)
-                        or not (isinstance(probe.get("id"), str)
-                                or isinstance(probe.get("url"), str))):
+                if not isinstance(probe, dict) or not (
+                    isinstance(probe.get("id"), str) or isinstance(probe.get("url"), str)
+                ):
                     raise ValueError("daemon target-open requires a probe ID or remote URL")
                 key = probe.get("key") or (
-                    f"remote:{probe['url']}" if probe.get("url") else f"probe:{probe['id']}")
+                    f"remote:{probe['url']}" if probe.get("url") else f"probe:{probe['id']}"
+                )
                 from .target_leases import DeviceBusyError
+
                 if any(owner.get("key") == key for owner in self.leases.values()):
-                    owner = next(owner for owner in self.leases.values()
-                                 if owner.get("key") == key)
+                    owner = next(owner for owner in self.leases.values() if owner.get("key") == key)
                     raise DeviceBusyError(key, owner)
                 if probe.get("id"):
                     from .target_leases import adapter_for_probe, external_local_owner
+
                     adapter = probe.get("adapter") or adapter_for_probe(
-                        f"{probe.get('vendor', '')} {probe.get('name', '')}")
+                        f"{probe.get('vendor', '')} {probe.get('name', '')}"
+                    )
                     external = external_local_owner(adapter)
-                    if external and (external.get("adapter") is None or adapter is None
-                                     or external.get("adapter") == adapter):
+                    if external and (
+                        external.get("adapter") is None
+                        or adapter is None
+                        or external.get("adapter") == adapter
+                    ):
                         raise DeviceBusyError(key, external)
                 # Classify the target and, when locked stock requires it, start
                 # the verified RAM stub before this session's lease suppresses
@@ -647,11 +821,16 @@ class Service:
                 if poller.backend is None:
                     raise RuntimeError(poller.state.get("detail", "target connection failed"))
                 from .target_leases import TargetLease
-                lease = TargetLease(key, str(message.get("operation", "hardware session")),
-                                    wait=0, allow_recovery_marker=True,
-                                    register_with_daemon=False,
-                                    owner_pid=int(message.get("pid", 0)) or None,
-                                    daemon_owned=True).acquire()
+
+                lease = TargetLease(
+                    key,
+                    str(message.get("operation", "hardware session")),
+                    wait=0,
+                    allow_recovery_marker=True,
+                    register_with_daemon=False,
+                    owner_pid=int(message.get("pid", 0)) or None,
+                    daemon_owned=True,
+                ).acquire()
                 poller.operation_lease = lease
                 if poller.backend is not None:
                     poller.backend._lease = lease
@@ -665,9 +844,14 @@ class Service:
                     lease.release()
                     raise
                 token = secrets.token_hex(16)
-                owner = {"key": key, "operation": str(message.get("operation", "hardware session")),
-                         "pid": int(message.get("pid", 0)), "started": time.time(),
-                         "daemon_owned": True, "lastHeartbeat": time.monotonic()}
+                owner = {
+                    "key": key,
+                    "operation": str(message.get("operation", "hardware session")),
+                    "pid": int(message.get("pid", 0)),
+                    "started": time.time(),
+                    "daemon_owned": True,
+                    "lastHeartbeat": time.monotonic(),
+                }
                 poller.backend._lease = lease
                 self.target_leases[token] = lease
                 self.leases[token] = owner
@@ -707,11 +891,20 @@ class Service:
                 pause_token = message.get("pauseToken")
                 pid = message.get("pid")
                 wait_seconds = message.get("waitSeconds", 30)
-                if (isinstance(key, str) and isinstance(pause_token, str)
-                        and isinstance(pid, int) and pid > 1):
-                    shared_session = next((owner for owner in self.leases.values()
-                                           if owner.get("key") == key
-                                           and owner.get("daemon_owned")), None)
+                if (
+                    isinstance(key, str)
+                    and isinstance(pause_token, str)
+                    and isinstance(pid, int)
+                    and pid > 1
+                ):
+                    shared_session = next(
+                        (
+                            owner
+                            for owner in self.leases.values()
+                            if owner.get("key") == key and owner.get("daemon_owned")
+                        ),
+                        None,
+                    )
                     if shared_session:
                         # A debugger session is actively using the daemon-owned
                         # connection. Do not close its backend during a competing
@@ -722,8 +915,10 @@ class Service:
                         wait_seconds = 30.0
                     timeout = max(1.0, min(3600.0, float(wait_seconds) + 10.0))
                     self.hardware_pause_tokens.setdefault(key, {})[pause_token] = {
-                        "pid": pid, "since": time.monotonic(),
-                        "expires": time.monotonic() + timeout}
+                        "pid": pid,
+                        "since": time.monotonic(),
+                        "expires": time.monotonic() + timeout,
+                    }
                     self.hardware_paused.add(key)
                     poller = self.hardware.get(key)
                     if poller:
@@ -754,28 +949,40 @@ class Service:
     def _blocking_lease_count(self) -> int:
         """Count live substantial operations from process-held OS leases."""
         from .target_leases import active_lease_owners, operation_blocks_drain
+
         count = 0
         for owner in active_lease_owners():
             pid = owner.get("pid")
-            if (operation_blocks_drain(owner) and isinstance(pid, int)
-                    and _pid_exists(pid)):
+            if operation_blocks_drain(owner) and isinstance(pid, int) and _pid_exists(pid):
                 count += 1
         return count
 
     def _lease_counts(self) -> tuple[int, int]:
         from .target_leases import active_lease_owners, operation_blocks_drain
+
         owners = active_lease_owners()
-        live = [owner for owner in owners
-                if isinstance(owner.get("pid"), int) and _pid_exists(owner["pid"])]
+        live = [
+            owner
+            for owner in owners
+            if isinstance(owner.get("pid"), int) and _pid_exists(owner["pid"])
+        ]
         return len(live), sum(operation_blocks_drain(owner) for owner in live)
 
     def _device_rows(self) -> list[dict]:
         rows = [poller.snapshot() for poller in self.hardware.copy().values()]
         if self.discovery_detail:
-            rows.append({"id": "hardware:*", "kind": "hardware",
-                         "backend": "GWProv daemon", "name": "Hardware discovery",
-                         "status": "unknown", "application": "Unknown",
-                         "installed": "Unknown", "detail": self.discovery_detail})
+            rows.append(
+                {
+                    "id": "hardware:*",
+                    "kind": "hardware",
+                    "backend": "GWProv daemon",
+                    "name": "Hardware discovery",
+                    "status": "unknown",
+                    "application": "Unknown",
+                    "installed": "Unknown",
+                    "detail": self.discovery_detail,
+                }
+            )
         return rows
 
     def snapshot_devices(self, *, refresh: bool = False) -> dict:
@@ -794,21 +1001,34 @@ class Service:
                     poller.poll(force=True)
         states = {poller.key: poller.snapshot() for poller in pollers}
         from .target_leases import active_lease_owners, operation_is_busy
+
         for owner in active_lease_owners():
             key = owner.get("key")
             if key in states and operation_is_busy(owner):
-                states[key].update(status="busy", busyOwner=owner,
-                                   detail=f"{owner.get('operation', 'device operation')} in progress")
+                states[key].update(
+                    status="busy",
+                    busyOwner=owner,
+                    detail=f"{owner.get('operation', 'device operation')} in progress",
+                )
         rows = list(states.values())
         if self.discovery_detail:
-            rows.append({"id": "hardware:*", "kind": "hardware",
-                         "backend": "GWProv daemon", "name": "Hardware discovery",
-                         "status": "unknown", "application": "Unknown",
-                         "installed": "Unknown", "detail": self.discovery_detail})
+            rows.append(
+                {
+                    "id": "hardware:*",
+                    "kind": "hardware",
+                    "backend": "GWProv daemon",
+                    "name": "Hardware discovery",
+                    "status": "unknown",
+                    "application": "Unknown",
+                    "installed": "Unknown",
+                    "detail": self.discovery_detail,
+                }
+            )
         return {"devices": rows}
 
     def start_vm(self, message: dict) -> dict:
         from .launch import image_launch_spec, profile_launch_spec
+
         profile_value = message.get("profile")
         cleanup_path = None
         headless = bool(message.get("headless", False))
@@ -816,37 +1036,65 @@ class Service:
         gdb_port = message.get("gdb_port")
         if gdb_port is not None:
             from .ports import validate_requested_port
+
             gdb_port = validate_requested_port(gdb_port)
         if profile_value:
             from .profiles import DeviceProfile
+
             profile = str(DeviceProfile.load(profile_value).root)
             if any(vm.profile == profile and vm.process.poll() is None for vm in self.vms.values()):
                 from .profiles import profile_reference
-                raise ValueError(f"profile {profile_reference(profile)} already has a managed GWemu instance")
+
+                raise ValueError(
+                    f"profile {profile_reference(profile)} already has a managed GWemu instance"
+                )
             cmd, cwd, env, log_path = profile_launch_spec(
-                profile, headless=headless, audio=audio, timeline=message.get("timeline"),
-                record_timeline=message.get("record_timeline"), gdb_port=gdb_port,
-                qmp_stdio=True, start_halted=bool(message.get("start_halted", False)),
+                profile,
+                headless=headless,
+                audio=audio,
+                timeline=message.get("timeline"),
+                record_timeline=message.get("record_timeline"),
+                gdb_port=gdb_port,
+                qmp_stdio=True,
+                start_halted=bool(message.get("start_halted", False)),
                 shared_sd_root=message.get("shared_sd_root"),
                 timing_mode=message.get("timing_mode", "default"),
-                icount=message.get("icount"), rtc_epoch=message.get("rtc_epoch"),
-                gwemu_bin=message.get("gwemu_bin"))
+                icount=message.get("icount"),
+                pacing=message.get("pacing"),
+                rtc_epoch=message.get("rtc_epoch"),
+                gwemu_bin=message.get("gwemu_bin"),
+            )
         else:
             profile = "raw image"
             cmd, cwd, env, log_path, cleanup_path = image_launch_spec(
-                message.get("image", {}), headless=headless, audio=audio,
+                message.get("image", {}),
+                headless=headless,
+                audio=audio,
                 timeline=message.get("timeline"),
-                record_timeline=message.get("record_timeline"), gdb_port=gdb_port,
-                icount=message.get("icount"), keep_temp=bool(message.get("keep_temp", False)),
-                timing_mode=message.get("timing_mode", "default"), rtc_epoch=message.get("rtc_epoch"),
-                gwemu_bin=message.get("gwemu_bin"))
+                record_timeline=message.get("record_timeline"),
+                gdb_port=gdb_port,
+                icount=message.get("icount"),
+                keep_temp=bool(message.get("keep_temp", False)),
+                timing_mode=message.get("timing_mode", "default"),
+                pacing=message.get("pacing"),
+                rtc_epoch=message.get("rtc_epoch"),
+                gwemu_bin=message.get("gwemu_bin"),
+            )
         from .binary_identity import file_identity
+
         expected_binary = file_identity(cmd[0]) if message.get("gwemu_bin") else None
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with log_path.open("w") as log:
-                process = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE,
-                                           stdout=subprocess.PIPE, stderr=log, bufsize=0)
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=log,
+                    bufsize=0,
+                )
             vm = ManagedVM(process, profile, headless, gdb_port, log_path, cleanup_path)
             if expected_binary and vm.binary_identity["sha256"] != expected_binary["sha256"]:
                 raise RuntimeError("GWemu executable changed between launch validation and startup")
@@ -856,11 +1104,25 @@ class Service:
                         vm.binary_identity["version"] = line.partition(":")[2].strip()
                         break
             mode = message.get("timing_mode", "default")
-            vm.timing = {"mode": mode, "icountShift": 0 if mode in ("baseline", "experimental-m7") else message.get("icount"),
-                         "rtcEpoch": message.get("rtc_epoch"),
-                         "cycleSemantics": "one-instruction-one-cycle" if mode == "baseline" else
-                                           "experimental-m7-issue-dependency-model" if mode == "experimental-m7" else "virtual-elapsed-time",
-                         "hardwareCycleAccurate": False}
+            pacing = message.get("pacing") or ("realtime" if mode == "baseline" else "unthrottled")
+            vm.timing = {
+                "mode": mode,
+                "pacing": pacing,
+                "icountShift": (
+                    0 if mode in ("baseline", "experimental-m7") else message.get("icount")
+                ),
+                "rtcEpoch": message.get("rtc_epoch"),
+                "cycleSemantics": (
+                    "one-instruction-one-cycle"
+                    if mode == "baseline"
+                    else (
+                        "experimental-m7-issue-dependency-model"
+                        if mode == "experimental-m7"
+                        else "virtual-elapsed-time"
+                    )
+                ),
+                "hardwareCycleAccurate": False,
+            }
         except Exception:
             process = locals().get("process")
             if process is not None:
@@ -907,9 +1169,12 @@ class Service:
         for token, owner in list(self.leases.items()):
             pid = owner.get("pid")
             heartbeat_at = owner.get("lastHeartbeat", 0.0)
-            if (isinstance(heartbeat_at, (int, float)) and
-                    time.monotonic() - heartbeat_at > LEASE_HEARTBEAT_TIMEOUT and
-                    isinstance(pid, int) and _pid_exists(pid)):
+            if (
+                isinstance(heartbeat_at, (int, float))
+                and time.monotonic() - heartbeat_at > LEASE_HEARTBEAT_TIMEOUT
+                and isinstance(pid, int)
+                and _pid_exists(pid)
+            ):
                 self._cancel_process(pid)
             if not isinstance(pid, int) or not _pid_exists(pid):
                 self.leases.pop(token, None)
@@ -931,6 +1196,7 @@ class Service:
         # forever. Keep the monitor paused while any process still owns the OS
         # lease, including a second client waiting for the same target.
         from .target_leases import lease_owner
+
         for key, tokens in list(self.hardware_pause_tokens.items()):
             current_owner = lease_owner(key)
             if current_owner and current_owner.get("lease_active"):
@@ -977,8 +1243,9 @@ class Service:
                 signal.signal(signum, lambda *_: self.shutdown_requested.set())
         server_thread = threading.Thread(target=self.server.serve, daemon=True)
         server_thread.start()
-        poll_thread = threading.Thread(target=self._poll_hardware, daemon=True,
-                                       name="gwprov-device-heartbeat")
+        poll_thread = threading.Thread(
+            target=self._poll_hardware, daemon=True, name="gwprov-device-heartbeat"
+        )
         poll_thread.start()
         try:
             while server_thread.is_alive():
@@ -1006,22 +1273,28 @@ class Service:
                     if self.draining and not self.vms and not blocking_leases:
                         self.server.stop()
                         break
-                    if not self.vms and not blocking_leases and \
-                            time.monotonic() - self.last_busy >= IDLE_EXIT_SECONDS:
+                    if (
+                        not self.vms
+                        and not blocking_leases
+                        and time.monotonic() - self.last_busy >= IDLE_EXIT_SECONDS
+                    ):
                         self.server.stop()
                         break
         finally:
             self.server.stop()
             server_thread.join(timeout=2)
             poll_thread.join(timeout=1)
+
             def close_monitors():
                 for poller in self.hardware.values():
                     try:
                         poller.handoff(wait=False)
                     except Exception:
                         pass
-            close_thread = threading.Thread(target=close_monitors, daemon=True,
-                                            name="gwprov-monitor-shutdown")
+
+            close_thread = threading.Thread(
+                target=close_monitors, daemon=True, name="gwprov-monitor-shutdown"
+            )
             close_thread.start()
             close_thread.join(timeout=1)
             for lease in self.target_leases.values():
@@ -1055,8 +1328,11 @@ class Service:
                 if poller.key in paused or now - poller.last_poll < 5.0:
                     continue
                 from .target_leases import operation_suppresses_poll
-                if any(owner.get("key") == poller.key and
-                       operation_suppresses_poll(owner) for owner in leases):
+
+                if any(
+                    owner.get("key") == poller.key and operation_suppresses_poll(owner)
+                    for owner in leases
+                ):
                     continue
                 poller.poll()
 
@@ -1072,19 +1348,40 @@ class Service:
             errors = []
             local_discovery_ok = True
             remote_discovery_ok = True
+            gdb_discovery_ok = True
             try:
                 from .backends import enumerate_local_probes
+
                 probes.extend(enumerate_local_probes())
             except (RuntimeError, OSError) as error:
                 local_discovery_ok = False
                 errors.append(f"Local probe discovery failed: {error}")
             try:
                 from .adapters import list_remote
-                probes.extend([{**remote, "key": f"remote:{remote['url']}"}
-                               for remote in list_remote()])
+
+                probes.extend(
+                    [{**remote, "key": f"remote:{remote['url']}"} for remote in list_remote()]
+                )
             except (RuntimeError, OSError, ValueError) as error:
                 remote_discovery_ok = False
                 errors.append(f"Remote adapter discovery failed: {error}")
+            try:
+                from .adapters import list_gdb
+
+                probes.extend(
+                    [
+                        {
+                            **remote,
+                            "remoteGdb": True,
+                            "deviceId": f"gdb:{remote['host']}:{remote['port']}",
+                            "key": f"remote-gdb:{remote['url']}",
+                        }
+                        for remote in list_gdb()
+                    ]
+                )
+            except (RuntimeError, OSError, ValueError) as error:
+                gdb_discovery_ok = False
+                errors.append(f"Remote GDB discovery failed: {error}")
             added = []
             present: set[str] = set()
             with self.lock:
@@ -1110,19 +1407,31 @@ class Service:
                 for key, poller in list(self.hardware.items()):
                     if key in present:
                         continue
-                    is_remote = bool(poller.probe.get("url"))
-                    if (not remote_discovery_ok if is_remote else not local_discovery_ok):
+                    is_gdb = bool(poller.probe.get("remoteGdb"))
+                    is_remote = bool(poller.probe.get("url")) and not is_gdb
+                    if (
+                        (is_gdb and not gdb_discovery_ok)
+                        or (is_remote and not remote_discovery_ok)
+                        or (not is_remote and not is_gdb and not local_discovery_ok)
+                    ):
                         continue
                     from .target_leases import lease_owner
+
                     owner = lease_owner(key)
                     if owner and owner.get("lease_active"):
                         from .target_leases import operation_is_busy
+
                         if operation_is_busy(owner):
-                            poller._update_state(status="busy", busyOwner=owner,
-                                                 detail="Adapter is not currently detected; its active operation still owns the target")
+                            poller._update_state(
+                                status="busy",
+                                busyOwner=owner,
+                                detail="Adapter is not currently detected; its active operation still owns the target",
+                            )
                         else:
-                            poller._update_state(status="unknown",
-                                                 detail="Adapter is not currently detected; its active session still owns the target")
+                            poller._update_state(
+                                status="unknown",
+                                detail="Adapter is not currently detected; its active session still owns the target",
+                            )
                         continue
                     if poller.handoff(wait=False):
                         self.hardware.pop(key, None)
@@ -1156,6 +1465,7 @@ class Service:
 def _pid_exists(pid: int) -> bool:
     if os.name == "nt":
         import ctypes
+
         handle = ctypes.WinDLL("kernel32", use_last_error=True).OpenProcess(0x1000, False, pid)
         if not handle:
             return False
@@ -1193,8 +1503,11 @@ def _daemon_identity() -> dict[str, str]:
         package_version = importlib.metadata.version("gwprov")
     except importlib.metadata.PackageNotFoundError:
         package_version = "0.0.0"
-    return {"version": package_version, "source": str(package_root),
-            "sourceSha256": digest.hexdigest()}
+    return {
+        "version": package_version,
+        "source": str(package_root),
+        "sourceSha256": digest.hexdigest(),
+    }
 
 
 def _check_daemon_identity(response: dict) -> None:
@@ -1204,12 +1517,14 @@ def _check_daemon_identity(response: dict) -> None:
             f"(pid {response.get('daemonPid', 'unknown')}); it predates daemon source "
             "identity reporting. Let active VM or hardware operations finish so it can "
             "exit, then retry. If it remains after those operations have ended, restart "
-            "the GWProv daemon process.")
+            "the GWProv daemon process."
+        )
     identity = response.get("daemonIdentity")
     if not isinstance(identity, dict):
         raise RuntimeError(
             "GWProv daemon returned invalid code identity metadata "
-            f"(pid {response.get('daemonPid', 'unknown')}); restart it and retry.")
+            f"(pid {response.get('daemonPid', 'unknown')}); restart it and retry."
+        )
     current = _daemon_identity()
     if not response.get("reloadRequired") and identity == current:
         return
@@ -1221,7 +1536,8 @@ def _check_daemon_identity(response: dict) -> None:
         "restart when its active GWemu or substantial hardware operations finish. "
         f"It reports {response.get('activeVMs', 0)} active VM(s) and "
         f"{response.get('blockingLeases', response.get('activeLeases', 0))} "
-        "blocking hardware operation(s).")
+        "blocking hardware operation(s)."
+    )
 
 
 def _is_gwprov_daemon(pid: int) -> bool:
@@ -1230,22 +1546,33 @@ def _is_gwprov_daemon(pid: int) -> bool:
         return False
     if os.path.isdir(f"/proc/{pid}"):
         try:
-            arguments = [part.decode(errors="replace") for part in
-                         Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
+            arguments = [
+                part.decode(errors="replace")
+                for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                if part
+            ]
         except OSError:
             return False
         # Match actual argv tokens. Substring matching can mistake a shell or
         # Python helper whose source text mentions `gwprov.daemon --serve` for
         # the daemon and would make a stale-process cleanup unsafe.
-        return (len(arguments) >= 4 and arguments[1:3] == ["-m", "gwprov.daemon"]
-                and "--serve" in arguments[3:])
+        return (
+            len(arguments) >= 4
+            and arguments[1:3] == ["-m", "gwprov.daemon"]
+            and "--serve" in arguments[3:]
+        )
     if os.name == "nt":
         # The named pipe is per-user and the PID came from its authenticated
         # daemon response. Signal handling is performed by the CLI service API.
         return True
     try:
-        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                                check=False, capture_output=True, text=True, timeout=1.0)
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
         command = result.stdout
         return "gwprov.daemon" in command and "--serve" in command
     except (OSError, subprocess.TimeoutExpired):
@@ -1292,28 +1619,32 @@ def _stop_unresponsive_daemon(pid: int, *, timeout: float) -> None:
     """Replace a hung daemon only when no live operation or managed child exists."""
     from .target_leases import active_lease_owners, operation_blocks_drain
 
-    owners = [owner for owner in active_lease_owners()
-              if owner.get("pid") != os.getpid()
-              and isinstance(owner.get("pid"), int)
-              and _pid_exists(owner["pid"])
-              and operation_blocks_drain(owner)]
+    owners = [
+        owner
+        for owner in active_lease_owners()
+        if owner.get("pid") != os.getpid()
+        and isinstance(owner.get("pid"), int)
+        and _pid_exists(owner["pid"])
+        and operation_blocks_drain(owner)
+    ]
     if owners:
         operations = ", ".join(
-            f"{owner.get('operation', 'device operation')} (pid {owner['pid']})"
-            for owner in owners)
+            f"{owner.get('operation', 'device operation')} (pid {owner['pid']})" for owner in owners
+        )
         raise RuntimeError(
             f"GWProv daemon pid {pid} is unresponsive while protected operation(s) are active: "
-            f"{operations}. Let them finish or cancel them before retrying.")
+            f"{operations}. Let them finish or cancel them before retrying."
+        )
     children = [child for child in _daemon_children(pid) if _pid_exists(child)]
     if children:
         raise RuntimeError(
             f"GWProv daemon pid {pid} is unresponsive and still owns child process(es) "
-            f"{', '.join(map(str, children))}; stop those managed instances before retrying.")
+            f"{', '.join(map(str, children))}; stop those managed instances before retrying."
+        )
     _stop_stale_daemon(pid, timeout=min(timeout, 1.0), force=True)
 
 
-def _stop_stale_daemon(pid: int, *, timeout: float = 8.0,
-                       force: bool = False) -> None:
+def _stop_stale_daemon(pid: int, *, timeout: float = 8.0, force: bool = False) -> None:
     if not _pid_exists(pid):
         return
     if not _is_gwprov_daemon(pid):
@@ -1337,10 +1668,13 @@ def _stop_stale_daemon(pid: int, *, timeout: float = 8.0,
             time.sleep(0.05)
     if _pid_exists(pid):
         if force:
-            raise RuntimeError(f"stale GWProv daemon pid {pid} did not stop after forced termination")
+            raise RuntimeError(
+                f"stale GWProv daemon pid {pid} did not stop after forced termination"
+            )
         raise RuntimeError(
             f"stale GWProv daemon pid {pid} did not stop cleanly; "
-            "it may still be finishing a device poll. Retry or use `gwprov daemon restart --force`.")
+            "it may still be finishing a device poll. Retry or use `gwprov daemon restart --force`."
+        )
 
 
 def ensure_running(*, timeout: float = 8.0) -> None:
@@ -1355,45 +1689,52 @@ def ensure_running(*, timeout: float = 8.0) -> None:
             # set reloadRequired. Treat missing identity as stale too, then
             # apply the same process-held lease and child-process safeguards.
             reported_identity = response.get("daemonIdentity")
-            stale = (response.get("reloadRequired")
-                     or not isinstance(reported_identity, dict)
-                     or reported_identity != _daemon_identity())
+            stale = (
+                response.get("reloadRequired")
+                or not isinstance(reported_identity, dict)
+                or reported_identity != _daemon_identity()
+            )
             if stale:
                 if int(response.get("activeVMs", 0)):
                     _check_daemon_identity(response)
                 daemon_pid = int(response.get("daemonPid", 0))
-                children = [child for child in _daemon_children(daemon_pid)
-                            if _pid_exists(child)]
+                children = [child for child in _daemon_children(daemon_pid) if _pid_exists(child)]
                 if children:
                     raise RuntimeError(
                         f"stale GWProv daemon pid {daemon_pid} still owns child process(es) "
                         f"{', '.join(map(str, children))}; stop those managed instances before "
-                        "the daemon can reload.")
+                        "the daemon can reload."
+                    )
                 from .target_leases import active_lease_owners, operation_blocks_drain
+
                 # A backend acquires its OS lease before registering with the
                 # service. Ignore this caller's just-acquired lease here: it
                 # has not opened the adapter yet, and restarting the stale
                 # monitor is the next step in that same attach sequence.
-                owners = [owner for owner in active_lease_owners()
-                          if owner.get("pid") != os.getpid()]
+                owners = [
+                    owner for owner in active_lease_owners() if owner.get("pid") != os.getpid()
+                ]
                 # Trust live process-held leases, not a stale daemon's in-memory
                 # lease count. The OS lock remains authoritative across daemon
                 # upgrades and lets us ignore abandoned lease entries from old
                 # code. A process that has exited no longer protects an operation.
-                blocking = sum(operation_blocks_drain(owner)
-                               and isinstance(owner.get("pid"), int)
-                               and _pid_exists(owner["pid"]) for owner in owners)
+                blocking = sum(
+                    operation_blocks_drain(owner)
+                    and isinstance(owner.get("pid"), int)
+                    and _pid_exists(owner["pid"])
+                    for owner in owners
+                )
                 if blocking:
                     raise RuntimeError(
                         f"stale GWProv daemon pid {daemon_pid} is waiting for "
                         f"{blocking} substantial device operation(s) to release their lease. "
-                        "Run `gwprov daemon restart --force` to cancel them.")
+                        "Run `gwprov daemon restart --force` to cancel them."
+                    )
                 # With no live VM or substantial process lease, a daemon stuck
                 # in a passive adapter poll must not trap every subsequent CLI
                 # command. Give it a short graceful window, then reap this
                 # verified stale daemon so the current version can start.
-                _stop_stale_daemon(daemon_pid,
-                                   timeout=min(timeout, 2.0), force=True)
+                _stop_stale_daemon(daemon_pid, timeout=min(timeout, 2.0), force=True)
                 response = None
             else:
                 _check_daemon_identity(response)
@@ -1407,21 +1748,28 @@ def ensure_running(*, timeout: float = 8.0) -> None:
             if len(candidates) > 1:
                 raise RuntimeError(
                     "multiple unresponsive GWProv daemon processes own this user's socket: "
-                    f"{', '.join(map(str, candidates))}; inspect them before retrying")
+                    f"{', '.join(map(str, candidates))}; inspect them before retrying"
+                )
             if candidates:
                 _stop_unresponsive_daemon(candidates[0], timeout=timeout)
         log_path = runtime_directory() / "daemon.log"
         log = log_path.open("ab")
         child_env = dict(os.environ)
         package_root = str(Path(__file__).resolve().parent.parent)
-        child_env["PYTHONPATH"] = package_root + (os.pathsep + child_env["PYTHONPATH"]
-                                                    if child_env.get("PYTHONPATH") else "")
-        kwargs: dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": log,
-                                  "stderr": subprocess.STDOUT, "close_fds": True,
-                                  "env": child_env}
+        child_env["PYTHONPATH"] = package_root + (
+            os.pathsep + child_env["PYTHONPATH"] if child_env.get("PYTHONPATH") else ""
+        )
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": log,
+            "stderr": subprocess.STDOUT,
+            "close_fds": True,
+            "env": child_env,
+        }
         if os.name == "nt":
-            kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-                                       | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+            kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+            )
         else:
             kwargs["start_new_session"] = True
         try:
@@ -1432,7 +1780,9 @@ def ensure_running(*, timeout: float = 8.0) -> None:
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                response = request({"op": "ping", "clientIdentity": _daemon_identity()}, timeout=0.4)
+                response = request(
+                    {"op": "ping", "clientIdentity": _daemon_identity()}, timeout=0.4
+                )
             except (OSError, RuntimeError, ValueError) as error:
                 last_error = error
                 time.sleep(0.05)
@@ -1450,21 +1800,25 @@ def _startup_lock():
     try:
         if os.name == "nt":
             import msvcrt
+
             if os.fstat(fd).st_size == 0:
                 os.write(fd, b"\0")
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
         else:
             import fcntl
+
             fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         if os.name == "nt":
             import msvcrt
+
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
+
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
@@ -1474,50 +1828,102 @@ def require_binary_override_support(binary):
         return
     capabilities = request({"op": "ping"}, timeout=1.0).get("capabilities", [])
     if "gwemu-bin" not in capabilities:
-        raise RuntimeError("running GWProv daemon does not support --gwemu-bin; finish active VM/hardware operations before restarting the daemon")
+        raise RuntimeError(
+            "running GWProv daemon does not support --gwemu-bin; finish active VM/hardware operations before restarting the daemon"
+        )
 
 
-def require_timing_support(timing_mode):
-    if timing_mode != "experimental-m7":
+def require_timing_support(timing_mode, pacing=None):
+    if timing_mode == "default" and pacing is None:
         return
     capabilities = request({"op": "ping"}, timeout=1.0).get("capabilities", [])
-    if "timing-experimental-m7" not in capabilities:
-        raise RuntimeError("running GWProv daemon does not support experimental-m7; finish active VM/hardware operations and let the idle daemon exit before retrying")
+    if "timing-pacing" not in capabilities:
+        raise RuntimeError(
+            "running GWProv daemon does not support explicit timing/pacing controls; "
+            "finish active operations and let the idle daemon exit before retrying"
+        )
+    if timing_mode == "experimental-m7" and "timing-experimental-m7" not in capabilities:
+        raise RuntimeError(
+            "running GWProv daemon does not support experimental-m7; finish active VM/hardware operations and let the idle daemon exit before retrying"
+        )
 
 
-def start_instance(profile: str, *, audio: bool = False, gdb_port: int | None = None,
-                   headless: bool = False, timeline: str | None = None,
-                   record_timeline: str | None = None,
-                   start_halted: bool = False,
-                   shared_sd_root: str | None = None, timing_mode: str = "default",
-                   icount: int | None = None, rtc_epoch: int | None = None,
-                   gwemu_bin: str | None = None) -> dict:
+def start_instance(
+    profile: str,
+    *,
+    audio: bool = False,
+    gdb_port: int | None = None,
+    headless: bool = False,
+    timeline: str | None = None,
+    record_timeline: str | None = None,
+    start_halted: bool = False,
+    shared_sd_root: str | None = None,
+    timing_mode: str = "default",
+    icount: int | None = None,
+    pacing: str | None = None,
+    rtc_epoch: int | None = None,
+    gwemu_bin: str | None = None,
+) -> dict:
     ensure_running()
     require_binary_override_support(gwemu_bin)
-    require_timing_support(timing_mode)
-    return request({"op": "start-vm", "profile": profile, "audio": audio,
-                    "gdb_port": gdb_port, "headless": headless,
-                    "timeline": timeline, "record_timeline": record_timeline,
-                    "start_halted": start_halted,
-                    "shared_sd_root": shared_sd_root, "timing_mode": timing_mode,
-                    "icount": icount, "rtc_epoch": rtc_epoch, "gwemu_bin": gwemu_bin}, timeout=20.0)["instance"]
+    require_timing_support(timing_mode, pacing)
+    return request(
+        {
+            "op": "start-vm",
+            "profile": profile,
+            "audio": audio,
+            "gdb_port": gdb_port,
+            "headless": headless,
+            "timeline": timeline,
+            "record_timeline": record_timeline,
+            "start_halted": start_halted,
+            "shared_sd_root": shared_sd_root,
+            "timing_mode": timing_mode,
+            "icount": icount,
+            "pacing": pacing,
+            "rtc_epoch": rtc_epoch,
+            "gwemu_bin": gwemu_bin,
+        },
+        timeout=20.0,
+    )["instance"]
 
 
-def start_image(image: dict[str, str], *, audio: bool = False,
-                gdb_port: int | None = None, headless: bool = False,
-                timeline: str | None = None, record_timeline: str | None = None,
-                icount: int | None = None, keep_temp: bool = False,
-                timing_mode: str = "default", rtc_epoch: int | None = None,
-                gwemu_bin: str | None = None) -> dict:
+def start_image(
+    image: dict[str, str],
+    *,
+    audio: bool = False,
+    gdb_port: int | None = None,
+    headless: bool = False,
+    timeline: str | None = None,
+    record_timeline: str | None = None,
+    icount: int | None = None,
+    keep_temp: bool = False,
+    timing_mode: str = "default",
+    pacing: str | None = None,
+    rtc_epoch: int | None = None,
+    gwemu_bin: str | None = None,
+) -> dict:
     ensure_running()
     require_binary_override_support(gwemu_bin)
-    require_timing_support(timing_mode)
-    return request({"op": "start-vm", "image": image, "audio": audio,
-                    "gdb_port": gdb_port, "headless": headless,
-                    "timeline": timeline, "record_timeline": record_timeline,
-                    "icount": icount, "keep_temp": keep_temp,
-                    "timing_mode": timing_mode, "rtc_epoch": rtc_epoch,
-                    "gwemu_bin": gwemu_bin}, timeout=20.0)["instance"]
+    require_timing_support(timing_mode, pacing)
+    return request(
+        {
+            "op": "start-vm",
+            "image": image,
+            "audio": audio,
+            "gdb_port": gdb_port,
+            "headless": headless,
+            "timeline": timeline,
+            "record_timeline": record_timeline,
+            "icount": icount,
+            "keep_temp": keep_temp,
+            "timing_mode": timing_mode,
+            "pacing": pacing,
+            "rtc_epoch": rtc_epoch,
+            "gwemu_bin": gwemu_bin,
+        },
+        timeout=20.0,
+    )["instance"]
 
 
 def managed_instances(*, start: bool = False) -> list[dict]:
@@ -1533,8 +1939,9 @@ def qmp_request(path: str, command: str, arguments: dict | None = None) -> dict:
     if not path.startswith("gwprov://"):
         raise ValueError("not a GWProv-managed QMP endpoint")
     vm = path.removeprefix("gwprov://")
-    return request({"op": "qmp", "vm": vm, "command": command,
-                    "arguments": arguments}, timeout=10.0)
+    return request(
+        {"op": "qmp", "vm": vm, "command": command, "arguments": arguments}, timeout=10.0
+    )
 
 
 def register_lease(token: str, owner: dict) -> None:
@@ -1571,14 +1978,24 @@ def device_snapshot(*, refresh: bool = False) -> list[dict]:
     """Read the daemon's latest hardware state, optionally waiting for a live poll."""
     ensure_running()
     timeout = 60.0 if refresh else 30.0
-    return request({"op": "device-snapshot", "refresh": refresh}, timeout=timeout).get("devices", [])
+    return request({"op": "device-snapshot", "refresh": refresh}, timeout=timeout).get(
+        "devices", []
+    )
 
 
 def pause_device_monitor(key: str, pause_token: str, pid: int, wait_seconds: float) -> None:
     """Hand a monitored target connection to a foreground device operation."""
     try:
-        request({"op": "target-pause", "key": key, "pauseToken": pause_token,
-                 "pid": pid, "waitSeconds": wait_seconds}, timeout=60.0)
+        request(
+            {
+                "op": "target-pause",
+                "key": key,
+                "pauseToken": pause_token,
+                "pid": pid,
+                "waitSeconds": wait_seconds,
+            },
+            timeout=60.0,
+        )
     except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
         # No service owns a monitor connection, so the foreground backend can
         # proceed to its process-shared lease and direct adapter connection.
@@ -1587,16 +2004,17 @@ def pause_device_monitor(key: str, pause_token: str, pid: int, wait_seconds: flo
 
 def resume_device_monitor(key: str, pause_token: str) -> None:
     try:
-        request({"op": "target-resume", "key": key,
-                 "pauseToken": pause_token}, timeout=1.0)
+        request({"op": "target-resume", "key": key, "pauseToken": pause_token}, timeout=1.0)
     except (OSError, RuntimeError, ValueError):
         pass
 
 
 def open_target_session(probe: dict, operation: str) -> dict:
     ensure_running()
-    return request({"op": "target-open", "probe": probe, "operation": operation,
-                    "pid": os.getpid()}, timeout=20.0)
+    return request(
+        {"op": "target-open", "probe": probe, "operation": operation, "pid": os.getpid()},
+        timeout=20.0,
+    )
 
 
 def call_target_session(token: str | None, method: str, arguments: list):
@@ -1605,8 +2023,10 @@ def call_target_session(token: str | None, method: str, arguments: list):
     if method == "write_memory":
         address, data = arguments
         arguments = [address, base64.b64encode(data).decode("ascii")]
-    response = request({"op": "target-call", "token": token,
-                        "method": method, "arguments": arguments}, timeout=60.0)
+    response = request(
+        {"op": "target-call", "token": token, "method": method, "arguments": arguments},
+        timeout=60.0,
+    )
     result = response.get("result")
     if method == "read_memory":
         return base64.b64decode(result, validate=True)
@@ -1633,8 +2053,10 @@ def _serve() -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv != ["--serve"]:
-        print("GWProv daemon is an internal service and has no public command interface.",
-              file=sys.stderr)
+        print(
+            "GWProv daemon is an internal service and has no public command interface.",
+            file=sys.stderr,
+        )
         return 2
     try:
         return _serve()

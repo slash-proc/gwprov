@@ -1,4 +1,5 @@
 """Structured, persistent QMP access independent of the GDB connection."""
+
 from __future__ import annotations
 
 import json
@@ -8,7 +9,6 @@ import os
 import time
 import traceback
 from pathlib import Path
-
 
 
 def record_control_request(path: str | None, transport: str, command: str) -> None:
@@ -21,14 +21,26 @@ def record_control_request(path: str | None, transport: str, command: str) -> No
         return
     if path.startswith("gwprov://"):
         from .daemon_ipc import runtime_directory
+
         destination = runtime_directory() / f"control-{path.removeprefix('gwprov://')}.jsonl"
     else:
         destination = Path(path).expanduser().resolve().parent / "control.jsonl"
-    callers = [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
-               for frame in traceback.extract_stack(limit=8)[:-1]]
-    payload = json.dumps({"time_ns": time.time_ns(), "pid": os.getpid(),
-                          "transport": transport, "command": command,
-                          "callers": callers}) + "\n"
+    callers = [
+        {"file": frame.filename, "line": frame.lineno, "function": frame.name}
+        for frame in traceback.extract_stack(limit=8)[:-1]
+    ]
+    payload = (
+        json.dumps(
+            {
+                "time_ns": time.time_ns(),
+                "pid": os.getpid(),
+                "transport": transport,
+                "command": command,
+                "callers": callers,
+            }
+        )
+        + "\n"
+    )
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(descriptor, payload.encode())
@@ -37,8 +49,10 @@ def record_control_request(path: str | None, transport: str, command: str) -> No
 
 
 def parse_arm_registers(text: str) -> dict[str, int]:
-    registers = {f"r{int(index)}": int(value, 16)
-                 for index, value in re.findall(r"\bR(\d{2})=([0-9a-fA-F]+)", text)}
+    registers = {
+        f"r{int(index)}": int(value, 16)
+        for index, value in re.findall(r"\bR(\d{2})=([0-9a-fA-F]+)", text)
+    }
     for alias, name in (("sp", "r13"), ("lr", "r14"), ("pc", "r15")):
         if name in registers:
             registers[alias] = registers[name]
@@ -66,10 +80,20 @@ class QMPConnection:
             # it starts the child. This connection is a client RPC handle.
             self.stream = True
             return self
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.path.startswith("tcp://"):
+            from urllib.parse import urlparse
+
+            parsed = urlparse(self.path)
+            if not parsed.hostname or parsed.port is None:
+                raise ValueError(f"invalid QMP TCP endpoint {self.path!r}")
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            address = (parsed.hostname, parsed.port)
+        else:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            address = self.path
         self.sock.settimeout(self.timeout)
         try:
-            self.sock.connect(self.path)
+            self.sock.connect(address)
             self.stream = self.sock.makefile("rwb", buffering=0)
             greeting = self.stream.readline()
             if not greeting or "QMP" not in json.loads(greeting):
@@ -78,10 +102,9 @@ class QMPConnection:
             return self
         except PermissionError as exc:
             self.close()
+            endpoint_type = "TCP" if self.path.startswith("tcp://") else "Unix socket"
             raise PermissionError(
-                f"access to GWemu QMP socket {self.path!r} was denied; run gwprov "
-                "with permission to connect to this Unix socket "
-                "(NET_ADMIN is not required for QMP Unix-socket access)"
+                f"access to GWemu QMP {endpoint_type} {self.path!r} was denied"
             ) from exc
         except BaseException:
             self.close()
@@ -97,14 +120,20 @@ class QMPConnection:
             if command == "qmp_capabilities":
                 return {"return": {}, "id": self.request_id}
             from .daemon_ipc import request
-            response = request({"op": "qmp", "vm": self.path.removeprefix("gwprov://"),
-                                "command": command, "arguments": arguments},
-                               timeout=self.timeout)
+
+            response = request(
+                {
+                    "op": "qmp",
+                    "vm": self.path.removeprefix("gwprov://"),
+                    "command": command,
+                    "arguments": arguments,
+                },
+                timeout=self.timeout,
+            )
             if "event" in response:
                 return response
             # daemon_ipc envelopes the child reply with protocol metadata.
-            return {key: value for key, value in response.items()
-                    if key not in {"ok", "protocol"}}
+            return {key: value for key, value in response.items() if key not in {"ok", "protocol"}}
         payload = {"execute": command, "id": self.request_id}
         if arguments:
             payload["arguments"] = arguments
@@ -139,13 +168,17 @@ class QMPConnection:
         words = []
         for line in self.monitor(f"xp /{count}wx 0x{aligned:x}").splitlines():
             if ":" in line:
-                words.extend(int(value, 16) for value in
-                             re.findall(r"0x([0-9a-fA-F]{1,8})", line.split(":", 1)[1]))
+                words.extend(
+                    int(value, 16)
+                    for value in re.findall(r"0x([0-9a-fA-F]{1,8})", line.split(":", 1)[1])
+                )
         if len(words) < count:
-            raise RuntimeError(f"QMP memory read at 0x{address:08x} returned "
-                               f"{len(words)} words; expected {count}")
+            raise RuntimeError(
+                f"QMP memory read at 0x{address:08x} returned "
+                f"{len(words)} words; expected {count}"
+            )
         data = b"".join(word.to_bytes(4, "little") for word in words[:count])
-        return data[offset:offset + size]
+        return data[offset : offset + size]
 
     def u32(self, address: int) -> int:
         return int.from_bytes(self.read_memory(address, 4), "little")

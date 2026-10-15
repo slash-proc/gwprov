@@ -46,7 +46,7 @@ START_ACTION_NEWGAME = 1
 STARTUP_FILE_LEN = 256
 BROWSE_SUBPATH_LEN = 96
 RESERVED_APP_LEN = 32
-CONFIG_SIZE = 416   # asserted below
+CONFIG_SIZE = 416  # asserted below
 
 
 def rom_path(dirname, filename):
@@ -56,34 +56,60 @@ def rom_path(dirname, filename):
     return f"{ROMS}/{dirname}/{filename}"
 
 
-def build(startup_file="", menu_timeout_s=0, backlight=6, volume=4,
-          font_size=8, theme=2, colors=0, turbo_buttons=0, font=0,
-          lang=0, startup_app=0, cpu_oc_level=0,
-          start_action=START_ACTION_RESUME, welcome_prompt=1,
-          selected_tab=0, cursor=0, browse_subpath="",
-          debug_clock_always_on=0):
+def build(
+    startup_file="",
+    menu_timeout_s=0,
+    backlight=6,
+    volume=4,
+    font_size=8,
+    theme=2,
+    colors=0,
+    turbo_buttons=0,
+    font=0,
+    lang=0,
+    startup_app=0,
+    cpu_oc_level=0,
+    start_action=START_ACTION_RESUME,
+    welcome_prompt=1,
+    selected_tab=0,
+    cursor=0,
+    browse_subpath="",
+    debug_clock_always_on=0,
+):
     """Return the packed /CONFIG bytes, CRC included."""
     if len(startup_file) >= STARTUP_FILE_LEN:
         raise ValueError("startup_file too long")
 
     blob = struct.pack(
-        "<I"          # magic
-        "12B"         # version, backlight, start_action, volume, font_size,
-                      # theme, colors, turbo_buttons, font, lang, startup_app,
-                      # cpu_oc_level
+        "<I"  # magic
+        "12B"  # version, backlight, start_action, volume, font_size,
+        # theme, colors, turbo_buttons, font, lang, startup_app,
+        # cpu_oc_level
         f"{STARTUP_FILE_LEN}s"
-        "3H"          # main_menu_timeout_s, selected_tab, cursor
+        "3H"  # main_menu_timeout_s, selected_tab, cursor
         f"{BROWSE_SUBPATH_LEN}s"
-        "B"           # debug_clock_always_on (bool)
-        "x"           # pad to 4-byte alignment for welcome_prompt
-        "I"           # welcome_prompt
+        "B"  # debug_clock_always_on (bool)
+        "x"  # pad to 4-byte alignment for welcome_prompt
+        "I"  # welcome_prompt
         f"{RESERVED_APP_LEN}s"
-        "I",          # crc32 (zero while computing)
+        "I",  # crc32 (zero while computing)
         CONFIG_MAGIC,
-        CONFIG_VERSION, backlight, start_action, volume, font_size,
-        theme, colors, turbo_buttons, font, lang, startup_app, cpu_oc_level,
-        startup_file.encode() ,
-        menu_timeout_s, selected_tab, cursor,
+        CONFIG_VERSION,
+        backlight,
+        start_action,
+        volume,
+        font_size,
+        theme,
+        colors,
+        turbo_buttons,
+        font,
+        lang,
+        startup_app,
+        cpu_oc_level,
+        startup_file.encode(),
+        menu_timeout_s,
+        selected_tab,
+        cursor,
         browse_subpath.encode(),
         debug_clock_always_on,
         welcome_prompt,
@@ -93,7 +119,8 @@ def build(startup_file="", menu_timeout_s=0, backlight=6, volume=4,
     if len(blob) != CONFIG_SIZE:
         raise AssertionError(
             f"packed /CONFIG is {len(blob)} bytes, expected {CONFIG_SIZE} -- "
-            "persistent_config_t layout changed; re-check odroid_settings.c")
+            "persistent_config_t layout changed; re-check odroid_settings.c"
+        )
 
     crc = zlib.crc32(blob) & 0xFFFFFFFF
     return blob[:-4] + struct.pack("<I", crc)
@@ -131,16 +158,28 @@ def build_from_values(values: dict, **overrides) -> bytes:
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--out", default="CONFIG", help="output path")
-    p.add_argument("--startup-file", default="",
-                   help="auto-launch this path at boot, e.g. /roms/dos/ALLEYCAT.dsk. "
-                        "Empty means show the launcher.")
-    p.add_argument("--rom", nargs=2, metavar=("DIRNAME", "FILENAME"),
-                   help="build the startup path from a core dirname + filename")
-    p.add_argument("--menu-timeout", type=int, default=0,
-                   help="idle standby seconds; 0 disables (default for tests)")
+    p.add_argument(
+        "--startup-file",
+        default="",
+        help="auto-launch this path at boot, e.g. /roms/dos/ALLEYCAT.dsk. "
+        "Empty means show the launcher.",
+    )
+    p.add_argument(
+        "--rom",
+        nargs=2,
+        metavar=("DIRNAME", "FILENAME"),
+        help="build the startup path from a core dirname + filename",
+    )
+    p.add_argument(
+        "--menu-timeout",
+        type=int,
+        default=0,
+        help="idle standby seconds; 0 disables (default for tests)",
+    )
     p.add_argument("--backlight", type=int, default=6)
     p.add_argument("--volume", type=int, default=4)
     args = p.parse_args()
@@ -149,14 +188,20 @@ def main():
     if args.rom:
         startup = rom_path(*args.rom)
 
-    blob = build(startup_file=startup, menu_timeout_s=args.menu_timeout,
-                 backlight=args.backlight, volume=args.volume)
+    blob = build(
+        startup_file=startup,
+        menu_timeout_s=args.menu_timeout,
+        backlight=args.backlight,
+        volume=args.volume,
+    )
     with open(args.out, "wb") as fh:
         fh.write(blob)
     print(f"wrote {args.out} ({len(blob)} bytes)")
     print(f"  startup_file        {startup or '(launcher)'}")
-    print(f"  main_menu_timeout_s {args.menu_timeout}"
-          f"{'  (standby disabled)' if args.menu_timeout == 0 else ''}")
+    print(
+        f"  main_menu_timeout_s {args.menu_timeout}"
+        f"{'  (standby disabled)' if args.menu_timeout == 0 else ''}"
+    )
     return 0
 
 

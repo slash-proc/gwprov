@@ -1,4 +1,4 @@
-# Release content to a bootable GWemu instance
+# Build, stage, and provision Retro-Go content
 
 Run these commands from the gwprov checkout. Generated files belong in the ignored
 `dev-local/` directory. Source ROMs, firmware and CD files are read as inputs.
@@ -27,6 +27,42 @@ The default firmware repository is `sylverb/game-and-watch-retro-go-sd`.
 `--variant flash` selects the published bank-2 firmware. `--version TAG` can
 pin a firmware or project release; resolved versions and inputs are recorded in
 local metadata. Use a new content root when choosing a different firmware/variant.
+
+### Build Retro-Go and run a local homebrew
+
+From a homebrew project checkout, build the Retro-Go base into a staging directory,
+build the homebrew with its own build instructions, install its GWRG dist bundle into
+the profile, then set Retro-Go to launch it:
+
+```bash
+RETRO_GO=/path/to/game-and-watch-retro-go-sd
+CONTENT="$PWD/build/retro-go-content"
+PROFILE=dev-homebrew
+
+# Use --profile PROFILE instead when an existing profile should choose SD_CARD.
+gwprov retro-go build --variant flash --path "$RETRO_GO" \
+  --output "$CONTENT" --makevar MY_EXPERIMENT=123
+
+# Build the homebrew using its documented build command.
+
+gwprov profile create "$PROFILE" --content "$CONTENT"
+gwprov project install "$PWD/build/homebrew-bundle.zip" profile:"$PROFILE"
+gwprov retro-go config profile:"$PROFILE" --auto-start /homebrews/my-app.bin
+gwprov start "profile:$PROFILE"
+```
+
+`gwprov start` accepts a device name or `profile:NAME`. Bare names resolve as
+devices; `profile:` launches a new GWemu instance from that profile. Starting a
+physical device is unsupported. Use `gwprov device DEVICE reset` to reset
+hardware; `start` does not power-cycle or restart it.
+
+`retro-go build` supplies the firmware, debug ELF, storage artifacts, and local
+manifest. The `--makevar` value is passed to Retro-Go's Makefile. GWProv does not
+infer or run an arbitrary homebrew's build command: prepare the project bundle using
+the GWRG dist manifest and ZIP layout first. `project install` then verifies its
+declared files and installs them into the profile. To run on hardware, apply the
+profile with `gwprov profile PROFILE apply device:DEVICE --start --bank 2` instead
+of starting GWemu.
 
 ```bash
 gwprov retro-go install --variant flash --output dev-local/content/retro-go-demo
@@ -87,22 +123,27 @@ directly.
 gwprov profile create dev-local/profiles/retro-go-demo \
   --content dev-local/content/retro-go-demo
 
-gwprov gwemu run --profile dev-local/profiles/retro-go-demo
+gwprov start profile:dev-local/profiles/retro-go-demo
 ```
 
 ## Inspect and edit device filesystems
 
 `gwprov show` gives a concise resource overview. Use `gwprov show devices` for
-the short device list and `gwprov ps` for detailed runtime state. Device controls
-always take the device name or stable ID shown by `show devices`:
+the device list and `gwprov show DEVICE` for one device's assignments, detected
+bank contents, bootloader, running application and lock state. Hardware details
+include the target and adapter; GWemu details include its process, timing, QMP
+and GDB endpoints. Use `gwprov ps` to compare live state across all devices.
+Device controls always take the device name or stable ID shown by `show devices`:
 
 ```bash
 gwprov show
 gwprov show devices
-gwprov screenshot gwemu:12345 --output screenshot.png
+gwprov show timing-test
+gwprov show device:probe:SERIAL --output json
+gwprov device gwemu:12345 screenshot --output screenshot.png
 ```
 
-`gwprov config show DEVICE` reads and decodes a device's stored Retro-Go
+`gwprov retro-go config device:DEVICE` reads and decodes a device's stored Retro-Go
 `/CONFIG`, including its CRC status. GWemu reads the running instance's extflash
 image; hardware reads its mapped LittleFS partition using the assigned profile's
 layout. Hardware inspection takes a target lease and fails while another session
@@ -114,9 +155,9 @@ point into the RAM service; `IDLE` plus a
 running core then confirms that it is live and idle. The mailbox can retain a
 stale `IDLE` value while application firmware runs, so it cannot identify the
 stub by itself. A resident stub blocks an implicit reset/load by flows that
-need to start the service. `gwprov profile PROFILE apply DEVICE` can attach to an already-running idle
+need to start the service. `gwprov profile PROFILE apply device:DEVICE` can attach to an already-running idle
 stub.
-`gwprov recover DEVICE` starts the RAM flasher when absent, or attaches and
+`gwprov device DEVICE recover` starts the RAM flasher when absent, or attaches and
 synchronizes its context counter when already live and idle. It restarts an
 idle but halted or terminal-error stub; it refuses a busy or unreadable
 resident service. Recovery leaves the device in Recovery Mode ready for commands.
@@ -135,35 +176,35 @@ gnwmanager firmware image back from SRAM and verify MSP/PC register writes. A
 failed verification leaves the core halted and reports the mismatch instead of
 starting an unverified image.
 
-Applying a profile names both resources: `gwprov profile PROFILE apply DEVICE`.
+Applying a profile names both resources: `gwprov profile PROFILE apply device:DEVICE`.
 For hardware it deploys the profile's flash regions and leaves the RAM flasher
 running. Pass `--start` to start bank 1 afterward, or add `--bank 2` to start
-bank 2. For GWemu, use `gwprov start PROFILE` to create a managed instance.
+bank 2. For GWemu, use `gwprov start profile:PROFILE` to create a managed instance.
 
 ```sh
-gwprov config show probe:PROBE_ID
-gwprov config show probe:PROBE_ID --output json
-gwprov profile dkc1 apply probe:PROBE_ID
-gwprov sdcard add /Volumes/RETROGO       # name defaults to RETROGO
+gwprov retro-go config device:probe:PROBE_ID
+gwprov retro-go config device:probe:PROBE_ID --output json
+gwprov profile dkc1 apply device:probe:PROBE_ID
+gwprov media sdcard add /Volumes/RETROGO       # name defaults to RETROGO
 ```
 
-Register mounted folders or drive roots with `gwprov sdcard add PATH [NAME]`.
+Register mounted folders or drive roots with `gwprov media sdcard add PATH [NAME]`.
 Names default to the folder name on Unix-like systems and the drive letter on
 Windows. Registration records the path only; it does not format the card.
-Inspect cards with `gwprov sdcard list` or `gwprov show sdcard`. The same
-`sdcard` command creates and populates raw card
-images with `gwprov sdcard create` and `gwprov sdcard compose`; `sd` remains a
+Inspect cards with `gwprov media sdcard list` or `gwprov show media`. The same
+`media sdcard` group creates and populates card
+images with `gwprov media sdcard create` and `gwprov media sdcard compose`; `sd` remains a
 short alias for the full command group.
 
-`adapters` and `devices` are also top-level commands. `adapters` lists detected
+`adapters` and `device ls` are also top-level commands. `adapters` lists detected
 local programmers and registered remote servers. Register one remote
 `gnwmanager serve` endpoint per adapter; each server represents one device:
 
 ```bash
-gwprov adapters add pi-probe ws://10.2.3.122:8765/gdb
+gwprov adapters add pi-probe ws://HOST:PORT/gdb
 gwprov adapters list
-gwprov devices
-gwprov input pi-probe tap B
+gwprov device ls
+gwprov device pi-probe input tap B
 gwprov adapters remove pi-probe
 ```
 
@@ -172,29 +213,111 @@ header. The per-user adapter registry uses the platform config directory;
 `GWPROV_CONFIG_DIR` overrides it. `show adapters` and `show devices` remain
 available as concise dashboard views.
 
-Filesystem commands accept a managed profile or an explicit image. FrogFS
-changes rebuild the filesystem and update a profile's declared FrogFS size;
-direct images are rebuilt within their existing image or explicitly sized region.
-A profile that declares mapped XiP artifacts requires each raw mapped source on
-every FrogFS rebuild because rebuilding can move payloads. GWProv rejects a
-rebuild that omits one, stores mapped payloads uncompressed, and relocates them
-using their declared `relocBase`. LittleFS and SD changes are applied in place.
-`create` formats an empty filesystem and requires `--force` when replacing
-existing data. Formatting a profile that still declares mapped XiP artifacts is
-rejected because it would remove the files while leaving their declarations:
+Raw GDB TCP servers use a `gdb://HOST:PORT` endpoint and are registered as
+named devices. For example, an OpenOCD GDB server:
 
 ```bash
-gwprov filesystem ls --profile retro-go-demo --target flash/ext
-gwprov filesystem add assets/title.png --source ./title.png \
-  --profile retro-go-demo --target flash/ext
-# For mapped XiP profiles, supply each raw sidecar source during every rebuild:
-gwprov filesystem add homebrews/app.bin --source ./app.bin \
-  --mapped-source homebrews/app.xip=./app.xip \
-  --profile retro-go-demo --target flash/ext
-gwprov filesystem remove assets/old.png --profile retro-go-demo --target flash/ext
-gwprov filesystem create --profile retro-go-demo --target flash/ext \
+gwprov adapters add test-target gdb://HOST:PORT
+gwprov device ls
+gwprov debug python test-target
+```
+
+The daemon polls registered raw GDB endpoints every five seconds and reports
+observed execution and firmware state in `gwprov ps`. Polls read target state
+without sending halt, continue, reset, or watchdog-freeze writes; shell
+completion remains registry-only. Before an explicit Python debug session, the
+daemon hands off its GDB connection. GWProv negotiates the target description
+without execution-control writes. A GDB server may have its own connection
+behavior that changes execution state. Raw GDB supports Python debugging, but
+not GWProv's managed reset-and-project-autostart sequence. GWProv coordinates
+its own local clients with a process lease; the GDB server controls access for
+clients on other machines.
+
+To let Web Builder or another gnwmanager WebSocket client connect through
+GWProv, start a local bridge for the explicit device and pass its printed URL
+to that client:
+
+```bash
+gwprov serve device:retro-go-vm start
+gwprov serve device:retro-go-vm stop
+```
+
+The bridge uses the gnwmanager WebSocket protocol on `/gdb`, binds to loopback
+by default, and chooses the first free port starting at 8766. GWemu GDB traffic
+uses its discovered GDB endpoint; QMP is used separately to read VM state.
+
+Retro-Go has two content layouts. The flash variant stores files in FrogFS and
+LittleFS on NOR. The SD variant stores its files together on the FAT filesystem
+of the SD card; NOR is used as a cache for contiguous memory-mapped files.
+Choose the filesystem that actually stores the target's content.
+
+`gwprov media add TARGET [SOURCE]` accepts a device or profile name, or a
+standalone filesystem image. Prefix managed targets with `device:` or `profile:`
+when needed. Scoped forms are `gwprov device DEVICE media add [SOURCE]` and
+`gwprov profile PROFILE media add [SOURCE]`. The
+source defaults to the current directory; `--dest` (also `--dst` or
+`--destination`) defaults to `/`. Files are copied into the destination
+directory, while a source directory is copied beneath it with its basename
+preserved. Missing directories are created.
+
+Storage is inferred for flash-only targets: `/bios`, `/fonts`, and `/homebrews`
+go to FrogFS, and other paths go to LittleFS. `--contiguous` forces FrogFS and
+stores added files uncompressed. `--sentinel ADDRESS` also uses contiguous
+FrogFS storage and relocates sentinel-based pointers in one file to the file's
+final extflash address; directory sources are rejected. `--sd` or `--sdcard`
+selects SD storage and is mutually exclusive with `--contiguous` and
+`--sentinel`. On SD Retro-Go targets, SD storage is selected by default.
+
+Device writes ask before starting the recovery flasher if it is not already
+running. `--yes`/`--force` skips that prompt. `ls` and `tree` accept either a
+file or directory inside the selected filesystem:
+
+```bash
+gwprov profile retro-go-demo media tree /
+gwprov profile retro-go-demo media add ./title.png --dest /homebrews
+gwprov profile retro-go-demo media add ./my-homebrew --dest /
+gwprov profile retro-go-demo media delete /assets/old.png --contiguous
+gwprov device DEVICE media tree /CONFIG
+gwprov device DEVICE media add ./settings.json --dest /config
+gwprov device DEVICE media ls /data/roms/game.sfc --sdcard
+```
+
+Standalone filesystem images can be used as top-level media targets. GWProv
+scans and validates their contents before listing or editing them. Use an
+explicit `blob:TYPE` prefix when the file name does not identify its type:
+
+```console
+gwprov media /path/to/frogfs.bin add ./bios
+gwprov media blob:frogfs /path/to/frogfs.bin tree
+gwprov media /path/to/littlefs.bin add ./CONFIG --dest /
+```
+
+`--contiguous` is valid only for FrogFS images. It is rejected for LittleFS and
+SD images; SD images also reject `--sentinel`.
+
+FrogFS changes rebuild the image and update its declared size. Rebuilding a
+profile with mapped XiP files preserves their raw payloads and relocates them
+using their declared `relocBase`. Device FrogFS edits use the assigned profile's
+layout and XiP metadata, then write the rebuilt FrogFS and its matching bank
+layout. LittleFS edits operate in place. SD-card edits write files into the
+card's shared namespace. Profile SD images support recursive directory creation.
+The current hardware gnwmanager protocol can write files only into existing SD
+directories; nested hardware SD imports need its SD mkdir action. Device changes
+show a confirmation; use `--yes` to skip it.
+
+Top-level media file operations treat an unprefixed target as a device. Use
+`profile:NAME` to select a profile explicitly. Device-specific actions live under
+`gwprov device DEVICE`; profile-specific actions live under
+`gwprov profile PROFILE`. `create` formats an empty filesystem and requires
+`--force` when replacing existing data.
+Formatting a profile that still declares mapped XiP artifacts is rejected:
+
+```bash
+gwprov profile retro-go-demo media tree /
+gwprov media add device:DEVICE ./title.png --dest /homebrews
+gwprov profile retro-go-demo media delete /assets/old.png --contiguous
+gwprov media create --profile retro-go-demo --target flash/ext \
   --filesystem frogfs --force
-gwprov filesystem ls --profile retro-go-demo --target sdcard
 ```
 
 Create standalone filesystem images with the concise size-in-MiB form. The
@@ -203,9 +326,9 @@ default to `frogfs.bin`, `lfs.bin`, and `sdcard.bin`. Use `--force` to replace
 an existing output:
 
 ```bash
-gwprov fs create frogfs 2 dev-local
-gwprov fs create lfs 2 dev-local littlefs-test.bin
-gwprov fs create sdcard 128 dev-local
+gwprov media create frogfs 2 dev-local
+gwprov media create lfs 2 dev-local littlefs-test.bin
+gwprov media create sdcard 128 dev-local
 ```
 
 For scripts or custom image layouts, the explicit image form is also available.
@@ -213,11 +336,11 @@ FrogFS and LittleFS use a byte size; LittleFS also takes `--offset` and
 `--block-size`. SD creation uses `--size-mib`:
 
 ```bash
-gwprov filesystem create --image dev-local/frogfs.bin \
+gwprov media create --image dev-local/frogfs.bin \
   --filesystem frogfs --size 0x200000
-gwprov filesystem create --image dev-local/littlefs.bin \
+gwprov media create --image dev-local/littlefs.bin \
   --filesystem littlefs --size 0x200000 --block-size 4096
-gwprov filesystem create --image dev-local/card.img \
+gwprov media create --image dev-local/card.img \
   --filesystem sd --size-mib 128
 ```
 
@@ -263,9 +386,9 @@ bank images used by GWemu. Existing parts with the same name require
 `--replace`; removal names the bank and component shown in the map:
 
 ```sh
-gwprov profile edit basic-test add bank0 "Mario Assets" mario-assets.bin --offset 0x0
-gwprov profile edit basic-test add bank1 "Bootloader" bootloader.bin --offset 0 --replace
-gwprov profile edit basic-test remove bank0 "Mario Assets"
+gwprov profile basic-test edit add bank0 "Mario Assets" mario-assets.bin --offset 0x0
+gwprov profile basic-test edit add bank1 "Bootloader" bootloader.bin --offset 0 --replace
+gwprov profile basic-test edit remove bank0 "Mario Assets"
 ```
 
 `bank0` is external flash; `bank1` and `bank2` are internal flash. Blob ranges
@@ -321,7 +444,7 @@ gwprov retro-go install --variant flash --output dev-local/content/doom-full
 gwprov project install doom --variant flash --output dev-local/content/doom-full \
   --input-dir "/path/to/doom-wads"
 gwprov profile create dev-local/profiles/doom-full --content dev-local/content/doom-full
-gwprov gwemu run --profile dev-local/profiles/doom-full
+gwprov start profile:dev-local/profiles/doom-full
 ```
 
 This includes the shipped shareware alongside converted `doom.wad` and `doom2.wad`.

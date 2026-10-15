@@ -7,8 +7,15 @@ from gwprov.reports import render_report
 
 def test_html_report_is_self_contained(tmp_path):
     source = tmp_path / "profile.json"
-    source.write_text(json.dumps({"title": "Hardware <profile>", "functions": [
-        {"name": "render", "cycles": 123}], "target": "hardware"}))
+    source.write_text(
+        json.dumps(
+            {
+                "title": "Hardware <profile>",
+                "functions": [{"name": "render", "cycles": 123}],
+                "target": "hardware",
+            }
+        )
+    )
     output = render_report(source, tmp_path / "profile.html", format="html")
     page = output.read_text()
     assert page.startswith("<!doctype html>")
@@ -62,15 +69,26 @@ def test_hardware_profile_default_html_keeps_json_report(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    snapshot = {"sequence": 0, "dropped": 0, "capacity": 1, "events": [],
-                "missing": 0, "overwritten_since_sequence": 0,
-                "flags": 1, "counter_hz": 280_000_000}
+    snapshot = {
+        "sequence": 0,
+        "dropped": 0,
+        "capacity": 1,
+        "events": [],
+        "missing": 0,
+        "overwritten_since_sequence": 0,
+        "flags": 1,
+        "counter_hz": 280_000_000,
+    }
     monkeypatch.setattr(hw_profile, "_symbols", lambda *_args: Symbols())
     monkeypatch.setattr(hw_profile, "read_trace", lambda *_args, **_kwargs: snapshot)
     monkeypatch.setattr("gwprov.backends.SelectedOpenOCDBackend", Backend)
 
-    assert hw_profile.profile_hardware(programmer="stlink", duration=0.001,
-                                       interval=0.001, output_format="html") == 2
+    assert (
+        hw_profile.profile_hardware(
+            programmer="stlink", duration=0.001, interval=0.001, output_format="html"
+        )
+        == 2
+    )
     directory = tmp_path / "dev-local" / "reports"
     json_reports = list(directory.glob("hardware-profile-*.json"))
     html_reports = list(directory.glob("hardware-profile-*.html"))

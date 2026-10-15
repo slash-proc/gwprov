@@ -53,20 +53,22 @@ class QemuSDCardManager(SDCardManager):
 
     def push_file(self, local_path, remote_path):
         print(f"[SD image] {local_path} -> ::{remote_path}")
-        subprocess.run(["mcopy", "-i", self.spec, "-o", local_path,
-                        f"::{remote_path}"], check=True)
+        subprocess.run(["mcopy", "-i", self.spec, "-o", local_path, f"::{remote_path}"], check=True)
 
     def mkdir(self, remote_path):
-        subprocess.run(["mmd", "-i", self.spec, f"::{remote_path}"],
-                       check=False, capture_output=True)
+        subprocess.run(
+            ["mmd", "-i", self.spec, f"::{remote_path}"], check=False, capture_output=True
+        )
 
     def remove(self, remote_path):
-        subprocess.run(["mdel", "-i", self.spec, f"::{remote_path}"],
-                       check=False, capture_output=True)
+        subprocess.run(
+            ["mdel", "-i", self.spec, f"::{remote_path}"], check=False, capture_output=True
+        )
 
     def listing(self, remote_path="/"):
-        return subprocess.run(["mdir", "-i", self.spec, f"::{remote_path}"],
-                              capture_output=True, text=True).stdout
+        return subprocess.run(
+            ["mdir", "-i", self.spec, f"::{remote_path}"], capture_output=True, text=True
+        ).stdout
 
 
 class HardwarePhysicalSDCardManager(SDCardManager):
@@ -82,8 +84,7 @@ class HardwarePhysicalSDCardManager(SDCardManager):
         shutil.copy(local_path, dest)
 
     def mkdir(self, remote_path):
-        os.makedirs(os.path.join(self.mount_path, remote_path.lstrip("/")),
-                    exist_ok=True)
+        os.makedirs(os.path.join(self.mount_path, remote_path.lstrip("/")), exist_ok=True)
 
     def remove(self, remote_path):
         try:
@@ -125,12 +126,11 @@ def create_image(path, size_mb=128, label="RETROGO", script=None):
     Uses the firmware's own make_sdcard_image.py (vendored) for the MBR, then
     mformat inside the partition -- the same two steps its Makefile.common does.
     """
-    script = script or os.path.join(os.path.dirname(__file__), "..",
-                                    "make_sdcard_image.py")
-    subprocess.run([sys.executable, script, path, "--size-mb", str(size_mb)],
-                   check=True)
-    subprocess.run(["mformat", "-i", f"{path}{MTOOLS_PARTITION_OFFSET}",
-                    "-F", "-v", label, "::"], check=True)
+    script = script or os.path.join(os.path.dirname(__file__), "..", "make_sdcard_image.py")
+    subprocess.run([sys.executable, script, path, "--size-mb", str(size_mb)], check=True)
+    subprocess.run(
+        ["mformat", "-i", f"{path}{MTOOLS_PARTITION_OFFSET}", "-F", "-v", label, "::"], check=True
+    )
     return path
 
 
@@ -151,8 +151,16 @@ def push_tree(manager, local_dir, *, exclude_names=()):
             manager.push_file(os.path.join(root, name), remote)
 
 
-def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
-            config=None, content_dir=None, sidecars=True):
+def compose(
+    manager,
+    core_bin=None,
+    core_name="dos",
+    rom=None,
+    rom_dir="dos",
+    config=None,
+    content_dir=None,
+    sidecars=True,
+):
     """Lay out everything the firmware needs, onto any destination.
 
     content_dir  the firmware's sd_content tree (fonts, lang, bios). Without
@@ -181,9 +189,9 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
         if sidecars:
             for ext in (".cfg", ".dosmeta", ".jpg"):
                 if os.path.exists(base + ext):
-                    manager.push_file(base + ext,
-                                      f"roms/{rom_dir}/"
-                                      f"{os.path.basename(base)}{ext}")
+                    manager.push_file(
+                        base + ext, f"roms/{rom_dir}/" f"{os.path.basename(base)}{ext}"
+                    )
 
     if config:
         manager.push_file(config, "CONFIG")

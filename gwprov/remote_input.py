@@ -10,6 +10,7 @@ indistinguishable from a physical press.
 The whole point of this module is **one persistent OpenOCD connection** to keep
 overhead low and avoid repeating commands.
 """
+
 from __future__ import annotations
 
 import time
@@ -35,9 +36,18 @@ BTN_PWR = 11
 
 # Name <-> bit, handy for CLIs / logging.
 NAMES = {
-    "UP": BTN_UP, "DOWN": BTN_DOWN, "LEFT": BTN_LEFT, "RIGHT": BTN_RIGHT,
-    "A": BTN_A, "B": BTN_B, "START": BTN_START, "SELECT": BTN_SELECT,
-    "PAUSE": BTN_PAUSE, "GAME": BTN_GAME, "TIME": BTN_TIME, "PWR": BTN_PWR,
+    "UP": BTN_UP,
+    "DOWN": BTN_DOWN,
+    "LEFT": BTN_LEFT,
+    "RIGHT": BTN_RIGHT,
+    "A": BTN_A,
+    "B": BTN_B,
+    "START": BTN_START,
+    "SELECT": BTN_SELECT,
+    "PAUSE": BTN_PAUSE,
+    "GAME": BTN_GAME,
+    "TIME": BTN_TIME,
+    "PWR": BTN_PWR,
 }
 BIT_NAME = {v: k for k, v in NAMES.items()}
 
@@ -94,6 +104,7 @@ class ShadowCellTransport(InputTransport):
     def open(self) -> "ShadowCellTransport":
         if self._backend is None:
             from .backends import AutoOpenOCDBackend
+
             self._backend = AutoOpenOCDBackend(operation="gwprov input transport")
             self._backend.open()
         return self

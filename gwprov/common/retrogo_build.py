@@ -1,5 +1,4 @@
-"""
-Build the Retro-Go SD firmware, and report what it produced.
+"""Build Retro-Go release artifacts for GWProv's profile staging pipeline.
 
 One function, both targets. gwemu and the device boot the SAME image -- that is
 retro-go's own guiding rule for its emulator integration -- so building is a
@@ -26,20 +25,17 @@ CORE is compiled with. The COVERFLOW fields sit before cheat_* in
 retro_emulator_file_t, so a firmware/core disagreement misaligns pointers rather
 than failing to build. Makefile.core sets the same pair; keep them in step.
 
-We build the `gwemu_release` target rather than `release`, because it depends on
-`release` and additionally lays down the emulator media (qemu_bank1.bin,
-qemu_bank2.bin, extflash.bin, sdcard.img) using the SAME parameters. Retro-go's
-comment on that dependency is explicit: otherwise "the emulator silently boots a
-different firmware than the device and any comparison between them is worthless."
-Consuming those bank images directly is also why nothing here re-implements bank
-placement or padding.
+SD builds use Retro-Go's `release` target and its generated `sd_content` tree.
+Flash builds use `frogfs_image` and `littlefs_image`. GWProv stages the resulting
+files with the same metadata contract used by downloaded Page-dist releases.
 """
 
 import os
-import shutil
+import hashlib
+import json
 import subprocess
-import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Hardcoded relative default by explicit exception: this is the one reference
 # tree we build from. Nothing links against it.
@@ -70,9 +66,8 @@ RELEASE_DEFAULTS = {
     "REMOTE_INPUT": 1,
 }
 
-# Deliberately NOT retro-go's release value of 2. See the module docstring:
-# bank 1 boots directly, which is what a development loop wants.
-DEV_INTFLASH_BANK = 1
+# Retro-Go's release distribution is linked for bank 2.
+RELEASE_INTFLASH_BANK = 2
 
 # External flash sizing. Specify the PHYSICAL PART and the OFFSET; the size is
 # derived. EXTFLASH_SIZE_MB is the USABLE region after the offset, not the part
@@ -90,49 +85,48 @@ DEV_EXTFLASH_OFFSET_MB = 0
 VALID_EXTFLASH_PART_MB = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 MB = 1024 * 1024
 
-# gwemu requires internal-flash bank images of EXACTLY this size and refuses a
-# short backing store ("too small for 'size' option 0x40000") even though it
-# offers to extend it. Both banks are padded to it.
-BANK_SIZE = 256 * 1024
-
 
 @dataclass
 class FirmwareBuild:
     """Where a completed build put things."""
+
     path: str
     intflash_bank: int
-    bank1: str = ""
-    bank2: str = ""
-    extflash: str = ""
-    sdcard: str = ""
     elf: str = ""
     intflash_bin: str = ""
     build_info: str = ""
     params: dict = field(default_factory=dict)
-
-    def missing(self):
-        return [n for n in ("bank1", "bank2", "elf")
-                if not getattr(self, n) or not os.path.exists(getattr(self, n))]
+    variant: str = "sd"
+    frogfs: str = ""
+    littlefs: str = ""
+    sd_content: str = ""
 
 
 def _artifacts(path, bank, params):
     b = os.path.join(path, "build")
     fb = FirmwareBuild(path=path, intflash_bank=bank, params=params)
-    for attr, name in (("bank1", "qemu_bank1.bin"),
-                       ("bank2", "qemu_bank2.bin"),
-                       ("extflash", "extflash.bin"),
-                       ("sdcard", "sdcard.img"),
-                       ("elf", "gw_retro_go.elf"),
-                       ("intflash_bin", "gw_retro_go_intflash.bin"),
-                       ("build_info", "gwemu_build_info.txt")):
+    for attr, name in (
+        ("elf", "gw_retro_go.elf"),
+        ("intflash_bin", "gw_retro_go_intflash.bin"),
+        ("build_info", "gwemu_build_info.txt"),
+    ):
         p = os.path.join(b, name)
         setattr(fb, attr, p if os.path.exists(p) else "")
     return fb
 
 
-def build(path=DEFAULT_FIRMWARE_PATH, clean=False, target="gwemu_release",
-          intflash_bank=None, extflash_part_mb=None, extflash_offset_mb=None,
-          jobs=None, docker=False, extra=None, verbose=True, dry_run=False):
+def build(
+    path=DEFAULT_FIRMWARE_PATH,
+    clean=False,
+    variant="sd",
+    extflash_part_mb=None,
+    extflash_offset_mb=None,
+    jobs=None,
+    docker=False,
+    extra=None,
+    verbose=True,
+    dry_run=False,
+):
     """Build the firmware. Returns FirmwareBuild, or the command list if
     dry_run. Raises on failure."""
     path = os.path.abspath(path)
@@ -141,34 +135,44 @@ def build(path=DEFAULT_FIRMWARE_PATH, clean=False, target="gwemu_release",
     if not os.path.exists(os.path.join(path, "Makefile.common")):
         raise FileNotFoundError(f"{path} does not look like a retro-go checkout")
 
-    params = dict(RELEASE_DEFAULTS)
-    params["INTFLASH_BANK"] = (DEV_INTFLASH_BANK if intflash_bank is None
-                               else intflash_bank)
+    if variant not in {"sd", "flash"}:
+        raise ValueError("variant must be sd or flash")
+    targets = ["release"] if variant == "sd" else ["all", "frogfs_image", "littlefs_image"]
 
-    part_mb = DEV_EXTFLASH_PART_MB if extflash_part_mb is None else extflash_part_mb
-    if part_mb not in VALID_EXTFLASH_PART_MB:
+    params = dict(RELEASE_DEFAULTS)
+    params["SD_CARD"] = 1 if variant == "sd" else 0
+    params["INTFLASH_BANK"] = RELEASE_INTFLASH_BANK
+
+    part_mb = extflash_part_mb
+    off_mb = extflash_offset_mb
+    if part_mb is not None or off_mb is not None:
+        part_mb = DEV_EXTFLASH_PART_MB if part_mb is None else part_mb
+        off_mb = DEV_EXTFLASH_OFFSET_MB if off_mb is None else off_mb
+    if part_mb is not None and part_mb not in VALID_EXTFLASH_PART_MB:
         raise ValueError(
             f"extflash part size {part_mb} MB is not valid; the physical part "
-            f"is a power of two, so use one of {list(VALID_EXTFLASH_PART_MB)}")
+            f"is a power of two, so use one of {list(VALID_EXTFLASH_PART_MB)}"
+        )
 
-    off_mb = DEV_EXTFLASH_OFFSET_MB if extflash_offset_mb is None else extflash_offset_mb
-    if off_mb < 0 or off_mb >= part_mb:
-        raise ValueError(
-            f"extflash offset {off_mb} MB does not fit inside a {part_mb} MB part")
+    if part_mb is not None and (off_mb < 0 or off_mb >= part_mb):
+        raise ValueError(f"extflash offset {off_mb} MB does not fit inside a {part_mb} MB part")
 
     # The usable region is what is LEFT after the offset. retro-go computes
     # EXTFLASH_END = OFFSET + SIZE and that must equal the part size.
-    params["EXTFLASH_OFFSET"] = off_mb * MB
-    params["EXTFLASH_SIZE_MB"] = part_mb - off_mb
+    if part_mb is not None:
+        params["EXTFLASH_OFFSET"] = off_mb * MB
+        params["EXTFLASH_SIZE_MB"] = part_mb - off_mb
     if extra:
         params.update(extra)
+    params["INTFLASH_BANK"] = RELEASE_INTFLASH_BANK
+    params["SD_CARD"] = 1 if variant == "sd" else 0
 
     jobs = jobs or (os.cpu_count() or 4)
     base = ["make", f"-j{jobs}"] + [f"{k}={v}" for k, v in sorted(params.items())]
     if docker:
         base.append("DOCKER=1")
 
-    cmd = base + [target]
+    cmd = base + targets
 
     if dry_run:
         if clean:
@@ -185,17 +189,29 @@ def build(path=DEFAULT_FIRMWARE_PATH, clean=False, target="gwemu_release",
     if verbose:
         print(f"[build_retrogo] {' '.join(cmd)}")
         print(f"[build_retrogo] cwd={path}")
-    res = subprocess.run(cmd, cwd=path)
-    if res.returncode != 0:
-        raise RuntimeError(f"firmware build failed (exit {res.returncode})")
+    for item in targets:
+        res = subprocess.run(base + [item], cwd=path)
+        if res.returncode != 0:
+            raise RuntimeError(f"firmware build target {item!r} failed (exit {res.returncode})")
 
     fb = _artifacts(path, params["INTFLASH_BANK"], params)
-    missing = fb.missing()
+    if int(params["INTFLASH_BANK"]) != 2:
+        raise ValueError(
+            "GWProv profile staging currently requires Retro-Go's bank-2 release layout"
+        )
+    fb.variant = variant
+    fb.frogfs = str(Path(path) / "build/frogfs.bin")
+    fb.littlefs = str(Path(path) / "build/littlefs.bin")
+    fb.sd_content = str(Path(path) / "sd_content")
+    required = ["elf", "intflash_bin"]
+    required += ["sd_content"] if variant == "sd" else ["frogfs", "littlefs"]
+    missing = [
+        name for name in required if not getattr(fb, name) or not Path(getattr(fb, name)).exists()
+    ]
     if missing:
         raise RuntimeError(
-            f"build reported success but these artifacts are missing: {missing}. "
-            f"Target '{target}' may not produce emulator media -- use gwemu_release.")
-    _refresh_bank_images(fb, verbose=verbose)
+            f"build completed but required {variant} artifacts are missing: {missing}"
+        )
 
     # The build flags are not dependencies here, so "I passed REMOTE_INPUT=1"
     # is not evidence that the image has it. Check the image.
@@ -205,49 +221,166 @@ def build(path=DEFAULT_FIRMWARE_PATH, clean=False, target="gwemu_release",
             raise RuntimeError(
                 "REMOTE_INPUT=1 was passed but buttons_get() in the built image "
                 "does not read the shadow cell -- a stale object. Rebuild with "
-                "--clean; --timeline on hardware would press nothing.")
+                "--clean; --timeline on hardware would press nothing."
+            )
         if verbose:
-            print(f"[build_retrogo] REMOTE_INPUT shadow cell "
-                  f"0x{REMOTE_INPUT_ADDR:08X} in image: "
-                  + ("yes" if got else "UNVERIFIED (no arm objdump)"))
+            print(
+                f"[build_retrogo] REMOTE_INPUT shadow cell "
+                f"0x{REMOTE_INPUT_ADDR:08X} in image: "
+                + ("yes" if got else "UNVERIFIED (no arm objdump)")
+            )
 
     if verbose:
         print(f"[build_retrogo] bank{fb.intflash_bank} firmware ready:")
-        for n in ("bank1", "bank2", "extflash", "sdcard", "elf"):
+        for n in ("intflash_bin", "frogfs", "littlefs", "sd_content", "elf"):
             p = getattr(fb, n)
             if p:
                 print(f"    {n:9} {p} ({os.path.getsize(p)} bytes)")
     return fb
 
 
-def _refresh_bank_images(fb, verbose=True):
-    """Re-cut qemu_bank{1,2}.bin from the intflash image this build produced.
+def stage_build(fb: FirmwareBuild, output: str | Path) -> dict:
+    """Stage local build files in the same tree consumed by profile creation."""
+    root = Path(output).expanduser().resolve()
+    marker = root / ".gwprov-firmware.json"
+    if marker.exists():
+        old = json.loads(marker.read_text(encoding="utf-8"))
+        if old.get("origin") != "local-build":
+            raise ValueError(f"refusing to replace a non-build firmware content root: {root}")
+        for rel in old.get("files", []):
+            path = root / rel
+            if path.is_file():
+                path.unlink()
+    elif root.exists() and any(root.iterdir()):
+        raise ValueError(f"refusing to stage over existing unrelated content: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    sources = {
+        "firmware/intflash.bin": Path(fb.intflash_bin),
+        "firmware/retro-go-debug.elf": Path(fb.elf),
+    }
+    if fb.variant == "flash":
+        sources["flash/frogfs.bin"] = Path(fb.frogfs)
+        sources["flash/littlefs.bin"] = Path(fb.littlefs)
+    else:
+        tree = Path(fb.sd_content)
+        if not tree.is_dir():
+            raise ValueError(f"Retro-Go release did not produce its sd_content directory: {tree}")
+        for source in tree.rglob("*"):
+            if source.is_file():
+                sources[(Path("sd") / source.relative_to(tree)).as_posix()] = source
+    entries = []
+    for relative, source in sorted(sources.items()):
+        if not source.is_file():
+            raise ValueError(f"build artifact is missing: {source}")
+        data = source.read_bytes()
+        dest = root / relative
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        entries.append(
+            {"path": relative, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        )
+    abi_version, abi_size = _abi_metadata(fb.elf)
+    source_info = _git_source(fb.path)
+    firmware = {
+        "version": source_info["version"],
+        "providesAbi": {"version": abi_version, "size": abi_size},
+        "superblock": {"magic": "GWLB", "version": 2, "structSize": 36},
+    }
+    metadata = {
+        "origin": "local-build",
+        "repo": source_info["repo"],
+        "version": firmware["version"],
+        "source": source_info,
+        "variant": fb.variant,
+        "build": "make " + ("release" if fb.variant == "sd" else "frogfs_image littlefs_image"),
+        "firmware": firmware,
+        "debugSymbols": "firmware/retro-go-debug.elf",
+        "littlefsBlockSize": int(fb.params.get("LITTLEFS_BLOCK_SIZE", 4096)),
+        "layout": _build_layout(fb),
+        "params": fb.params,
+        "files": [entry["path"] for entry in entries],
+        "artifacts": entries,
+    }
+    marker.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    (root / "manifest.json").write_text(
+        json.dumps({"schemaVersion": 1, "firmware": metadata, "files": entries}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return metadata
 
-    THE EMULATOR IMAGES ARE NOT REBUILT BY `gwemu_release`. Its prep block is
-    guarded by `if [ ! -f build/sdcard.img ]`, so once any gwemu media exists
-    the bank images are never cut again -- every later build updates
-    gw_retro_go_intflash.bin and leaves qemu_bank1.bin at whatever the FIRST
-    build produced. Tier 2 then boots firmware that can be hours old while the
-    build log says success, which is exactly how a REMOTE_INPUT=1 firmware came
-    up with no remote input in it. Same failure shape as the stale SD image in
-    docs/04, one layer down.
 
-    Only the bank the firmware was LINKED for is touched: on a bank-2 build,
-    bank 1 holds the stock-firmware backup and is not ours to overwrite.
-    """
-    src = fb.intflash_bin
-    if not src or not os.path.exists(src):
-        return
-    dst = os.path.join(fb.path, "build",
-                       "qemu_bank2.bin" if fb.intflash_bank == 2
-                       else "qemu_bank1.bin")
-    stale = (not os.path.exists(dst)
-             or os.path.getmtime(dst) < os.path.getmtime(src))
-    pad_bank(src, dst)
-    setattr(fb, "bank2" if fb.intflash_bank == 2 else "bank1", dst)
-    if verbose and stale:
-        print(f"[build_retrogo] refreshed {os.path.basename(dst)} from "
-              f"{os.path.basename(src)} (gwemu_release does NOT)")
+def _git_source(path: str) -> dict:
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments], cwd=path, capture_output=True, text=True, check=False
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    version = git("describe", "--tags", "--always", "--dirty") or "unknown"
+    commit = git("rev-parse", "HEAD") or "unknown"
+    remote = git("remote", "get-url", "origin")
+    import re
+
+    match = re.search(r"(?:github\.com[:/])([^/]+/[^/]+?)(?:\.git)?$", remote)
+    repo = match.group(1).lower() if match else "local/retro-go"
+    return {"repo": repo, "version": version, "commit": commit, "dirty": version.endswith("-dirty")}
+
+
+def _abi_metadata(elf: str) -> tuple[int, int]:
+    """Read the ABI version and struct size at the start of .firmware_abi."""
+    result = subprocess.run(
+        [os.environ.get("OBJDUMP", "arm-none-eabi-objdump"), "-s", "-j", ".firmware_abi", elf],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            "cannot read .firmware_abi from built ELF; install arm-none-eabi-objdump"
+        )
+    import re
+
+    words = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"\s*[0-9a-fA-F]+\s+((?:[0-9a-fA-F]{8}\s*)+)", line)
+        if match:
+            words.extend(re.findall(r"[0-9a-fA-F]{8}", match.group(1)))
+    if not words:
+        raise RuntimeError("built ELF has no readable .firmware_abi data")
+    raw = bytes.fromhex("".join(words))
+    version, size = int.from_bytes(raw[:4], "little"), int.from_bytes(raw[4:8], "little")
+    if version < 1 or size < 8:
+        raise RuntimeError("built ELF has invalid firmware ABI metadata")
+    return version, size
+
+
+def _build_layout(fb: FirmwareBuild) -> dict:
+    if fb.variant == "sd":
+        return {"sd": True}
+    firmware = Path(fb.intflash_bin).read_bytes()
+    locations = [
+        i for i in range(len(firmware) - 36) if firmware[i : i + 8] == b"GWLB\x02\x00\x24\x00"
+    ]
+    if len(locations) != 1:
+        raise RuntimeError(f"expected one GWLB firmware layout record, found {len(locations)}")
+    import struct
+
+    values = struct.unpack_from("<6I", firmware, locations[0] + 8)
+    frogfs_offset, frogfs_bytes, extflash_bytes, _, littlefs_bytes, _ = values
+    if (
+        extflash_bytes <= 0
+        or frogfs_bytes != Path(fb.frogfs).stat().st_size
+        or littlefs_bytes != Path(fb.littlefs).stat().st_size
+        or frogfs_offset + frogfs_bytes > extflash_bytes - littlefs_bytes
+    ):
+        raise RuntimeError("built filesystem images do not match the firmware layout record")
+    return {
+        "extflashBytes": extflash_bytes,
+        "frogfsOffset": frogfs_offset,
+        "frogfsBytes": frogfs_bytes,
+        "littlefsBytes": littlefs_bytes,
+        "littlefsOffset": extflash_bytes - littlefs_bytes,
+    }
 
 
 # The shadow cell a REMOTE_INPUT firmware reads. Keep in sync with
@@ -269,50 +402,16 @@ def verify_remote_input(elf, addr=REMOTE_INPUT_ADDR, objdump=None):
     """
     tool = objdump or os.environ.get("OBJDUMP", "arm-none-eabi-objdump")
     try:
-        out = subprocess.run([tool, "-d", elf, "--disassemble=buttons_get"],
-                             capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(
+            [tool, "-d", elf, "--disassemble=buttons_get"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
     except (OSError, subprocess.CalledProcessError):
-        return None                      # cannot tell; caller decides
+        return None  # cannot tell; caller decides
     import re
+
     words = [int(m, 16) for m in re.findall(r"\.word\s+0x([0-9a-f]+)", out)]
     offs = [int(m) for m in re.findall(r"ldr(?:\.w)?\s+\w+,\s*\[\w+,\s*#(\d+)\]", out)]
     return any(w + o == addr for w in words for o in offs + [0])
-
-
-def pad_bank(src, dst, size=BANK_SIZE):
-    """Copy a bank image padded to exactly `size`. gwemu rejects anything else."""
-    with open(src, "rb") as fh:
-        data = fh.read()
-    if len(data) > size:
-        raise RuntimeError(
-            f"{src} is {len(data)} bytes, larger than a {size}-byte bank")
-    with open(dst, "wb") as fh:
-        fh.write(data.ljust(size, b"\x00"))
-    return dst
-
-
-def stage(fb, dest, sd_image=None, verbose=True):
-    """Copy a build's media into `dest` under the names gwemu expects.
-
-    Bank images are padded to exactly 256 KB -- gwemu refuses a short backing
-    store. The SD image and extflash are copied as-is.
-
-    sd_image overrides the firmware's own sdcard.img -- that is how our core and
-    its /CONFIG get onto the card without touching the firmware tree.
-    """
-    os.makedirs(dest, exist_ok=True)
-    out = {}
-    for attr, name in (("bank1", "qemu_bank1.bin"), ("bank2", "qemu_bank2.bin")):
-        src = getattr(fb, attr)
-        if src and os.path.exists(src):
-            out[attr] = pad_bank(src, os.path.join(dest, name))
-    for attr, name in (("extflash", "extflash.bin"), ("sdcard", "sdcard.img")):
-        src = sd_image if (attr == "sdcard" and sd_image) else getattr(fb, attr)
-        if src and os.path.exists(src):
-            dst = os.path.join(dest, name)
-            shutil.copy(src, dst)
-            out[attr] = dst
-    if verbose:
-        sizes = ", ".join(f"{k}={os.path.getsize(v)}" for k, v in out.items())
-        print(f"[build_retrogo] staged -> {dest} ({sizes})")
-    return out

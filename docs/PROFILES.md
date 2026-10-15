@@ -6,6 +6,10 @@ the map to describe each named component, its destination offset, size, and SHA-
 GWemu receives composed bank images with erased (`0xFF`) padding. Hardware receives
 each component at its mapped offset.
 
+Managed profile names and custom device display names use letters, numbers,
+hyphens, and underscores. Explicit profile directory paths may contain normal
+filesystem characters.
+
 ## Find stock backups
 
 ```console
@@ -37,9 +41,10 @@ and the bootloader as separate components. The default bootloader is the
 vendored `sylverb/game-and-watch-bootloader` v1.0.8 asset linked at
 `0x08032000`; `--sd-bootloader-file` accepts a replacement compiled for that
 address. `--bootloader-file` is for the separate base-address bootloader used
-by content-based profiles. Backup pairs discovered with `gwprov backups
-search` supply the original images. Choose either `-m` or `-z`; when neither
-is specified, the profile contains no stock firmware.
+by content-based profiles. Backup pairs discovered with `gwprov backups add`
+supply the original images. Choose either `-m` or `-z`; when neither is
+specified, a profile created from Retro-Go or staged content contains no stock
+bank 1 firmware.
 
 ## Add Retro-Go
 
@@ -66,15 +71,15 @@ assembling multiple profiles.
 
 Projects can also be installed directly into an existing profile. This updates
 the profile files only; it does not connect to or flash hardware. Use
-`profile PROFILE apply DEVICE` afterward to write the updated profile:
+`profile PROFILE apply device:DEVICE` afterward to write the updated profile:
 
 ```console
-gwprov project install doom --profile dualboot-rg
-gwprov deploy plan dualboot-rg
-gwprov profile dualboot-rg apply DEVICE
+gwprov project install doom profile:dualboot-rg
+gwprov profile dualboot-rg plan
+gwprov profile dualboot-rg apply device:DEVICE
 
 # Preview detected files and destinations without changing the profile
-gwprov project install doom --profile dualboot-rg --dry-run
+gwprov project install doom profile:dualboot-rg --dry-run
 ```
 
 `--variant` is optional. GWProv infers it from the profile's provisioning
@@ -83,6 +88,23 @@ or from a target directory's firmware metadata or existing `flash/` and `sd/`
 subdirectories. A release that publishes only one storage variant also supplies
 an unambiguous default. If these clues do not identify one choice, pass
 `--variant flash` or `--variant sd`.
+
+Local Retro-Go builds use the same staging contract as downloaded releases. The storage
+variant is read from `--profile`; without a profile, specify `--variant`:
+
+```console
+gwprov retro-go build --profile retro-go-profile --output dev-local/retro-go-build
+gwprov profile create retro-go-local --content dev-local/retro-go-build
+
+gwprov retro-go build --variant flash --output dev-local/retro-go-flash --dry-run
+```
+
+The SD build runs Retro-Go's `release` target and stages `sd_content/`. The flash build
+runs `all`, `frogfs_image`, and `littlefs_image`, retaining the built images as direct
+profile components. Both include the unstripped ELF and a manifest containing build
+variables and per-file sizes and SHA-256 hashes. `profile create` places flash images at
+the offsets declared in the firmware layout; it does not rebuild those images. Add or
+remove project files explicitly afterward with the profile media or project commands.
 
 For SD projects, GWProv selects `sd` from a profile configured with a bundled
 SD image; `--variant sd` remains an explicit override. The target profile must contain a
@@ -100,15 +122,15 @@ entries are ignored and never extracted. Unsafe ZIP paths, missing files,
 duplicate names, malformed metadata, or checksum mismatches reject the bundle.
 
 ```console
-gwprov project install ./doom-v1.2.0.zip --profile dualboot-rg
-gwprov deploy plan dualboot-rg
-gwprov profile dualboot-rg apply DEVICE
+gwprov project install ./doom-v1.2.0.zip profile:dualboot-rg
+gwprov profile dualboot-rg plan
+gwprov profile dualboot-rg apply device:DEVICE
 
 # Install and write to a device's assigned profile in one prompted action
-gwprov project install ./doom-v1.2.0.zip --device DEVICE
+gwprov project install ./doom-v1.2.0.zip device:DEVICE
 ```
 
-`--device DEVICE` names a device. That device must have a managed profile
+`device:NAME` names a device. That device must have a managed profile
 assigned. `--yes` accepts the write
 without prompting. For an SD project, the profile needs a bundled SD image; a
 direct device install also requires an assigned registered SD card, which gets
@@ -116,8 +138,8 @@ the project files overlaid while retaining unrelated files.
 
 `--dry-run` shows the resolved project and storage variant, each file's size,
 and where it would be placed in the staging directory, profile, or assigned SD
-card. With `--device`, it reads the saved assignment but does not poll or
-connect to hardware. Add `--format json` for structured output.
+card. With a `device:NAME` target, it reads the saved assignment without opening
+a hardware debug connection. Add `--format json` for structured output.
 
 Projects with mapped XiP artifacts, such as GBA cores, are placed in FrogFS
 uncompressed and relocated when that filesystem is composed. Newly created
@@ -127,12 +149,12 @@ stay local and must be supplied to the converter, including for an offline
 bundle:
 
 ```console
-gwprov project install ./project-bundle.zip --profile dualboot-rg \
+gwprov project install ./project-bundle.zip profile:dualboot-rg \
   --input base=./supported-rom.sfc --dry-run
-gwprov project install ./project-bundle.zip --profile dualboot-rg \
+gwprov project install ./project-bundle.zip profile:dualboot-rg \
   --input base=./supported-rom.sfc
-gwprov deploy plan dualboot-rg
-gwprov profile dualboot-rg apply DEVICE
+gwprov profile dualboot-rg plan
+gwprov profile dualboot-rg apply device:DEVICE
 ```
 
 Mapped payload placement depends on the final FrogFS composition, so the dry-run
@@ -150,18 +172,16 @@ Bundle checksums prove the archive is internally consistent, but they do not
 authenticate the publisher. The install result labels this source accordingly.
 Use `--format json` for a structured result suitable for scripts.
 
-## Import custom images
+## Custom flash components and map format
 
-```console
-gwprov profile create custom-profile ./images
-```
+`gwprov profile create NAME DIRECTORY` is not currently a raw-image import
+command. Profile creation accepts stock selections, a listed Retro-Go release,
+or a GWProv staged content root through `--content`. After creating a profile,
+use `profile PROFILE edit add|remove` to change named flash components.
 
-Without `flash-map.yaml`, the import recognizes `bank0.bin`, `bank1.bin`,
-optional `bank2.bin`, and `sdcard.img` or `sdcard.qcow2`. `bank0` is external
-flash (extflash). Offset filenames such as `bank0@0.bin`,
-`bank0@0x400000.bin`, and `bank0@1M.bin` set the component's byte offset. A
-plain `bank0.bin` starts at offset zero. When supplied, `flash-map.yaml` is the
-authoritative mapping and uses this form:
+Profiles record those components in `flash-map.yaml`. Its keys are `bank1`,
+`bank2`, and `bank0` (extflash); each entry records a name, file, byte offset,
+byte size, and SHA-256, for example:
 
 ```yaml
 bank1:
@@ -189,12 +209,12 @@ time, and the 256 MiB addressable limit.
 ## Edit a profile
 
 ```console
-gwprov profile edit mario-stock add bank0 "Mario Assets" ./assets.bin --offset 0
-gwprov profile edit mario-stock add bank2 "Retro-Go v2.0.0-rc15" ./retro-go.bin --offset 0
-gwprov profile edit mario-stock remove bank0 "Mario Assets"
-gwprov profile edit mario-stock --sdcard ./sdcard.img
-gwprov profile edit mario-stock --no-sdcard
-gwprov profile edit mario-stock --sdcard-size 256
+gwprov profile mario-stock edit add bank0 "Mario Assets" ./assets.bin --offset 0
+gwprov profile mario-stock edit add bank2 "Retro-Go v2.0.0-rc15" ./retro-go.bin --offset 0
+gwprov profile mario-stock edit remove bank0 "Mario Assets"
+gwprov profile mario-stock edit --sdcard ./sdcard.img
+gwprov profile mario-stock edit --no-sdcard
+gwprov profile mario-stock edit --sdcard-size 256
 ```
 
 Adding or replacing a flash component updates its map and composed images. An
@@ -207,12 +227,12 @@ Retro-Go's `/CONFIG` is changed inline; there is no separate config editor or
 config build step:
 
 ```console
-gwprov retro-go config PROFILE
-gwprov retro-go config --profile PROFILE --auto-start /homebrews/demo.bin --timeout 0
-gwprov retro-go config --profile PROFILE --no-auto-start
+gwprov retro-go config profile:PROFILE
+gwprov retro-go config profile:PROFILE --auto-start /homebrews/demo.bin --timeout 0
+gwprov retro-go config profile:PROFILE --no-auto-start
 ```
 
-For hardware, use its device name or stable ID instead of `PROFILE`. GWProv
+For hardware, use `device:NAME` instead of `profile:NAME`. GWProv
 updates the assigned profile's LittleFS image and deploys only that region after
 the normal write confirmation. Add `--yes` to skip the confirmation. Use
 `--output FILE` to save the resulting 416-byte CONFIG blob.
@@ -220,20 +240,27 @@ the normal write confirmation. Add `--yes` to skip the confirmation. Use
 Inspect profile storage with the same object-first form:
 
 ```console
-gwprov profile PROFILE filesystem tree
-gwprov profile PROFILE filesystem tree frogfs
-gwprov profile PROFILE filesystem tree littlefs
-gwprov profile PROFILE filesystem tree sdcard
+gwprov profile PROFILE media tree /
+gwprov profile PROFILE media tree /CONFIG
+gwprov profile PROFILE media tree /data --sdcard
+gwprov profile PROFILE media add ./homebrews --dest /
+gwprov profile PROFILE media delete /CONFIG
 ```
 
-An empty selector shows every filesystem present. Asking for `sdcard` on a
-profile without an SD image produces a direct error.
+`media add` infers the content store from the profile variant and destination.
+For flash profiles, `/bios`, `/fonts`, and `/homebrews` go to FrogFS; other
+paths go to LittleFS. Use `--contiguous` to force uncompressed FrogFS storage,
+or `--sentinel ADDRESS` to relocate sentinel based pointers in a single file to
+its final FrogFS address. `--sdcard` selects the profile's SD image and cannot
+be combined with either option. A source directory keeps its basename beneath
+`--dest`, which defaults to `/`, and GWProv creates parent directories as
+needed. `ls` and `tree` accept a file path as well as a directory path.
 
 ## Plan and flash
 
 ```console
-gwprov deploy plan mario-stock
-gwprov profile mario-stock apply probe:PROBE_ID
+gwprov profile mario-stock plan
+gwprov profile mario-stock apply device:probe:PROBE_ID
 ```
 
 Review the plan's target bank, component names, offsets, and human-readable sizes

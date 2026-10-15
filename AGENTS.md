@@ -18,7 +18,7 @@ its changes:
   Before any flow calls `GnW.start_gnwmanager()`, passively inspect the
   gnwmanager mailbox, DHCSR, and VTOR. Mark the lease as requiring recovery
   before entering the RAM service, and clear that marker only after verified
-  return to application firmware. `gwprov device recover` is the explicit
+  return to application firmware. `gwprov device DEVICE recover` is the explicit
   transition out of an idle Recovery Mode stub.
 - **Systems integrator:** Keep local hardware, remote gnwmanager, and GWemu
   workflows coherent while respecting the different transports and side
@@ -41,34 +41,35 @@ the next level of help. A command map should describe the real parser hierarchy;
 any machine-facing representation used by shell completion must remain
 deterministic and free of color or layout glyphs.
 
-## Command scope and active device
+## Command scope and target selection
 
 - Keep three scopes clear in the command tree: GWProv-wide inventory and
-  configuration, all-device inventory, and controls for the selected device.
-- `gwprov show` is the concise overview; `adapters`, `devices`, `projects`,
-  `profile`, `perf`, and `sdcard` are first-class top-level resource commands. Their
+  configuration, all-device inventory through `gwprov device ls`, and operations on one explicitly named
+  device or profile. Never store or infer a current device selection.
+- Put device actions under `gwprov device DEVICE ACTION`; put profile actions
+  under `gwprov profile PROFILE ACTION`. Commands that accept either resource
+  use one positional target and accept `device:NAME` or `profile:NAME` prefixes.
+  Reject ambiguous bare names instead of guessing.
+- `gwprov show` is the concise overview; `adapters`, `device ls`, `project`,
+  `profile`, and `media` are first-class top-level resource commands. Their
   `show CATEGORY` forms remain concise dashboard views. `gwprov ps` remains the
-  detailed live-state view. Do not duplicate its technical columns in `devices`.
-- Keep SD-card resource operations and SD-image file operations under the single
-  `sdcard` command (`add/list/remove/create/compose`). Preserve `sd` as a short
-  command alias rather than presenting a second SD concept in help or the tree.
+  detailed live-state view. Do not duplicate its technical columns in `device ls`.
+- Keep SD-card registration and image operations under `gwprov media sdcard`
+  (`add/list/remove/create/compose`). Preserve `sd` as a short subcommand alias
+  rather than presenting a second SD concept in help or the tree.
 - Register remote `gnwmanager serve` endpoints under `gwprov adapters`; one
   endpoint represents one device. Store per-user adapter configuration in the
   platform config directory and honor `GWPROV_CONFIG_DIR`.
-- `gwprov set active DEVICE` stores a per-user device ID. Commands that control
-  one device should use this selection when an explicit target is omitted, and
-  fail with a direct message if the selection is missing, stale, or the wrong
-  device kind. Never silently pick the first adapter or VM.
-- `gwprov set profile PROFILE` and `gwprov set sdcard CARD` attach managed
-  resources to the active device. `gwprov apply` consumes those assignments:
-  it launches the assigned profile for GWemu or deploys it to hardware. A
-  registered SD-card path is an already-mounted folder/drive; registration
-  never formats media. Applying its profile overlays files and retains extras.
+- Device operations require an explicit device name or stable ID. Profile
+  assignments remain metadata attached to a device, and profile deployment
+  names both the profile and destination device. A registered SD-card path is
+  an already-mounted folder/drive; registration never formats media. Applying
+  its profile overlays files and retains extras.
 - Shell completion must query local profile, device, and SD-card registries
   through script-friendly output modes. Device completion must not poll QMP or
   open a physical debug session.
-- Keep device-interacting commands shallow in the tree and group them under
-  selected-device controls. Label remaining directory-driven firmware tasks
+- Keep device-interacting commands grouped under the explicit `device DEVICE`
+  noun. Label remaining directory-driven firmware tasks
   (`retro-go`, `ofw`) as file workflows that are not yet device-scoped; keep
   project-catalog commands in their own group.
 - Filesystem edits must make the target and side effect clear. FrogFS edits
@@ -78,8 +79,7 @@ deterministic and free of color or layout glyphs.
   data.
 - Keep profile-name workflows distinct from direct image-file workflows, but
   expose them through the same filesystem verbs where their behavior is the
-  same. Preserve existing commands as aliases or compatible entry points while
-  transitioning help and completion.
+  same. Do not retain superseded command spellings as compatibility aliases.
 
 ## Pre-reset hardware diagnosis
 

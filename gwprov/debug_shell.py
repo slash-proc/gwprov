@@ -6,12 +6,14 @@ import code
 import errno
 import inspect
 import json
+import os
 import re
 import shutil
 import socket
 import subprocess
 import tempfile
 import time
+import uuid
 import textwrap
 import zipfile
 import xml.etree.ElementTree as ET
@@ -45,6 +47,7 @@ class SymbolTable:
 
     def load(self, path: str | Path) -> int:
         from .debug_types import clear_layout_caches
+
         clear_layout_caches()
         elf = Path(path).expanduser().resolve()
         if not elf.is_file():
@@ -71,29 +74,41 @@ class SymbolTable:
                 if not symbol.name:
                     continue
                 name = symbol.name
-                if str(symbol['st_info']['type']) == 'STT_FILE':
+                if str(symbol["st_info"]["type"]) == "STT_FILE":
                     current_file = name
-                if (str(symbol['st_info']['bind']) == 'STB_LOCAL' and current_file
-                        and str(symbol['st_info']['type']) != 'STT_FILE'):
+                if (
+                    str(symbol["st_info"]["bind"]) == "STB_LOCAL"
+                    and current_file
+                    and str(symbol["st_info"]["type"]) != "STT_FILE"
+                ):
                     self._symbol_file_hints[name] = current_file
                 else:
                     self._symbol_file_hints.pop(name, None)
                 if str(symbol["st_info"]["type"]) == "STT_FUNC":
                     section_index = symbol["st_shndx"]
-                    function_rows.append({"name": name, "address": int(symbol["st_value"]),
-                                          "size": int(symbol["st_size"]),
-                                          "section": section_names.get(section_index),
-                                          "elf": str(elf), "type": "STT_FUNC"})
+                    function_rows.append(
+                        {
+                            "name": name,
+                            "address": int(symbol["st_value"]),
+                            "size": int(symbol["st_size"]),
+                            "section": section_names.get(section_index),
+                            "elf": str(elf),
+                            "type": "STT_FUNC",
+                        }
+                    )
                 self._symbols[name] = int(symbol["st_value"])
                 owned_symbols[name] = int(symbol["st_value"])
                 self._symbol_owners[name] = elf
                 self._symbol_types[name] = str(symbol["st_info"]["type"])
                 self._symbol_sizes[name] = int(symbol["st_size"])
                 section_index = symbol["st_shndx"]
-                owned_meta[name] = {"type": str(symbol["st_info"]["type"]),
-                                    "size": int(symbol["st_size"]),
-                                    "section": section_names.get(section_index)
-                                    if isinstance(section_index, int) else None}
+                owned_meta[name] = {
+                    "type": str(symbol["st_info"]["type"]),
+                    "size": int(symbol["st_size"]),
+                    "section": (
+                        section_names.get(section_index) if isinstance(section_index, int) else None
+                    ),
+                }
                 if isinstance(section_index, int):
                     section = section_names.get(section_index)
                     if section:
@@ -115,12 +130,14 @@ class SymbolTable:
         """Return original DWARF CU source and compiler producer strings in order."""
         selected = Path(elf).expanduser().resolve() if elf is not None else None
         result = []
+
         def value(die, name):
             attribute = die.attributes.get(name)
             if attribute is None:
                 return None
             raw = attribute.value
             return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+
         for owner in self.sources:
             if owner in self._map_sources or (selected is not None and owner != selected):
                 continue
@@ -128,12 +145,17 @@ class SymbolTable:
                 dwarf = ELFFile(stream).get_dwarf_info()
                 for cu in dwarf.iter_CUs():
                     die = cu.get_top_DIE()
-                    result.append({"elf": str(owner), "offset": cu.cu_offset,
-                                   "source": value(die, "DW_AT_name"),
-                                   "directory": value(die, "DW_AT_comp_dir"),
-                                   "producer": value(die, "DW_AT_producer"),
-                                   "language": value(die, "DW_AT_language"),
-                                   "dwarf_version": cu["version"]})
+                    result.append(
+                        {
+                            "elf": str(owner),
+                            "offset": cu.cu_offset,
+                            "source": value(die, "DW_AT_name"),
+                            "directory": value(die, "DW_AT_comp_dir"),
+                            "producer": value(die, "DW_AT_producer"),
+                            "language": value(die, "DW_AT_language"),
+                            "dwarf_version": cu["version"],
+                        }
+                    )
         if selected is not None and selected not in self.sources:
             raise ValueError(f"ELF is not loaded: {selected}")
         return result
@@ -141,6 +163,7 @@ class SymbolTable:
     def compact_debug(self, output: str | Path, *, elf: str | Path | None = None) -> dict:
         """Create a separate compressed-debug ELF without changing loadable data."""
         from .elf_tools import compact_debug
+
         choices = [source for source in self.sources if source not in self._map_sources]
         if elf is None:
             if len(choices) != 1:
@@ -175,16 +198,23 @@ class SymbolTable:
             kind = "STT_FUNC" if entry["kind"] == "function" else "STT_OBJECT"
             self._symbols[name] = entry["address"]
             owned_symbols[name] = entry["address"]
-            owned_meta[name] = {"type": kind, "size": entry["size"],
-                                "section": entry["section"]}
+            owned_meta[name] = {"type": kind, "size": entry["size"], "section": entry["section"]}
             self._symbol_owners[name] = owner
             self._symbol_types[name] = kind
             self._symbol_sizes[name] = entry["size"]
             self._symbol_sections[name] = entry["section"]
             if kind == "STT_FUNC":
-                functions.append({"name": name, "address": entry["address"],
-                                  "size": entry["size"], "section": entry["section"],
-                                  "type": kind, "elf": str(owner), "source_format": "routine-map"})
+                functions.append(
+                    {
+                        "name": name,
+                        "address": entry["address"],
+                        "size": entry["size"],
+                        "section": entry["section"],
+                        "type": kind,
+                        "elf": str(owner),
+                        "source_format": "routine-map",
+                    }
+                )
         self._function_sources[owner] = functions
         self._symbols_by_elf[owner] = owned_symbols
         self._symbol_meta_by_elf[owner] = owned_meta
@@ -195,6 +225,7 @@ class SymbolTable:
     def load_config(self, path) -> dict:
         """Read a local developer's ELF/map, relocation and progress description."""
         from .debug_config import load_debug_config
+
         return load_debug_config(path, self)
 
     def __getitem__(self, name: str) -> int:
@@ -244,7 +275,7 @@ class SymbolTable:
             for section, (_, size) in sections.items():
                 if not section.startswith(".xip_"):
                     continue
-                stem = section[len(".xip_"):]
+                stem = section[len(".xip_") :]
                 pointer = rows.get(f"{stem}_xip_runtime_base")
                 if not pointer or pointer["type"] != "STT_OBJECT" or pointer["size"] < 4:
                     continue
@@ -269,9 +300,12 @@ class SymbolTable:
     def type_layout(self, symbol: str) -> dict:
         """Describe a global's C layout from its owning ELF's DWARF."""
         from .debug_types import variable_layout
+
         if self.owner(symbol) in self._map_sources:
             raise ValueError("compact symbol maps have no DWARF type layouts")
-        return variable_layout(self.owner(symbol), symbol, self.source_hint(symbol), self.link_address(symbol))
+        return variable_layout(
+            self.owner(symbol), symbol, self.source_hint(symbol), self.link_address(symbol)
+        )
 
     def nm(self, query: str = "", elf: str | Path | None = None) -> list[dict]:
         """Return structured nm-style symbol rows, optionally filtered by ELF."""
@@ -285,15 +319,22 @@ class SymbolTable:
                 meta = self._symbol_meta_by_elf.get(owner, {}).get(name, {})
                 section = meta.get("section")
                 address += self._section_deltas.get((owner, section), 0) if section else 0
-                rows.append({"name": name, "address": address,
-                             "size": meta.get("size", 0),
-                             "type": meta.get("type", ""),
-                             "section": section, "elf": str(owner)})
+                rows.append(
+                    {
+                        "name": name,
+                        "address": address,
+                        "size": meta.get("size", 0),
+                        "type": meta.get("type", ""),
+                        "section": section,
+                        "elf": str(owner),
+                    }
+                )
         return sorted(rows, key=lambda row: (row["address"], row["name"]))
 
     def disassembly_tool(self, symbol: str) -> dict:
         """Report the ELF machine and selected executable/version for a symbol."""
         from .elf_binutils import select_elf_tool
+
         owner = self.owner(symbol)
         if owner in self._map_sources:
             raise ValueError("ELF disassembly requires an ELF, not a compact symbol map")
@@ -303,21 +344,26 @@ class SymbolTable:
         """Disassemble one symbol with binutils selected for its ELF machine."""
         if symbol not in self._symbols:
             raise KeyError(f"symbol {symbol!r} is not loaded")
-        owner = (Path(elf).expanduser().resolve() if elf is not None
-                 else self._symbol_owners[symbol])
+        owner = Path(elf).expanduser().resolve() if elf is not None else self._symbol_owners[symbol]
         if self._symbol_owners[symbol] != owner:
             raise ValueError(f"symbol {symbol!r} does not belong to {owner}")
         if owner in self._map_sources:
             raise ValueError("ELF disassembly requires an ELF, not a compact symbol map")
         from .elf_binutils import select_elf_tool
+
         selection = select_elf_tool(owner, "objdump")
         try:
             result = subprocess.run(
                 [selection["path"], "-d", "-C", f"--disassemble={symbol}", str(owner)],
-                check=True, capture_output=True, text=True)
+                check=True,
+                capture_output=True,
+                text=True,
+            )
         except subprocess.CalledProcessError as error:
-            raise ValueError(f"{selection['path']} cannot disassemble ELF machine "
-                             f"{selection['machine']}: {error.stderr.strip()}") from error
+            raise ValueError(
+                f"{selection['path']} cannot disassemble ELF machine "
+                f"{selection['machine']}: {error.stderr.strip()}"
+            ) from error
         return result.stdout
 
     def source_locations(self, addresses) -> list[dict]:
@@ -336,9 +382,20 @@ class SymbolTable:
         for owner, links in groups.items():
             try:
                 output = subprocess.run(
-                    [tool, "-a", "-f", "-C", "-i", "-e", str(owner),
-                     *[hex(link) for link in links]],
-                    check=True, capture_output=True, text=True).stdout
+                    [
+                        tool,
+                        "-a",
+                        "-f",
+                        "-C",
+                        "-i",
+                        "-e",
+                        str(owner),
+                        *[hex(link) for link in links],
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
                 decoded = {}
                 current = None
                 for line in output.splitlines():
@@ -349,45 +406,80 @@ class SymbolTable:
                         decoded[current].append(line)
                 for link, runtime_addresses in links.items():
                     lines = decoded.get(link, [])
-                    frames = [{"function": lines[i], "file": lines[i + 1]}
-                              for i in range(0, len(lines) - 1, 2)]
+                    frames = [
+                        {"function": lines[i], "file": lines[i + 1]}
+                        for i in range(0, len(lines) - 1, 2)
+                    ]
                     for address in runtime_addresses:
-                        results[address] = {"address": address, "link_address": link,
-                            "elf": str(owner), "available": bool(frames), "frames": frames}
+                        results[address] = {
+                            "address": address,
+                            "link_address": link,
+                            "elf": str(owner),
+                            "available": bool(frames),
+                            "frames": frames,
+                        }
             except (OSError, subprocess.SubprocessError) as exc:
                 for link, runtime_addresses in links.items():
                     for address in runtime_addresses:
-                        results[address] = {"address": address, "link_address": link,
-                            "elf": str(owner), "available": False, "reason": str(exc)}
+                        results[address] = {
+                            "address": address,
+                            "link_address": link,
+                            "elf": str(owner),
+                            "available": False,
+                            "reason": str(exc),
+                        }
         return [results[address] for address in addresses]
 
     def source_location(self, address: int, elf: str | Path | None = None) -> dict:
         """Resolve a runtime PC to source lines, accounting for section rebases."""
         owner_info = self._owner_for_pc(address, elf)
         if owner_info is None:
-            return {"address": address, "available": False,
-                    "reason": "address is outside loaded ELF sections"}
+            return {
+                "address": address,
+                "available": False,
+                "reason": "address is outside loaded ELF sections",
+            }
         owner, link_address = owner_info
         if owner in self._map_sources:
-            return {"address": address, "link_address": link_address,
-                    "symbol_source": str(owner), "available": False,
-                    "reason": "compact symbol map names routines but has no source/DWARF"}
+            return {
+                "address": address,
+                "link_address": link_address,
+                "symbol_source": str(owner),
+                "available": False,
+                "reason": "compact symbol map names routines but has no source/DWARF",
+            }
         tool = shutil.which("arm-none-eabi-addr2line") or shutil.which("addr2line")
         if not tool:
-            return {"address": address, "available": False,
-                    "elf": str(owner), "reason": "arm-none-eabi-addr2line or addr2line is required"}
+            return {
+                "address": address,
+                "available": False,
+                "elf": str(owner),
+                "reason": "arm-none-eabi-addr2line or addr2line is required",
+            }
         try:
             result = subprocess.run(
                 [tool, "-f", "-C", "-i", "-e", str(owner), hex(link_address)],
-                check=True, capture_output=True, text=True)
+                check=True,
+                capture_output=True,
+                text=True,
+            )
         except (OSError, subprocess.SubprocessError) as exc:
-            return {"address": address, "link_address": link_address,
-                    "elf": str(owner), "available": False, "reason": str(exc)}
+            return {
+                "address": address,
+                "link_address": link_address,
+                "elf": str(owner),
+                "available": False,
+                "reason": str(exc),
+            }
         rows = [row for row in result.stdout.splitlines() if row]
-        frames = [{"function": rows[i], "file": rows[i + 1]}
-                  for i in range(0, len(rows) - 1, 2)]
-        return {"address": address, "link_address": link_address,
-                "elf": str(owner), "available": bool(frames), "frames": frames}
+        frames = [{"function": rows[i], "file": rows[i + 1]} for i in range(0, len(rows) - 1, 2)]
+        return {
+            "address": address,
+            "link_address": link_address,
+            "elf": str(owner),
+            "available": bool(frames),
+            "frames": frames,
+        }
 
     def code_context(self, address: int, radius: int = 4) -> dict:
         """Return nearby disassembly for a sampled PC when a loaded ELF covers it."""
@@ -401,18 +493,30 @@ class SymbolTable:
             if owner:
                 break
         if owner is None:
-            return {"address": address, "available": False,
-                    "reason": "PC is outside loaded ELF sections"}
+            return {
+                "address": address,
+                "available": False,
+                "reason": "PC is outside loaded ELF sections",
+            }
         symbol = self.nearest(address, elf=owner)
         if not symbol:
-            return {"address": address, "available": False,
-                    "elf": str(owner), "reason": "no preceding symbol"}
+            return {
+                "address": address,
+                "available": False,
+                "elf": str(owner),
+                "reason": "no preceding symbol",
+            }
         name = symbol["name"]
         try:
             listing = self.disassemble(name, elf=owner)
         except (KeyError, ValueError, OSError, subprocess.SubprocessError) as exc:
-            return {"address": address, "available": False,
-                    "symbol": symbol, "elf": str(owner), "reason": str(exc)}
+            return {
+                "address": address,
+                "available": False,
+                "symbol": symbol,
+                "elf": str(owner),
+                "reason": str(exc),
+            }
         section = symbol.get("section")
         delta = self._section_deltas.get((owner, section), 0) if section else 0
         link_pc = (address & ~1) - delta
@@ -422,15 +526,22 @@ class SymbolTable:
             if match:
                 instructions.append((int(match.group(1), 16), line.rstrip()))
         if not instructions:
-            return {"address": address, "available": False,
-                    "symbol": symbol, "elf": str(owner),
-                    "reason": "objdump returned no instructions"}
-        index = min(range(len(instructions)),
-                    key=lambda i: abs(instructions[i][0] - link_pc))
-        selected = instructions[max(0, index - radius):index + radius + 1]
-        return {"address": address, "link_address": link_pc,
-                "symbol": symbol, "elf": str(owner),
-                "instructions": [line for _, line in selected]}
+            return {
+                "address": address,
+                "available": False,
+                "symbol": symbol,
+                "elf": str(owner),
+                "reason": "objdump returned no instructions",
+            }
+        index = min(range(len(instructions)), key=lambda i: abs(instructions[i][0] - link_pc))
+        selected = instructions[max(0, index - radius) : index + radius + 1]
+        return {
+            "address": address,
+            "link_address": link_pc,
+            "symbol": symbol,
+            "elf": str(owner),
+            "instructions": [line for _, line in selected],
+        }
 
     def sections(self, elf: str | Path | None = None) -> dict[str, tuple[int, int]]:
         """Return section link-time bases and sizes for a loaded ELF."""
@@ -442,8 +553,9 @@ class SymbolTable:
             owner = Path(elf).expanduser().resolve()
         return dict(self._sections[owner])
 
-    def nearest(self, address: int, elf: str | Path | None = None,
-                max_distance: int | None = None) -> dict | None:
+    def nearest(
+        self, address: int, elf: str | Path | None = None, max_distance: int | None = None
+    ) -> dict | None:
         """Return the closest preceding symbol and its offset from an address."""
         selected = Path(elf).expanduser().resolve() if elf is not None else None
         lookup_address = address & ~1
@@ -465,13 +577,13 @@ class SymbolTable:
                 candidates.append((value, "STT_FUNC", row["name"], owner))
         if not candidates:
             return None
-        value, kind, name, owner = max(candidates,
-                                       key=lambda item: (item[0], item[1] == "STT_FUNC"))
+        value, kind, name, owner = max(
+            candidates, key=lambda item: (item[0], item[1] == "STT_FUNC")
+        )
         offset = lookup_address - value
         if max_distance is not None and offset > max_distance:
             return None
-        return {"name": name, "address": value, "offset": offset,
-                "type": kind, "elf": str(owner)}
+        return {"name": name, "address": value, "offset": offset, "type": kind, "elf": str(owner)}
 
     def _frame_entries(self, owner: Path) -> list[tuple[int, int, FDE]]:
         if owner in self._map_sources:
@@ -499,8 +611,7 @@ class SymbolTable:
                     return owner, address - self._section_deltas.get((owner, section), 0)
         return None
 
-    def unwind(self, registers: dict[str, int], read_memory,
-               max_frames: int = 32) -> dict:
+    def unwind(self, registers: dict[str, int], read_memory, max_frames: int = 32) -> dict:
         """Unwind ARM frames using the loaded ELF .debug_frame CFI."""
         current = {index: registers.get(f"r{index}", 0) for index in range(13)}
         current[13] = registers.get("sp", 0)
@@ -519,8 +630,11 @@ class SymbolTable:
             seen.add((pc, sp))
             located = self._owner_for_pc(pc)
             owner = located[0] if located else None
-            frame = {"index": index, "pc": pc,
-                     "symbol": self.nearest(pc, elf=owner) if owner else None}
+            frame = {
+                "index": index,
+                "pc": pc,
+                "symbol": self.nearest(pc, elf=owner) if owner else None,
+            }
             frames.append(frame)
             if owner is None:
                 reason = "PC is outside loaded ELF sections"
@@ -544,8 +658,9 @@ class SymbolTable:
                 break
 
             table = fde.get_decoded().table
-            row = next((candidate for candidate in reversed(table)
-                        if candidate["pc"] <= link_pc), None)
+            row = next(
+                (candidate for candidate in reversed(table) if candidate["pc"] <= link_pc), None
+            )
             if row is None:
                 reason = "no unwind rule for PC"
                 break
@@ -567,8 +682,7 @@ class SymbolTable:
                 elif rule.type == RegisterRule.SAME_VALUE:
                     pass
                 elif rule.type == RegisterRule.OFFSET:
-                    previous[regnum] = int.from_bytes(
-                        read_memory(cfa + rule.arg, 4), "little")
+                    previous[regnum] = int.from_bytes(read_memory(cfa + rule.arg, 4), "little")
                 elif rule.type == RegisterRule.VAL_OFFSET:
                     previous[regnum] = cfa + rule.arg
                 elif rule.type == RegisterRule.REGISTER:
@@ -655,6 +769,7 @@ class GwemuGDBBackend(GDBBackend):
         # A register-bank read synchronizes with the interrupt while the
         # transport consumes any asynchronous stop packet, preserving hooks.
         from .qmp import record_control_request
+
         record_control_request(getattr(self, "_control_audit_socket", None), "gdb", "halt")
         self._write(b"\x03")
         reply = self._send_command(b"g")
@@ -666,12 +781,14 @@ class GwemuGDBBackend(GDBBackend):
             self._is_running = False
             return
         from .qmp import record_control_request
+
         record_control_request(getattr(self, "_control_audit_socket", None), "gdb", "resume")
         return super().resume()
 
     def single_step(self):
         """Consume the step stop packet; the base transport treats it as asynchronous."""
         from .qmp import record_control_request
+
         record_control_request(getattr(self, "_control_audit_socket", None), "gdb", "step")
         packet = b"$s#73"
         self._write(packet)
@@ -692,8 +809,12 @@ class GwemuGDBBackend(GDBBackend):
     def open(self, *, halt: bool = False):
         """Attach without releasing a paused target when halt=True."""
         from .qmp import record_control_request
-        record_control_request(getattr(self, "_control_audit_socket", None), "gdb",
-                               "attach_halted" if halt else "attach_resume")
+
+        record_control_request(
+            getattr(self, "_control_audit_socket", None),
+            "gdb",
+            "attach_halted" if halt else "attach_resume",
+        )
         self._opening_halted = halt
         try:
             super().open()
@@ -713,10 +834,11 @@ class GwemuGDBBackend(GDBBackend):
 
     def _register_index(self, name: str) -> int:
         key = name.lower()
-        aliases = {"msp": "sp", "r13": "sp", "r14": "lr", "r15": "pc",
-                   "cpsr": "xpsr"}
+        aliases = {"msp": "sp", "r13": "sp", "r14": "lr", "r15": "pc", "cpsr": "xpsr"}
         key = aliases.get(key, key)
         if key not in self.register_numbers:
+            if not self.register_numbers:
+                return self._get_reg_idx(key)
             raise ValueError(f"target does not advertise register {name!r}")
         return self.register_numbers[key]
 
@@ -743,8 +865,7 @@ class GwemuGDBBackend(GDBBackend):
             if len(raw) < 16 * 4:
                 raise RuntimeError(f"short GDB core-register packet ({len(raw)} bytes)")
             names = [*(f"r{i}" for i in range(13)), "sp", "lr", "pc"]
-            values = [int.from_bytes(raw[i * 4:i * 4 + 4], "little")
-                      for i in range(16)]
+            values = [int.from_bytes(raw[i * 4 : i * 4 + 4], "little") for i in range(16)]
             return dict(zip(names, values))
         finally:
             if was_running:
@@ -761,6 +882,100 @@ class GwemuGDBBackend(GDBBackend):
             self.resume()
         if reply != b"OK":
             raise RuntimeError(f"register write failed: {reply!r}")
+
+
+class RemoteGDBBackend(GwemuGDBBackend):
+    """Direct TCP GDB backend with optional target XML register numbering."""
+
+    def __init__(
+        self, host: str, port: int, *, url: str | None = None,
+        operation: str = "gwprov debug session", daemon_managed: bool = False
+    ):
+        super().__init__(host=host, port=port)
+        from .target_leases import TargetLease
+
+        self.endpoint = url or f"gdb://{host}:{port}"
+        self.daemon_managed = daemon_managed
+        self._monitor_pause_token: str | None = None
+        self._remote_lease = TargetLease(
+            f"remote-gdb:{self.endpoint}",
+            operation,
+            wait=0,
+            register_with_daemon=False,
+            daemon_owned=daemon_managed,
+        )
+        self.target_xml_error: str | None = None
+
+    def open(self):
+        from gnwmanager.ocdbackend.gdb_backend import GDBError
+        from contextlib import suppress
+
+        try:
+            if not self.daemon_managed:
+                self._monitor_pause_token = f"remote-gdb-{os.getpid()}-{uuid.uuid4().hex}"
+                from .daemon import pause_device_monitor
+
+                pause_device_monitor(
+                    f"remote-gdb:{self.endpoint}",
+                    self._monitor_pause_token,
+                    os.getpid(),
+                    30.0,
+                )
+            self._remote_lease.acquire()
+            # The generic GDBBackend.open() sends `c` after qSupported because
+            # QEMU's stub used to stop the VM on connect. A raw remote server
+            # may be attached to live hardware, so connect and negotiate only;
+            # never change execution state as an implicit attach side effect.
+            try:
+                self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._socket.settimeout(5.0)
+                self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self._socket.connect((self.host, self.port))
+                self._sock_file = self._socket.makefile("rb", buffering=8192)
+                with suppress(GDBError):
+                    self._send_command(
+                        b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+"
+                    )
+                self._is_running = None
+            except Exception as error:
+                cause = error.__cause__
+                detail = str(cause) if isinstance(cause, OSError) else str(error)
+                raise RuntimeError(
+                    f"could not connect to remote GDB server at {self.endpoint}: {detail}"
+                ) from error
+            try:
+                self._load_register_numbers()
+            except GDBError as error:
+                if "GDB error response:" not in str(error):
+                    raise
+                self.register_numbers.clear()
+                self.target_xml_error = str(error)
+            except RuntimeError as error:
+                if not str(error).startswith("target did not provide GDB feature"):
+                    raise
+                self.register_numbers.clear()
+                self.target_xml_error = str(error)
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def halt(self):
+        return GDBBackend.halt(self)
+
+    def resume(self):
+        return GDBBackend.resume(self)
+
+    def close(self):
+        try:
+            GDBBackend.close(self)
+        finally:
+            self._remote_lease.release()
+            if self._monitor_pause_token is not None:
+                from .daemon import resume_device_monitor
+
+                token, self._monitor_pause_token = self._monitor_pause_token, None
+                resume_device_monitor(f"remote-gdb:{self.endpoint}", token)
 
 
 class DebugSession:
@@ -838,21 +1053,35 @@ class DebugSession:
             if not running:
                 if self.transport == "gwemu":
                     self.backend._is_running = False
-                    return {"stopped": True, "status": state,
-                            "stop_reply": None, "registers": self.regs()}
+                    return {
+                        "stopped": True,
+                        "status": state,
+                        "stop_reply": None,
+                        "registers": self.regs(),
+                    }
                 if state != "halted":
-                    return {"stopped": False, "status": state,
-                            "reason": f"target is {state}; it is not at a debug halt"}
+                    return {
+                        "stopped": False,
+                        "status": state,
+                        "reason": f"target is {state}; it is not at a debug halt",
+                    }
                 try:
                     registers = self.regs()
                 except Exception as error:
                     current_state = self._target_state()
-                    return {"stopped": False, "status": current_state,
-                            "observed_status": state,
-                            "reason": "target state changed or registers became unavailable while reading the stop",
-                            "register_error": str(error)}
-                return {"stopped": True, "status": state,
-                        "stop_reply": None, "registers": registers}
+                    return {
+                        "stopped": False,
+                        "status": current_state,
+                        "observed_status": state,
+                        "reason": "target state changed or registers became unavailable while reading the stop",
+                        "register_error": str(error),
+                    }
+                return {
+                    "stopped": True,
+                    "status": state,
+                    "stop_reply": None,
+                    "registers": registers,
+                }
             remaining = deadline - time.monotonic() if deadline is not None else None
             if remaining is not None and remaining <= 0:
                 return {"stopped": False, "status": state, "reason": "timeout"}
@@ -870,8 +1099,7 @@ class DebugSession:
             self.resume()
             result = self.wait_stopped(timeout)
             result["breakpoint"] = address
-            result["hit"] = bool(result["stopped"] and
-                                 result["registers"]["pc"] == address)
+            result["hit"] = bool(result["stopped"] and result["registers"]["pc"] == address)
             return result
         finally:
             try:
@@ -897,10 +1125,9 @@ class DebugSession:
         """
         if self.transport != "hardware":
             raise ValueError("watchdog freeze is available only for hardware targets")
-        from .hw_lifecycle import (DBGMCU_APB3FZ1, DBGMCU_APB4FZ1,
-                                   DBG_WWDG1, DBG_IWDG1)
-        registers = (("WWDG1", DBGMCU_APB3FZ1, DBG_WWDG1),
-                     ("IWDG1", DBGMCU_APB4FZ1, DBG_IWDG1))
+        from .hw_lifecycle import DBGMCU_APB3FZ1, DBGMCU_APB4FZ1, DBG_WWDG1, DBG_IWDG1
+
+        registers = (("WWDG1", DBGMCU_APB3FZ1, DBG_WWDG1), ("IWDG1", DBGMCU_APB4FZ1, DBG_IWDG1))
         result = {}
         for name, address, mask in registers:
             before = self.u32(address)
@@ -921,6 +1148,10 @@ class DebugSession:
             reply = self.backend.single_step()
             self.backend._is_running = False
             return reply.decode("ascii", errors="replace")
+        if hasattr(self.backend, "single_step"):
+            reply = self.backend.single_step()
+            self.backend._is_running = False
+            return reply.decode("ascii", errors="replace") if isinstance(reply, bytes) else reply
         target = getattr(self.backend, "target", None)
         if target is not None:
             target.step()
@@ -950,8 +1181,9 @@ class DebugSession:
             if was_running:
                 self.backend.resume()
 
-    def fault_context(self, registers: dict[str, int] | None = None, *,
-                      include_mpu: bool = True) -> dict:
+    def fault_context(
+        self, registers: dict[str, int] | None = None, *, include_mpu: bool = True
+    ) -> dict:
         """Decode a Cortex-M fault captured at handler entry, before its prologue.
 
         EXC_RETURN selects MSP/PSP and whether the 18-word FP context exists.
@@ -959,10 +1191,11 @@ class DebugSession:
         follows them. Read only while halted so frame and SCB data stay coherent.
         """
         import struct
+
         current = registers or self.regs()
-        exception = current.get("xpsr", 0) & 0x1ff
+        exception = current.get("xpsr", 0) & 0x1FF
         exc_return = current.get("lr", 0)
-        if exception not in {3, 4, 5, 6} or exc_return & 0xffffff00 != 0xffffff00:
+        if exception not in {3, 4, 5, 6} or exc_return & 0xFFFFFF00 != 0xFFFFFF00:
             return {"available": False, "reason": "not at a Cortex-M fault handler entry"}
         if exc_return & 4:
             frame_address = self.reg("psp")
@@ -981,49 +1214,80 @@ class DebugSession:
         core_frame_address = frame_address
         raw = self.read(frame_address, (72 if extended else 0) + 32)
         core_offset = 0
-        values = struct.unpack("<8I", raw[core_offset:core_offset + 32])
+        values = struct.unpack("<8I", raw[core_offset : core_offset + 32])
         if not values[7] & (1 << 24):
-            return {"available": False, "reason": "stacked xPSR has no Thumb bit",
-                    "frame_address": frame_address,
-                    "core_frame_address": core_frame_address,
-                    "extended_fp_frame": extended, "frame_bytes": raw.hex()}
+            return {
+                "available": False,
+                "reason": "stacked xPSR has no Thumb bit",
+                "frame_address": frame_address,
+                "core_frame_address": core_frame_address,
+                "extended_fp_frame": extended,
+                "frame_bytes": raw.hex(),
+            }
         names = ["r0", "r1", "r2", "r3", "r12", "lr", "pc", "xpsr"]
         stacked = dict(zip(names, values))
         padding = 4 if values[7] & (1 << 9) else 0
         recovered = dict(current)
         recovered.update(stacked)
         recovered["sp"] = frame_address + 32 + (72 if extended else 0) + padding
-        scb_values = struct.unpack("<6I", self.read(0xe000ed28, 24))
+        scb_values = struct.unpack("<6I", self.read(0xE000ED28, 24))
         scb = dict(zip(["CFSR", "HFSR", "DFSR", "MMFAR", "BFAR", "AFSR"], scb_values))
         cfsr = scb["CFSR"]
-        bits = {0: "IACCVIOL", 1: "DACCVIOL", 3: "MUNSTKERR", 4: "MSTKERR",
-                5: "MLSPERR", 7: "MMARVALID", 8: "IBUSERR", 9: "PRECISERR",
-                10: "IMPRECISERR", 11: "UNSTKERR", 12: "STKERR", 13: "LSPERR",
-                15: "BFARVALID", 16: "UNDEFINSTR", 17: "INVSTATE", 18: "INVPC",
-                19: "NOCP", 24: "UNALIGNED", 25: "DIVBYZERO"}
-        result = {"available": True,
-                  "exception": {3: "HardFault", 4: "MemManage", 5: "BusFault", 6: "UsageFault"}[exception],
-                  "exception_return": exc_return, "frame_address": frame_address,
-                  "core_frame_address": core_frame_address,
-                  "frame_bytes": raw.hex(), "extended_fp_frame": extended,
-                  "registers": recovered, "scb": scb,
-                  "fault_flags": [name for bit, name in bits.items() if cfsr & (1 << bit)],
-                  "fault_address": scb["MMFAR"] if cfsr & (1 << 7)
-                                   else scb["BFAR"] if cfsr & (1 << 15) else None}
+        bits = {
+            0: "IACCVIOL",
+            1: "DACCVIOL",
+            3: "MUNSTKERR",
+            4: "MSTKERR",
+            5: "MLSPERR",
+            7: "MMARVALID",
+            8: "IBUSERR",
+            9: "PRECISERR",
+            10: "IMPRECISERR",
+            11: "UNSTKERR",
+            12: "STKERR",
+            13: "LSPERR",
+            15: "BFARVALID",
+            16: "UNDEFINSTR",
+            17: "INVSTATE",
+            18: "INVPC",
+            19: "NOCP",
+            24: "UNALIGNED",
+            25: "DIVBYZERO",
+        }
+        result = {
+            "available": True,
+            "exception": {3: "HardFault", 4: "MemManage", 5: "BusFault", 6: "UsageFault"}[
+                exception
+            ],
+            "exception_return": exc_return,
+            "frame_address": frame_address,
+            "core_frame_address": core_frame_address,
+            "frame_bytes": raw.hex(),
+            "extended_fp_frame": extended,
+            "registers": recovered,
+            "scb": scb,
+            "fault_flags": [name for bit, name in bits.items() if cfsr & (1 << bit)],
+            "fault_address": (
+                scb["MMFAR"] if cfsr & (1 << 7) else scb["BFAR"] if cfsr & (1 << 15) else None
+            ),
+        }
         memmanage_status = cfsr & 0x3F
         if include_mpu and (result["exception"] == "MemManage" or memmanage_status):
             try:
                 result["mpu"] = self._mpu_context(
-                    pc=recovered["pc"], fault_address=result["fault_address"],
-                    cfsr=cfsr)
+                    pc=recovered["pc"], fault_address=result["fault_address"], cfsr=cfsr
+                )
             except Exception as exc:
                 result["mpu"] = {"available": False, "reason": str(exc)}
         try:
             guard = self.at("_stack_redzone")
             size = self.at("_Stack_Redzone_Size")
             address = result["fault_address"]
-            result["stack_guard"] = {"address": guard, "size": size,
-                                      "hit": address is not None and guard <= address < guard + size}
+            result["stack_guard"] = {
+                "address": guard,
+                "size": size,
+                "hit": address is not None and guard <= address < guard + size,
+            }
         except KeyError:
             pass
         result["source_location"] = self.symbols.source_location(recovered["pc"])
@@ -1065,8 +1329,7 @@ class DebugSession:
             return
         raise RuntimeError(f"{backend.__class__.__name__} has no safe 32-bit register write")
 
-    def _mpu_context(self, *, pc: int, fault_address: int | None,
-                     cfsr: int) -> dict:
+    def _mpu_context(self, *, pc: int, fault_address: int | None, cfsr: int) -> dict:
         """Capture ARMv7-M MPU regions and identify the effective fault region.
 
         MPU_RNR is temporarily changed to read RBAR/RASR and restored before
@@ -1081,10 +1344,16 @@ class DebugSession:
         mpu_ctrl = self._read_u32_register(mpu_ctrl_address)
         region_count = (mpu_type >> 8) & 0xFF
         if region_count == 0:
-            return {"available": True, "architecture": "ARMv7-M",
-                    "type": mpu_type, "control": mpu_ctrl,
-                    "enabled": bool(mpu_ctrl & 1), "regions": [], "pc": pc,
-                    "fault_address": fault_address}
+            return {
+                "available": True,
+                "architecture": "ARMv7-M",
+                "type": mpu_type,
+                "control": mpu_ctrl,
+                "enabled": bool(mpu_ctrl & 1),
+                "regions": [],
+                "pc": pc,
+                "fault_address": fault_address,
+            }
 
         original_rnr = self._read_u32_register(mpu_rnr_address)
         regions = []
@@ -1098,6 +1367,7 @@ class DebugSession:
                 size = (1 << (((rasr >> 1) & 0x1F) + 1)) if enabled else None
                 base = ((rbar & 0xFFFFFFE0) & ~(size - 1)) if enabled else None
                 subregion_mask = (rasr >> 8) & 0xFF
+
                 def contains(address):
                     if not enabled or not (mpu_ctrl & 1) or address is None:
                         return False, False
@@ -1108,18 +1378,26 @@ class DebugSession:
                         subregion = (address - base) // (size // 8)
                         disabled = bool(subregion_mask & (1 << subregion))
                     return not disabled, disabled
+
                 pc_covered, pc_subregion_disabled = contains(pc)
                 addr_covered, addr_subregion_disabled = contains(fault_address)
-                regions.append({"number": index, "enabled": enabled,
-                                "base": base, "size_bytes": size,
-                                "xn": bool(rasr & (1 << 28)),
-                                "access_permission": (rasr >> 24) & 7,
-                                "subregion_disable_mask": subregion_mask,
-                                "covers_pc": pc_covered,
-                                "pc_subregion_disabled": pc_subregion_disabled,
-                                "covers_fault_address": addr_covered,
-                                "fault_address_subregion_disabled": addr_subregion_disabled,
-                                "rbar": rbar, "rasr": rasr})
+                regions.append(
+                    {
+                        "number": index,
+                        "enabled": enabled,
+                        "base": base,
+                        "size_bytes": size,
+                        "xn": bool(rasr & (1 << 28)),
+                        "access_permission": (rasr >> 24) & 7,
+                        "subregion_disable_mask": subregion_mask,
+                        "covers_pc": pc_covered,
+                        "pc_subregion_disabled": pc_subregion_disabled,
+                        "covers_fault_address": addr_covered,
+                        "fault_address_subregion_disabled": addr_subregion_disabled,
+                        "rbar": rbar,
+                        "rasr": rasr,
+                    }
+                )
         finally:
             try:
                 self._write_u32_register(mpu_rnr_address, original_rnr)
@@ -1127,17 +1405,24 @@ class DebugSession:
                 restore_error = str(exc)
 
         enabled_regions = [r for r in regions if r["enabled"] and (mpu_ctrl & 1)]
+
         def effective(field):
             matches = [r for r in enabled_regions if r[field]]
             return max(matches, key=lambda r: r["number"]) if matches else None
-        result = {"available": True, "architecture": "ARMv7-M",
-                  "type": mpu_type, "control": mpu_ctrl,
-                  "enabled": bool(mpu_ctrl & 1),
-                  "privileged_default": bool(mpu_ctrl & 4), "pc": pc,
-                  "fault_address": fault_address,
-                  "effective_pc_region": effective("covers_pc"),
-                  "effective_fault_address_region": effective("covers_fault_address"),
-                  "regions": regions}
+
+        result = {
+            "available": True,
+            "architecture": "ARMv7-M",
+            "type": mpu_type,
+            "control": mpu_ctrl,
+            "enabled": bool(mpu_ctrl & 1),
+            "privileged_default": bool(mpu_ctrl & 4),
+            "pc": pc,
+            "fault_address": fault_address,
+            "effective_pc_region": effective("covers_pc"),
+            "effective_fault_address_region": effective("covers_fault_address"),
+            "regions": regions,
+        }
         if restore_error:
             result["region_selector_restore_error"] = restore_error
         return result
@@ -1182,11 +1467,21 @@ class DebugSession:
             addresses = {name: self.reg(name) for name in ("pc", "lr")}
             result = {}
             for name, address in addresses.items():
-                elf = next((str(path) for path in reversed(self.symbols.sources)
-                            if any(self._in_section(address, path, section)
-                                   for section in self.symbols.sections(path))), None)
-                result[name] = {"address": address,
-                                "symbol": self.symbols.nearest(address, elf=elf) if elf else None}
+                elf = next(
+                    (
+                        str(path)
+                        for path in reversed(self.symbols.sources)
+                        if any(
+                            self._in_section(address, path, section)
+                            for section in self.symbols.sections(path)
+                        )
+                    ),
+                    None,
+                )
+                result[name] = {
+                    "address": address,
+                    "symbol": self.symbols.nearest(address, elf=elf) if elf else None,
+                }
             return result
         finally:
             if was_running:
@@ -1211,17 +1506,21 @@ class DebugSession:
         elif buffer or index:
             raise RuntimeError(
                 "loaded symbols describe only part of the Retro-Go log buffer; "
-                "load the matching firmware ELF")
+                "load the matching firmware ELF"
+            )
         else:
             import re
+
             version = re.search(r"v?(\d+)", self.retro_go_version or "")
             if version is None:
                 raise RuntimeError(
                     "Retro-Go log layout is unknown; load matching firmware symbols "
-                    "or identify the installed Retro-Go version")
+                    "or identify the installed Retro-Go version"
+                )
             major = int(version.group(1))
-            address, index_address = ((0x30000008, 0x30000004) if major >= 2
-                                     else (0x20000008, 0x20000004))
+            address, index_address = (
+                (0x30000008, 0x30000004) if major >= 2 else (0x20000008, 0x20000004)
+            )
             size = 4096
         cursor = self.u32(index_address)
         if cursor > size:
@@ -1230,7 +1529,7 @@ class DebugSession:
         aligned = address & ~3
         prefix = address - aligned
         total = (prefix + length + 3) & ~3
-        data = self.read(aligned, total)[prefix:prefix + length]
+        data = self.read(aligned, total)[prefix : prefix + length]
         if cursor == 0:
             # The linear log buffer resets its cursor to zero on wrap. Match
             # gnw-web-builder's prefix decoder so stale bytes after the first
@@ -1247,6 +1546,7 @@ class DebugSession:
         Unsupported or missing types fail explicitly instead of guessing offsets.
         """
         from .debug_types import decode_value
+
         layout = self.symbols.type_layout(symbol)
         if layout["size"] > max_bytes:
             raise ValueError(f"{symbol} is {layout['size']} bytes; limit is {max_bytes}")
@@ -1255,34 +1555,47 @@ class DebugSession:
     def memory_path(self, expression: str) -> dict:
         """Resolve a dotted C global/member path using DWARF and live pointers."""
         from .debug_types import path_layout
+
         parts = expression.split(".")
         if not parts or any(not part.isidentifier() for part in parts):
             raise ValueError("memory paths use GLOBAL.member identifiers")
         root = parts[0]
-        layout = path_layout(self.symbols.owner(root), root, tuple(parts[1:]),
-                             self.symbols.source_hint(root), self.symbols.link_address(root))
+        layout = path_layout(
+            self.symbols.owner(root),
+            root,
+            tuple(parts[1:]),
+            self.symbols.source_hint(root),
+            self.symbols.link_address(root),
+        )
         address = self.at(root)
         for operation in layout["operations"]:
             if operation["kind"] == "dereference":
-                address = int.from_bytes(self.read(address, operation["size"]),
-                                         layout["type"]["byteorder"])
+                address = int.from_bytes(
+                    self.read(address, operation["size"]), layout["type"]["byteorder"]
+                )
                 if address == 0:
                     raise ValueError(f"null pointer resolving {expression!r}")
             else:
                 address += operation["bytes"]
-        return {"expression": expression, "address": address,
-                "size": layout["type"]["size"], "type": layout["type"]}
+        return {
+            "expression": expression,
+            "address": address,
+            "size": layout["type"]["size"],
+            "type": layout["type"],
+        }
 
     def read_path(self, expression: str, *, max_bytes: int = 65536):
         """Decode a dotted C global/member path; intermediate pointers are followed."""
         from .debug_types import decode_value
+
         resolved = self.memory_path(expression)
         if resolved["size"] > max_bytes:
             raise ValueError(f"{expression} is {resolved['size']} bytes; limit is {max_bytes}")
         return decode_value(resolved["type"], self.read(resolved["address"], resolved["size"]))
 
-    def read_paths(self, expressions, *, max_bytes=65536, max_total_bytes=4 * 1024 * 1024,
-                   errors="raise") -> dict:
+    def read_paths(
+        self, expressions, *, max_bytes=65536, max_total_bytes=4 * 1024 * 1024, errors="raise"
+    ) -> dict:
         """Read typed fields together, sharing pointer reads and adjacent ranges.
 
         Only requested bytes are read: no gap filling or MMIO over-read. Pointer
@@ -1290,6 +1603,7 @@ class DebugSession:
         Returns explicit values/errors plus transport metrics; no app schema.
         """
         from .debug_types import path_layouts, decode_value
+
         if errors not in ("raise", "collect"):
             raise ValueError("errors must be raise or collect")
         if max_bytes <= 0 or max_total_bytes <= 0:
@@ -1299,10 +1613,12 @@ class DebugSession:
         expressions = tuple(dict.fromkeys(expressions))
         groups, failures, resolved = {}, {}, {}
         pointer_cache = {}
+
         def fail(expression, error):
             if errors == "raise":
                 raise error
             failures[expression] = {"type": type(error).__name__, "message": str(error)}
+
         for expression in expressions:
             parts = expression.split(".")
             if not parts or any(not part.isidentifier() for part in parts):
@@ -1315,12 +1631,12 @@ class DebugSession:
             groups.setdefault((owner, parts[0]), []).append((expression, tuple(parts[1:])))
         for (owner, root), fields in groups.items():
             try:
-                hint = getattr(self.symbols, 'source_hint', lambda symbol: None)(root)
+                hint = getattr(self.symbols, "source_hint", lambda symbol: None)(root)
                 options = {}
                 if hint:
-                    options['source_hint'] = hint
-                if hasattr(self.symbols, 'link_address'):
-                    options['symbol_address'] = self.symbols.link_address(root)
+                    options["source_hint"] = hint
+                if hasattr(self.symbols, "link_address"):
+                    options["symbol_address"] = self.symbols.link_address(root)
                 plans = path_layouts(owner, root, [members for _, members in fields], **options)
             except (KeyError, ValueError) as error:
                 for expression, _ in fields:
@@ -1361,16 +1677,22 @@ class DebugSession:
         regions = [(start, end, self.read(start, end - start)) for start, end in ranges]
         values = {}
         for expression, (address, layout) in resolved.items():
-            start, _, data = next(region for region in regions
-                                 if region[0] <= address and address + layout["size"] <= region[1])
+            start, _, data = next(
+                region
+                for region in regions
+                if region[0] <= address and address + layout["size"] <= region[1]
+            )
             offset = address - start
-            values[expression] = decode_value(layout, data[offset:offset + layout["size"]])
-        return {"values": {name: values[name] for name in expressions if name in values},
-                "errors": {name: failures[name] for name in expressions if name in failures},
-                "memory_reads": len(regions), "pointer_reads": len(pointer_cache),
-                "requested_union_bytes": total,
-                "transport_bytes": total + sum(len(data) for data in pointer_cache.values()),
-                "regions": [{"address": start, "size": end - start} for start, end in ranges]}
+            values[expression] = decode_value(layout, data[offset : offset + layout["size"]])
+        return {
+            "values": {name: values[name] for name in expressions if name in values},
+            "errors": {name: failures[name] for name in expressions if name in failures},
+            "memory_reads": len(regions),
+            "pointer_reads": len(pointer_cache),
+            "requested_union_bytes": total,
+            "transport_bytes": total + sum(len(data) for data in pointer_cache.values()),
+            "regions": [{"address": start, "size": end - start} for start, end in ranges],
+        }
 
     def read_ring(self, symbol: str, head_symbol: str, *, max_bytes: int = 65536) -> dict:
         """Read a fixed C array with a monotonic next-write head, oldest first.
@@ -1391,9 +1713,14 @@ class DebugSession:
             capacity = len(entries)
             count = min(head, capacity)
             ordered = [entries[(head - count + i) % capacity] for i in range(count)]
-            return {"symbol": symbol, "head_symbol": head_symbol, "head": head,
-                    "capacity": capacity, "overwritten": max(0, head - capacity),
-                    "entries": ordered}
+            return {
+                "symbol": symbol,
+                "head_symbol": head_symbol,
+                "head": head,
+                "capacity": capacity,
+                "overwritten": max(0, head - capacity),
+                "entries": ordered,
+            }
         finally:
             if was_running:
                 self.resume()
@@ -1419,13 +1746,23 @@ class DebugSession:
         self.debug_configuration = settings
         return settings
 
-    def profile(self, *, duration=15.0, interval=0.02, progress_symbols=None,
-                rebase_symbols=None, stop_event=None, stall_threshold=1.0, sample_gauges=None,
-                progress_interval=1.0) -> dict:
+    def profile(
+        self,
+        *,
+        duration=15.0,
+        interval=0.02,
+        progress_symbols=None,
+        rebase_symbols=None,
+        stop_event=None,
+        stall_threshold=1.0,
+        sample_gauges=None,
+        progress_interval=1.0,
+    ) -> dict:
         """Sample native function PCs through QMP alongside this debug session."""
         if self.transport != "gwemu" or not self.qmp_socket:
             raise RuntimeError("native PC sampling requires a GWemu QMP socket")
         from .profiling import sample_profile
+
         settings = getattr(self, "debug_configuration", {})
         if progress_symbols is None:
             progress_symbols = settings.get("progress_symbols") or None
@@ -1433,11 +1770,18 @@ class DebugSession:
             rebase_symbols = settings.get("rebase_symbols")
         if sample_gauges is None:
             sample_gauges = settings.get("sample_gauges")
-        return sample_profile(self.qmp_socket, self.symbols, duration=duration,
-                              interval=interval, progress_symbols=progress_symbols,
-                              rebase_symbols=rebase_symbols, stop_event=stop_event,
-                              stall_threshold=stall_threshold, sample_gauges=sample_gauges,
-                              progress_interval=progress_interval)
+        return sample_profile(
+            self.qmp_socket,
+            self.symbols,
+            duration=duration,
+            interval=interval,
+            progress_symbols=progress_symbols,
+            rebase_symbols=rebase_symbols,
+            stop_event=stop_event,
+            stall_threshold=stall_threshold,
+            sample_gauges=sample_gauges,
+            progress_interval=progress_interval,
+        )
 
     def bp(self, address: int):
         """Set a hardware breakpoint, suitable for flash code addresses."""
@@ -1452,11 +1796,19 @@ class DebugSession:
         target = getattr(self.backend, "target", None)
         if target is not None:
             from pyocd.core.target import Target
+
             if not target.set_breakpoint(address, Target.BreakpointType.HW):
-                raise RuntimeError(f"could not set hardware breakpoint at 0x{address:08x}; "
-                                   "the probe may have no free comparator slots")
+                raise RuntimeError(
+                    f"could not set hardware breakpoint at 0x{address:08x}; "
+                    "the probe may have no free comparator slots"
+                )
             self._breakpoints[address] = self._breakpoint_info(address)
             return "OK"
+        if hasattr(self.backend, "_send_command"):
+            reply = self.backend._send_command(f"Z1,{address:x},2".encode()).decode()
+            if reply == "OK":
+                self._breakpoints[address] = self._breakpoint_info(address)
+            return reply
         if hasattr(self.backend, "__call__"):
             reply = self.backend(f"bp 0x{address:08x} 2 hw", decode=False).decode().strip()
             if reply == "OK":
@@ -1481,26 +1833,29 @@ class DebugSession:
             raise ValueError("watchpoint size must be 1, 2, 4, or 8 bytes")
         if self.transport == "gwemu":
             kind = rsp_types[access]
-            reply = self.backend._send_command(
-                f"Z{kind},{address:x},{size:x}".encode()).decode()
+            reply = self.backend._send_command(f"Z{kind},{address:x},{size:x}".encode()).decode()
             if reply != "OK":
                 raise RuntimeError(f"GWemu watchpoint installation failed: {reply}")
             return "OK"
         target = getattr(self.backend, "target", None)
         if target is not None:
             from pyocd.core.target import Target
-            kinds = {"read": Target.WatchpointType.READ,
-                     "write": Target.WatchpointType.WRITE,
-                     "read_write": Target.WatchpointType.READ_WRITE,
-                     "access": Target.WatchpointType.READ_WRITE}
+
+            kinds = {
+                "read": Target.WatchpointType.READ,
+                "write": Target.WatchpointType.WRITE,
+                "read_write": Target.WatchpointType.READ_WRITE,
+                "access": Target.WatchpointType.READ_WRITE,
+            }
             if not target.set_watchpoint(address, size, kinds[access]):
-                raise RuntimeError(f"could not set {access} watchpoint at "
-                                   f"0x{address:08x}; the target may have no free DWT comparators")
+                raise RuntimeError(
+                    f"could not set {access} watchpoint at "
+                    f"0x{address:08x}; the target may have no free DWT comparators"
+                )
             return "OK"
         if hasattr(self.backend, "_send_command"):
             kind = rsp_types[access]
-            reply = self.backend._send_command(
-                f"Z{kind},{address:x},{size:x}".encode()).decode()
+            reply = self.backend._send_command(f"Z{kind},{address:x},{size:x}".encode()).decode()
             if reply != "OK":
                 raise RuntimeError(f"remote watchpoint installation failed: {reply}")
             return "OK"
@@ -1513,31 +1868,33 @@ class DebugSession:
             raise ValueError("access must be 'read', 'write', or 'read_write'")
         if self.transport == "gwemu":
             kind = {"write": 2, "read": 3, "read_write": 4, "access": 4}[access]
-            reply = self.backend._send_command(
-                f"z{kind},{address:x},{size:x}".encode()).decode()
+            reply = self.backend._send_command(f"z{kind},{address:x},{size:x}".encode()).decode()
             if reply != "OK":
                 raise RuntimeError(f"GWemu watchpoint removal failed: {reply}")
             return "OK"
         target = getattr(self.backend, "target", None)
         if target is not None:
             from pyocd.core.target import Target
-            kinds = {"read": Target.WatchpointType.READ,
-                     "write": Target.WatchpointType.WRITE,
-                     "read_write": Target.WatchpointType.READ_WRITE,
-                     "access": Target.WatchpointType.READ_WRITE}
+
+            kinds = {
+                "read": Target.WatchpointType.READ,
+                "write": Target.WatchpointType.WRITE,
+                "read_write": Target.WatchpointType.READ_WRITE,
+                "access": Target.WatchpointType.READ_WRITE,
+            }
             target.remove_watchpoint(address, size, kinds[access])
             return "OK"
         if hasattr(self.backend, "_send_command"):
             kind = {"write": 2, "read": 3, "read_write": 4, "access": 4}[access]
-            reply = self.backend._send_command(
-                f"z{kind},{address:x},{size:x}".encode()).decode()
+            reply = self.backend._send_command(f"z{kind},{address:x},{size:x}".encode()).decode()
             if reply != "OK":
                 raise RuntimeError(f"remote watchpoint removal failed: {reply}")
             return "OK"
         raise NotImplementedError("watchpoints are unavailable for this debug backend")
 
-    def inject_return(self, return_at: str | int, value: int, *,
-                      register: str = "r0", timeout: float = 30.0) -> dict:
+    def inject_return(
+        self, return_at: str | int, value: int, *, register: str = "r0", timeout: float = 30.0
+    ) -> dict:
         """Override one function result at its return site, then resume.
 
         ``return_at`` is the address of the instruction reached after the
@@ -1554,15 +1911,21 @@ class DebugSession:
         if not result.get("hit"):
             return result
         self.backend.write_register(register, value)
-        result["injected"] = {"address": address, "register": register,
-                              "value": value}
+        result["injected"] = {"address": address, "register": register, "value": value}
         self.resume()
         return result
 
-    def press_button(self, return_at: str | int, mask: int, *,
-                     release_polls: int = 1, hold_polls: int = 1,
-                     release_value: int = 0, register: str = "r0",
-                     timeout: float = 30.0) -> dict:
+    def press_button(
+        self,
+        return_at: str | int,
+        mask: int,
+        *,
+        release_polls: int = 1,
+        hold_polls: int = 1,
+        release_value: int = 0,
+        register: str = "r0",
+        timeout: float = 30.0,
+    ) -> dict:
         """[INCOMPLETE / DEFECTIVE] Experimental button-mask injection.
 
         This helper has never been reliable and is intentionally omitted from
@@ -1571,7 +1934,8 @@ class DebugSession:
         """
         raise NotImplementedError(
             "dbg.press_button is incomplete/defective and is not supported; "
-            "use dbg.inject_return or the firmware's supported input transport")
+            "use dbg.inject_return or the firmware's supported input transport"
+        )
 
     def clear_bp(self, address: int):
         """Remove a hardware breakpoint at an address."""
@@ -1586,6 +1950,11 @@ class DebugSession:
             target.remove_breakpoint(address)
             self._breakpoints.pop(address, None)
             return "OK"
+        if hasattr(self.backend, "_send_command"):
+            reply = self.backend._send_command(f"z1,{address:x},2".encode()).decode()
+            if reply == "OK":
+                self._breakpoints.pop(address, None)
+            return reply
         if hasattr(self.backend, "__call__"):
             reply = self.backend(f"rbp 0x{address:08x}", decode=False).decode().strip()
             if reply == "OK":
@@ -1595,8 +1964,13 @@ class DebugSession:
 
     def arm_fault_breakpoints(self) -> list[dict]:
         """Install available Cortex-M fault-entry breakpoints before repro."""
-        names = ("common_fault_handler_c", "HardFault_Handler", "MemManage_Handler",
-                 "BusFault_Handler", "UsageFault_Handler")
+        names = (
+            "common_fault_handler_c",
+            "HardFault_Handler",
+            "MemManage_Handler",
+            "BusFault_Handler",
+            "UsageFault_Handler",
+        )
         armed = []
         seen = set()
         for name in names:
@@ -1620,8 +1994,9 @@ class DebugSession:
             return {"stop": stop, "triage": None}
         return {"stop": stop, "triage": self.traceback()}
 
-    def watchdog_context(self, registers: dict[str, int] | None = None,
-                         max_frames: int = 32) -> dict:
+    def watchdog_context(
+        self, registers: dict[str, int] | None = None, max_frames: int = 32
+    ) -> dict:
         """Decode the interrupted Cortex-M context at a watchdog IRQ entry.
 
         Unlike a fault, a watchdog reset does not preserve the faulting stack.
@@ -1631,12 +2006,15 @@ class DebugSession:
         frames when symbols and unwind data are available.
         """
         import struct
+
         current = registers or self.regs()
-        exception = current.get("xpsr", 0) & 0x1ff
+        exception = current.get("xpsr", 0) & 0x1FF
         exc_return = current.get("lr", 0)
-        if exception < 16 or exc_return & 0xffffff00 != 0xffffff00:
-            return {"available": False,
-                    "reason": "not at a Cortex-M exception entry; halt at WWDG_IRQHandler"}
+        if exception < 16 or exc_return & 0xFFFFFF00 != 0xFFFFFF00:
+            return {
+                "available": False,
+                "reason": "not at a Cortex-M exception entry; halt at WWDG_IRQHandler",
+            }
         frame_address = self.reg("psp") if exc_return & 4 else current["sp"]
         extended = not bool(exc_return & (1 << 4))
         # The exception SP points at the core frame. Extended FP state is
@@ -1644,27 +2022,38 @@ class DebugSession:
         core_frame_address = frame_address
         raw = self.read(frame_address, (72 if extended else 0) + 32)
         core_offset = 0
-        values = struct.unpack("<8I", raw[core_offset:core_offset + 32])
+        values = struct.unpack("<8I", raw[core_offset : core_offset + 32])
         names = ["r0", "r1", "r2", "r3", "r12", "lr", "pc", "xpsr"]
         stacked = dict(zip(names, values))
         if not stacked["xpsr"] & (1 << 24):
-            return {"available": False, "reason": "stacked xPSR has no Thumb bit",
-                    "frame_address": frame_address, "core_frame_address": core_frame_address,
-                    "extended_fp_frame": extended, "frame_bytes": raw.hex()}
+            return {
+                "available": False,
+                "reason": "stacked xPSR has no Thumb bit",
+                "frame_address": frame_address,
+                "core_frame_address": core_frame_address,
+                "extended_fp_frame": extended,
+                "frame_bytes": raw.hex(),
+            }
         padding = 4 if stacked["xpsr"] & (1 << 9) else 0
         interrupted = dict(current)
         interrupted.update(stacked)
         interrupted["sp"] = frame_address + 32 + (72 if extended else 0) + padding
         handler_pc = current.get("pc", 0)
         handler = self.symbols.nearest(handler_pc)
-        result = {"available": True, "exception_number": exception,
-                  "handler": handler, "frame_address": frame_address,
-                  "core_frame_address": core_frame_address,
-                  "extended_fp_frame": extended, "frame_bytes": raw.hex(),
-                  "handler_registers": current, "interrupted_registers": interrupted,
-                  "interrupted_pc": self.symbols.source_location(stacked["pc"]),
-                  "interrupted_lr": self.symbols.source_location(stacked["lr"]),
-                  "interrupted_traceback": self.symbols.unwind(interrupted, self.read, max_frames)}
+        result = {
+            "available": True,
+            "exception_number": exception,
+            "handler": handler,
+            "frame_address": frame_address,
+            "core_frame_address": core_frame_address,
+            "extended_fp_frame": extended,
+            "frame_bytes": raw.hex(),
+            "handler_registers": current,
+            "interrupted_registers": interrupted,
+            "interrupted_pc": self.symbols.source_location(stacked["pc"]),
+            "interrupted_lr": self.symbols.source_location(stacked["lr"]),
+            "interrupted_traceback": self.symbols.unwind(interrupted, self.read, max_frames),
+        }
         result["code_context"] = self.symbols.code_context(stacked["pc"])
         return result
 
@@ -1684,12 +2073,13 @@ class DebugSession:
             self.bp(address)
             armed.append({"symbol": name, "address": address})
         if not armed:
-            raise RuntimeError("loaded symbols contain no WWDG interrupt handler; "
-                               "load firmware symbols or set a breakpoint manually")
+            raise RuntimeError(
+                "loaded symbols contain no WWDG interrupt handler; "
+                "load firmware symbols or set a breakpoint manually"
+            )
         return armed
 
-    def wait_watchdog(self, timeout: float = 30.0,
-                      poll_interval: float = 0.05) -> dict:
+    def wait_watchdog(self, timeout: float = 30.0, poll_interval: float = 0.05) -> dict:
         """Wait for a WWDG early-wakeup IRQ and report its interrupted code path."""
         stop = self.wait_stopped(timeout, poll_interval)
         if not stop.get("stopped"):
@@ -1697,8 +2087,7 @@ class DebugSession:
         registers = stop.get("registers") or self.regs()
         context = self.watchdog_context(registers)
         if not context.get("available"):
-            return {"stop": stop, "watchdog": context,
-                    "triage": self.traceback()}
+            return {"stop": stop, "watchdog": context, "triage": self.traceback()}
         return {"stop": stop, "watchdog": context}
 
     def at(self, symbol: str) -> int:
@@ -1715,8 +2104,11 @@ class DebugSession:
             if selected not in candidates:
                 raise ValueError(f"ELF is not loaded: {selected}")
             candidates = [selected]
-        projects = [path for path in candidates
-                    if "gnw_core_entry" in self.symbols._symbols_by_elf.get(path, {})]
+        projects = [
+            path
+            for path in candidates
+            if "gnw_core_entry" in self.symbols._symbols_by_elf.get(path, {})
+        ]
         if len(projects) == 1:
             return projects[0]
         if not projects:
@@ -1728,8 +2120,9 @@ class DebugSession:
         if name not in symbols:
             raise KeyError(f"{name!r} is not present in {elf}")
         section = self.symbols._symbol_meta_by_elf.get(elf, {}).get(name, {}).get("section")
-        return symbols[name] + (self.symbols._section_deltas.get((elf, section), 0)
-                                if section else 0)
+        return symbols[name] + (
+            self.symbols._section_deltas.get((elf, section), 0) if section else 0
+        )
 
     def _breakpoint_info(self, address: int) -> dict:
         nearest = self.symbols.nearest(address)
@@ -1751,10 +2144,14 @@ class DebugSession:
             address = self._elf_symbol(owner, symbol)
         return self.bp(address)
 
-    def arm_project_launch(self, elf: str | Path | None = None, *,
-                           entry_symbol: str = "app_main",
-                           firmware_elf: str | Path | None = None,
-                           loader_symbol: str | None = None) -> list[dict]:
+    def arm_project_launch(
+        self,
+        elf: str | Path | None = None,
+        *,
+        entry_symbol: str = "app_main",
+        firmware_elf: str | Path | None = None,
+        loader_symbol: str | None = None,
+    ) -> list[dict]:
         """Set breakpoints at the shared core trampoline and project entry.
 
         Optionally include a known firmware loader symbol such as
@@ -1779,10 +2176,18 @@ class DebugSession:
                 self.bp(address)
                 if not already_installed:
                     installed.append(address)
-                armed.append({"symbol": name, "address": address,
-                              "elf": str(symbol_owner),
-                              "stage": "loader" if loader_symbol == name and symbol_owner != owner
-                              else "core-entry" if name == "gnw_core_entry" else "app-entry"})
+                armed.append(
+                    {
+                        "symbol": name,
+                        "address": address,
+                        "elf": str(symbol_owner),
+                        "stage": (
+                            "loader"
+                            if loader_symbol == name and symbol_owner != owner
+                            else "core-entry" if name == "gnw_core_entry" else "app-entry"
+                        ),
+                    }
+                )
         except Exception:
             for address in reversed(installed):
                 try:
@@ -1805,9 +2210,12 @@ class DebugSession:
         registers = stop["registers"]
         pc = registers.get("pc", 0) & ~1
         stage = stages.get(pc)
-        result = {"event": dict(stage) if stage else None,
-                  "stop": stop, "registers": registers,
-                  "location": self.addr2line(pc)}
+        result = {
+            "event": dict(stage) if stage else None,
+            "stop": stop,
+            "registers": registers,
+            "location": self.addr2line(pc),
+        }
         if stage and stage["stage"] == "core-entry":
             try:
                 result["arguments"] = self.project_entry_args(stage["elf"])
@@ -1817,10 +2225,14 @@ class DebugSession:
             result["reason"] = "target stopped before reaching an armed launch stage"
         return result
 
-    def run_project_unpaused(self, elf: str | Path | None = None, *,
-                             timeout: float | None = None,
-                             halt_at_entry: bool = False,
-                             force_start_paused: bool = False) -> dict:
+    def run_project_unpaused(
+        self,
+        elf: str | Path | None = None,
+        *,
+        timeout: float | None = None,
+        halt_at_entry: bool = False,
+        force_start_paused: bool = False,
+    ) -> dict:
         """Intercept a project's ``app_main``, set ABI ``start_paused`` in r1,
         and resume it unless ``halt_at_entry`` is requested.
 
@@ -1836,8 +2248,9 @@ class DebugSession:
             if owner not in candidates:
                 raise ValueError(f"ELF is not loaded: {owner}")
             candidates = [owner]
-        candidates = [path for path in candidates
-                      if "app_main" in self.symbols._symbols_by_elf.get(path, {})]
+        candidates = [
+            path for path in candidates if "app_main" in self.symbols._symbols_by_elf.get(path, {})
+        ]
         if len(candidates) != 1:
             if not candidates:
                 raise ValueError("no loaded project ELF defines app_main")
@@ -1859,31 +2272,41 @@ class DebugSession:
             base + self.symbols._section_deltas.get((owner, section), 0)
             <= current_pc
             < base + self.symbols._section_deltas.get((owner, section), 0) + size
-            for section, (base, size) in self.symbols._sections.get(owner, {}).items())
+            for section, (base, size) in self.symbols._sections.get(owner, {}).items()
+        )
         if in_project and current_pc != address:
             raise RuntimeError(
                 "the target is already executing this project's code; app_main has "
                 "passed, so start_paused cannot be changed for this launch. Arm "
-                "this helper before the next autostart or project launch.")
+                "this helper before the next autostart or project launch."
+            )
 
         # If the caller is already stopped at app_main, do not step past the
         # entry just to hit the breakpoint we would otherwise install.
         if state == "halted":
             if current_pc == address:
-                stop = {"stopped": True, "status": state,
-                        "registers": self.regs(), "breakpoint": address,
-                        "hit": True}
+                stop = {
+                    "stopped": True,
+                    "status": state,
+                    "registers": self.regs(),
+                    "breakpoint": address,
+                    "hit": True,
+                }
             else:
                 stop = self.run_until(address, timeout=timeout)
         else:
             stop = self.run_until(address, timeout=timeout)
 
-        hit = bool(stop.get("stopped") and
-                   (stop.get("registers", {}).get("pc", 0) & ~1) == address)
+        hit = bool(stop.get("stopped") and (stop.get("registers", {}).get("pc", 0) & ~1) == address)
         stop["hit"] = hit
         if not hit:
-            return {"intercepted": False, "elf": str(owner),
-                    "symbol": "app_main", "address": address, "stop": stop}
+            return {
+                "intercepted": False,
+                "elf": str(owner),
+                "symbol": "app_main",
+                "address": address,
+                "stop": stop,
+            }
         if self._target_state() != "halted":
             raise RuntimeError("target left the app_main breakpoint before r1 could be updated")
         registers = self.regs()
@@ -1896,18 +2319,26 @@ class DebugSession:
             self.backend.write_register("r1", 0)
         if not halt_at_entry:
             self.resume()
-        return {"intercepted": True, "elf": str(owner),
-                "symbol": "app_main", "address": address,
-                "start_paused_before": bool(previous & 0xFF),
-                "r1_before": previous,
-                "r1_after": ((previous & ~0xFF) | 1) if force_start_paused else 0,
-                "forced_start_paused": force_start_paused,
-                "resumed": not halt_at_entry}
+        return {
+            "intercepted": True,
+            "elf": str(owner),
+            "symbol": "app_main",
+            "address": address,
+            "start_paused_before": bool(previous & 0xFF),
+            "r1_before": previous,
+            "r1_after": ((previous & ~0xFF) | 1) if force_start_paused else 0,
+            "forced_start_paused": force_start_paused,
+            "resumed": not halt_at_entry,
+        }
 
-    def reset_and_run_project_unpaused(self, elf: str | Path | None = None, *,
-                                       timeout: float | None = None,
-                                       halt_at_entry: bool = False,
-                                       force_start_paused: bool = False) -> dict:
+    def reset_and_run_project_unpaused(
+        self,
+        elf: str | Path | None = None,
+        *,
+        timeout: float | None = None,
+        halt_at_entry: bool = False,
+        force_start_paused: bool = False,
+    ) -> dict:
         """Reset into halt, then intercept the selected project's ``app_main``.
 
         This is the convenient entry point for a fresh autostart debugging run.
@@ -1921,8 +2352,11 @@ class DebugSession:
         if state != "halted":
             raise RuntimeError(f"reset did not leave the target halted (state: {state})")
         launch = self.run_project_unpaused(
-            elf=elf, timeout=timeout, halt_at_entry=halt_at_entry,
-            force_start_paused=force_start_paused)
+            elf=elf,
+            timeout=timeout,
+            halt_at_entry=halt_at_entry,
+            force_start_paused=force_start_paused,
+        )
         return {"reset": reset_result, "state_after_reset": state, **launch}
 
     def project_entry_args(self, elf: str | Path | None = None) -> dict:
@@ -1943,53 +2377,92 @@ class DebugSession:
         if phase is None:
             raise RuntimeError(f"PC 0x{pc:08x} is not at this project ELF's core entry or app_main")
         r0, r1, r2 = (regs.get(f"r{index}", 0) & 0xFFFFFFFF for index in range(3))
-        return {"elf": str(owner), "phase": phase, "pc": pc,
-                "load_state": r0 & 0xFF, "start_paused": bool(r1 & 0xFF),
-                "save_slot": (r2 & 0xFF) - (0x100 if r2 & 0x80 else 0),
-                "registers": {"r0": r0, "r1": r1, "r2": r2}}
+        return {
+            "elf": str(owner),
+            "phase": phase,
+            "pc": pc,
+            "load_state": r0 & 0xFF,
+            "start_paused": bool(r1 & 0xFF),
+            "save_slot": (r2 & 0xFF) - (0x100 if r2 & 0x80 else 0),
+            "registers": {"r0": r0, "r1": r1, "r2": r2},
+        }
 
     def core_load_report(self, elf: str | Path | None = None) -> dict:
         """Report linked RAM_EMU code, BSS, and capacity from a project ELF."""
         owner = self._project_elf(elf)
         values = {}
-        for name in ("__RAM_EMU_START__", "__RAM_EMU_END__", "__CORE_CODE_END__",
-                     "__CORE_BSS_END__", "__RAM_EMU_LENGTH__",
-                     "__ITCM_CORE_START__", "__ITCM_CORE_LENGTH__",
-                     "__CORE_ITCM_CODE_END__", "__CORE_ITCM_BSS_END__",
-                     "__RAM_UC_CORE_START__", "__RAM_UC_CORE_LENGTH__",
-                     "__CORE_RAM_UC_CODE_END__", "__CORE_RAM_UC_BSS_END__"):
+        for name in (
+            "__RAM_EMU_START__",
+            "__RAM_EMU_END__",
+            "__CORE_CODE_END__",
+            "__CORE_BSS_END__",
+            "__RAM_EMU_LENGTH__",
+            "__ITCM_CORE_START__",
+            "__ITCM_CORE_LENGTH__",
+            "__CORE_ITCM_CODE_END__",
+            "__CORE_ITCM_BSS_END__",
+            "__RAM_UC_CORE_START__",
+            "__RAM_UC_CORE_LENGTH__",
+            "__CORE_RAM_UC_CODE_END__",
+            "__CORE_RAM_UC_BSS_END__",
+        ):
             try:
                 values[name] = self.symbols._symbols_by_elf[owner][name]
             except KeyError:
                 pass
-        start, code_end, bss_end = (values.get(name) for name in
-                                    ("__RAM_EMU_START__", "__CORE_CODE_END__", "__CORE_BSS_END__"))
+        start, code_end, bss_end = (
+            values.get(name)
+            for name in ("__RAM_EMU_START__", "__CORE_CODE_END__", "__CORE_BSS_END__")
+        )
         end = values.get("__RAM_EMU_END__")
         if end is None and start is not None and "__RAM_EMU_LENGTH__" in values:
             end = start + values["__RAM_EMU_LENGTH__"]
         if start is not None and code_end is not None and bss_end is not None and end is not None:
-            values["ram_emu"] = {"start": start, "code_end": code_end, "bss_end": bss_end,
-                                 "end": end, "code_bytes": code_end - start,
-                                 "bss_bytes": bss_end - code_end,
-                                 "used_bytes": bss_end - start, "capacity_bytes": end - start,
-                                 "fits": bss_end <= end}
+            values["ram_emu"] = {
+                "start": start,
+                "code_end": code_end,
+                "bss_end": bss_end,
+                "end": end,
+                "code_bytes": code_end - start,
+                "bss_bytes": bss_end - code_end,
+                "used_bytes": bss_end - start,
+                "capacity_bytes": end - start,
+                "fits": bss_end <= end,
+            }
         for key, start_name, code_name, bss_name, length_name in (
-                ("itcm", "__ITCM_CORE_START__", "__CORE_ITCM_CODE_END__",
-                 "__CORE_ITCM_BSS_END__", "__ITCM_CORE_LENGTH__"),
-                ("ram_uc", "__RAM_UC_CORE_START__", "__CORE_RAM_UC_CODE_END__",
-                 "__CORE_RAM_UC_BSS_END__", "__RAM_UC_CORE_LENGTH__")):
+            (
+                "itcm",
+                "__ITCM_CORE_START__",
+                "__CORE_ITCM_CODE_END__",
+                "__CORE_ITCM_BSS_END__",
+                "__ITCM_CORE_LENGTH__",
+            ),
+            (
+                "ram_uc",
+                "__RAM_UC_CORE_START__",
+                "__CORE_RAM_UC_CODE_END__",
+                "__CORE_RAM_UC_BSS_END__",
+                "__RAM_UC_CORE_LENGTH__",
+            ),
+        ):
             segment_start = values.get(start_name)
             segment_code_end = values.get(code_name)
             segment_bss_end = values.get(bss_name)
             capacity = values.get(length_name)
-            if all(value is not None for value in
-                   (segment_start, segment_code_end, segment_bss_end, capacity)):
-                values[key] = {"start": segment_start, "code_end": segment_code_end,
-                               "bss_end": segment_bss_end, "code_bytes": segment_code_end - segment_start,
-                               "bss_bytes": segment_bss_end - segment_code_end,
-                               "used_bytes": segment_bss_end - segment_start,
-                               "capacity_bytes": capacity,
-                               "fits": segment_bss_end <= segment_start + capacity}
+            if all(
+                value is not None
+                for value in (segment_start, segment_code_end, segment_bss_end, capacity)
+            ):
+                values[key] = {
+                    "start": segment_start,
+                    "code_end": segment_code_end,
+                    "bss_end": segment_bss_end,
+                    "code_bytes": segment_code_end - segment_start,
+                    "bss_bytes": segment_bss_end - segment_code_end,
+                    "used_bytes": segment_bss_end - segment_start,
+                    "capacity_bytes": capacity,
+                    "fits": segment_bss_end <= segment_start + capacity,
+                }
         load_segments = []
         with owner.open("rb") as stream:
             image = ELFFile(stream)
@@ -1999,34 +2472,43 @@ class DebugSession:
                 address = int(segment["p_vaddr"])
                 file_size = int(segment["p_filesz"])
                 memory_size = int(segment["p_memsz"])
-                row = {"address": address, "file_bytes": file_size,
-                       "memory_bytes": memory_size,
-                       "bss_bytes": max(0, memory_size - file_size),
-                       "flags": segment["p_flags"]}
+                row = {
+                    "address": address,
+                    "file_bytes": file_size,
+                    "memory_bytes": memory_size,
+                    "bss_bytes": max(0, memory_size - file_size),
+                    "flags": segment["p_flags"],
+                }
                 row["address_end"] = address + memory_size
                 row["region"] = "unclassified"
                 for region_name in ("ram_emu", "itcm", "ram_uc"):
                     region = values.get(region_name)
-                    if region and region["start"] <= address and row["address_end"] <= (
-                            region["start"] + region["capacity_bytes"]):
+                    if (
+                        region
+                        and region["start"] <= address
+                        and row["address_end"] <= (region["start"] + region["capacity_bytes"])
+                    ):
                         row["region"] = region_name
                         row["fits"] = True
                         break
                 if row["region"] == "unclassified":
                     row["fits"] = False
                 load_segments.append(row)
-        return {"elf": str(owner), "symbols": values,
-                "load_segments": load_segments,
-                "all_segments_fit_known_regions": bool(load_segments) and
-                all(row["fits"] for row in load_segments)}
+        return {
+            "elf": str(owner),
+            "symbols": values,
+            "load_segments": load_segments,
+            "all_segments_fit_known_regions": bool(load_segments)
+            and all(row["fits"] for row in load_segments),
+        }
 
     def project_layout(self, elf: str | Path | None = None) -> dict:
         """Compatibility name for :meth:`core_load_report`."""
         return self.core_load_report(elf)
 
-    def capture_crash_bundle(self, output: str | Path, *,
-                             reason: str | None = None,
-                             max_frames: int = 32) -> dict:
+    def capture_crash_bundle(
+        self, output: str | Path, *, reason: str | None = None, max_frames: int = 32
+    ) -> dict:
         """Save a halted target's registers, stack, fault context, logs, and screen."""
         if self._target_state() != "halted":
             raise RuntimeError("stop the target before capturing a crash bundle")
@@ -2055,22 +2537,31 @@ class DebugSession:
             except Exception as error:
                 artifacts["watchdog"] = {"available": False, "error": str(error)}
         else:
-            artifacts["watchdog"] = {"available": False,
-                                      "reason": "PC is not at a recognized WWDG handler"}
+            artifacts["watchdog"] = {
+                "available": False,
+                "reason": "PC is not at a recognized WWDG handler",
+            }
         project_loads = []
         for symbol_elf in self._loaded_elfs():
             if "gnw_core_entry" in self.symbols._symbols_by_elf.get(symbol_elf, {}):
                 try:
                     project_loads.append(self.core_load_report(symbol_elf))
                 except Exception as error:
-                    project_loads.append({"elf": str(symbol_elf), "available": False,
-                                          "error": str(error)})
-        report = {"schemaVersion": 1, "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                  "transport": self.transport, "state": self._target_state(),
-                  "reason": reason, "retroGoVersion": self.retro_go_version,
-                  "symbols": [str(path) for path in self.symbols.sources],
-                  "projectLoads": project_loads,
-                  "traceback": trace, **artifacts}
+                    project_loads.append(
+                        {"elf": str(symbol_elf), "available": False, "error": str(error)}
+                    )
+        report = {
+            "schemaVersion": 1,
+            "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "transport": self.transport,
+            "state": self._target_state(),
+            "reason": reason,
+            "retroGoVersion": self.retro_go_version,
+            "symbols": [str(path) for path in self.symbols.sources],
+            "projectLoads": project_loads,
+            "traceback": trace,
+            **artifacts,
+        }
         with tempfile.TemporaryDirectory(prefix="gwprov-crash-") as temporary:
             files = {"report.json": json.dumps(report, indent=2, default=str) + "\n"}
             try:
@@ -2082,21 +2573,28 @@ class DebugSession:
                 try:
                     image_path = Path(temporary) / "screenshot.png"
                     screenshot = self.screenshot(image_path)
-                    report["screenshot"] = {key: value for key, value in screenshot.items()
-                                            if key != "path"}
+                    report["screenshot"] = {
+                        key: value for key, value in screenshot.items() if key != "path"
+                    }
                     files["screenshot.png"] = image_path.read_bytes()
                     files["report.json"] = json.dumps(report, indent=2, default=str) + "\n"
                 except Exception as error:
                     report["screenshotUnavailable"] = str(error)
                     files["report.json"] = json.dumps(report, indent=2, default=str) + "\n"
             else:
-                report["screenshotUnavailable"] = "screenshots are available only for GWemu sessions"
+                report["screenshotUnavailable"] = (
+                    "screenshots are available only for GWemu sessions"
+                )
                 files["report.json"] = json.dumps(report, indent=2, default=str) + "\n"
             with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 for name, contents in files.items():
                     archive.writestr(name, contents)
-        return {"path": str(destination), "files": list(files),
-                "state": report["state"], "reason": reason}
+        return {
+            "path": str(destination),
+            "files": list(files),
+            "state": report["state"],
+            "reason": reason,
+        }
 
     def resolve_project_address(self, address: int, elf: str | Path | None = None) -> dict:
         """Resolve an address using only the selected project's ELF sections."""
@@ -2105,8 +2603,12 @@ class DebugSession:
             delta = self.symbols._section_deltas.get((owner, section), 0)
             if base + delta <= (address & ~1) < base + delta + size:
                 return self.symbols.source_location(address, elf=owner)
-        return {"address": address, "elf": str(owner), "available": False,
-                "reason": "address is outside this project's loaded ELF sections"}
+        return {
+            "address": address,
+            "elf": str(owner),
+            "available": False,
+            "reason": "address is outside this project's loaded ELF sections",
+        }
 
     def arm_firmware_boot(self, elf: str | Path | None = None) -> list[dict]:
         """Set breakpoints at available Reset_Handler, SystemInit, and main symbols."""
@@ -2117,10 +2619,15 @@ class DebugSession:
                 raise ValueError(f"ELF is not loaded: {selected}")
             candidates = [selected]
         else:
-            firmware = [path for path in candidates
-                        if "Reset_Handler" in self.symbols._symbols_by_elf.get(path, {})]
+            firmware = [
+                path
+                for path in candidates
+                if "Reset_Handler" in self.symbols._symbols_by_elf.get(path, {})
+            ]
             if len(firmware) != 1:
-                raise ValueError("select elf= with the firmware ELF when zero or multiple firmware ELFs are loaded")
+                raise ValueError(
+                    "select elf= with the firmware ELF when zero or multiple firmware ELFs are loaded"
+                )
             candidates = firmware
         owner = candidates[0]
         armed = []
@@ -2148,7 +2655,9 @@ class DebugSession:
         """Read a target-side base pointer and rebase that ELF section to it."""
         actual_base = self.u32(self.at(pointer_symbol))
         if actual_base == 0:
-            raise RuntimeError(f"target symbol {pointer_symbol!r} is still null; has the app initialized?")
+            raise RuntimeError(
+                f"target symbol {pointer_symbol!r} is still null; has the app initialized?"
+            )
         return self.symbols.rebase(section, actual_base)
 
     def screenshot(self, path: str | Path | None = None) -> dict:
@@ -2156,6 +2665,7 @@ class DebugSession:
         if not self.qmp_socket:
             raise RuntimeError("pass --qmp-socket to enable GWemu screenshots")
         from .gwemu_manager import screenshot_qmp
+
         return screenshot_qmp(self.qmp_socket, path)
 
     def diagnose_qmp(self, path=None, *, max_frames: int = 32) -> dict:
@@ -2163,6 +2673,7 @@ class DebugSession:
         if self.transport != "gwemu" or not self.qmp_socket:
             raise ValueError("QMP diagnosis requires a managed GWemu endpoint")
         from .qmp import QMPConnection
+
         with QMPConnection(self.qmp_socket) as qmp:
             state = qmp.execute("query-status")["return"]
             if state.get("running"):
@@ -2173,20 +2684,29 @@ class DebugSession:
             trace["code_context"] = self.symbols.code_context(registers["pc"])
             trace["source_location"] = self.symbols.source_location(registers["pc"])
             raw = qmp.read_memory(0xE000ED28, 20)
-            fault_registers = {name: int.from_bytes(raw[index * 4:index * 4 + 4], "little")
-                               for index, name in enumerate(("cfsr", "hfsr", "dfsr", "mmfar", "bfar"))}
-        return {"method": "qmp-halted-diagnosis", "state": state,
-                "traceback": trace, "fault_registers": fault_registers,
-                "screenshot": self.screenshot(path)}
+            fault_registers = {
+                name: int.from_bytes(raw[index * 4 : index * 4 + 4], "little")
+                for index, name in enumerate(("cfsr", "hfsr", "dfsr", "mmfar", "bfar"))
+            }
+        return {
+            "method": "qmp-halted-diagnosis",
+            "state": state,
+            "traceback": trace,
+            "fault_registers": fault_registers,
+            "screenshot": self.screenshot(path),
+        }
 
-    def diagnose(self, path: str | Path | None = None,
-                 max_frames: int = 32,
-                 inspect_u32: tuple[str, ...] | list[str] = (),
-                 inspect_deref: tuple[str, ...] | list[str] = (),
-                 inspect_bytes: tuple[str, ...] | list[str] = (),
-                 inspect_values: tuple[str, ...] | list[str] = (),
-                 inspect_rings: tuple[str, ...] | list[str] = (),
-                 screenshot: dict | None = None) -> dict:
+    def diagnose(
+        self,
+        path: str | Path | None = None,
+        max_frames: int = 32,
+        inspect_u32: tuple[str, ...] | list[str] = (),
+        inspect_deref: tuple[str, ...] | list[str] = (),
+        inspect_bytes: tuple[str, ...] | list[str] = (),
+        inspect_values: tuple[str, ...] | list[str] = (),
+        inspect_rings: tuple[str, ...] | list[str] = (),
+        screenshot: dict | None = None,
+    ) -> dict:
         """Capture the framebuffer and a symbol-resolved call stack together."""
         status = self.qmp("query-status").get("return", {})
         screenshot = screenshot or self.screenshot(path)
@@ -2199,8 +2719,12 @@ class DebugSession:
         for name in inspect_u32:
             address = self.at(name)
             value = self.u32(address)
-            memory[name] = {"address": address, "address_hex": hex(address),
-                            "value": value, "value_hex": hex(value)}
+            memory[name] = {
+                "address": address,
+                "address_hex": hex(address),
+                "value": value,
+                "value_hex": hex(value),
+            }
         for spec in inspect_deref:
             expression, separator, length_text = spec.partition(":")
             if not separator:
@@ -2211,17 +2735,26 @@ class DebugSession:
             try:
                 offset, length = int(offset_text, 0), int(length_text, 0)
             except ValueError as exc:
-                raise ValueError(f"invalid --deref {spec!r}; offsets and sizes use decimal or 0x notation") from exc
+                raise ValueError(
+                    f"invalid --deref {spec!r}; offsets and sizes use decimal or 0x notation"
+                ) from exc
             if not symbol or offset < 0 or length <= 0:
-                raise ValueError(f"invalid --deref {spec!r}; symbol, nonnegative offset, and positive size required")
+                raise ValueError(
+                    f"invalid --deref {spec!r}; symbol, nonnegative offset, and positive size required"
+                )
             pointer = self.u32(self.at(symbol))
             address = pointer + offset
             data = self.read(address, length)
             key = f"*{symbol}+{offset:#x}:{length}"
-            memory[key] = {"symbol": symbol, "pointer": pointer,
-                           "pointer_hex": hex(pointer), "address": address,
-                           "address_hex": hex(address), "size": length,
-                           "bytes_hex": data.hex()}
+            memory[key] = {
+                "symbol": symbol,
+                "pointer": pointer,
+                "pointer_hex": hex(pointer),
+                "address": address,
+                "address_hex": hex(address),
+                "size": length,
+                "bytes_hex": data.hex(),
+            }
         for spec in inspect_bytes:
             expression, separator, length_text = spec.partition(":")
             if not separator:
@@ -2232,20 +2765,30 @@ class DebugSession:
             try:
                 offset, length = int(offset_text, 0), int(length_text, 0)
             except ValueError as exc:
-                raise ValueError(f"invalid --bytes {spec!r}; offsets and sizes use decimal or 0x notation") from exc
+                raise ValueError(
+                    f"invalid --bytes {spec!r}; offsets and sizes use decimal or 0x notation"
+                ) from exc
             if not symbol or offset < 0 or length <= 0:
-                raise ValueError(f"invalid --bytes {spec!r}; symbol, nonnegative offset, and positive size required")
+                raise ValueError(
+                    f"invalid --bytes {spec!r}; symbol, nonnegative offset, and positive size required"
+                )
             address = self.at(symbol) + offset
             data = self.read(address, length)
             key = f"{symbol}+{offset:#x}:{length}"
-            memory[key] = {"symbol": symbol, "address": address,
-                           "address_hex": hex(address), "size": length,
-                           "bytes_hex": data.hex()}
+            memory[key] = {
+                "symbol": symbol,
+                "address": address,
+                "address_hex": hex(address),
+                "size": length,
+                "bytes_hex": data.hex(),
+            }
         for name in inspect_values:
             try:
-                memory[name] = {"address": self.at(name),
-                                "value": self.read_value(name),
-                                "type": self.symbols.type_layout(name)}
+                memory[name] = {
+                    "address": self.at(name),
+                    "value": self.read_value(name),
+                    "type": self.symbols.type_layout(name),
+                }
             except (KeyError, ValueError) as exc:
                 memory[name] = {"available": False, "reason": str(exc)}
         rings = {}
@@ -2257,19 +2800,26 @@ class DebugSession:
                 rings[spec] = self.read_ring(name, head)
             except (KeyError, ValueError) as exc:
                 rings[spec] = {"available": False, "reason": str(exc)}
-        frame_symbols = {frame.get("symbol", {}).get("name")
-                         for frame in trace["frames"] if frame.get("symbol")}
-        overlay_active = bool(frame_symbols & {
-            "open_pause_menu", "odroid_overlay_game_menu", "odroid_overlay_dialog"})
+        frame_symbols = {
+            frame.get("symbol", {}).get("name") for frame in trace["frames"] if frame.get("symbol")
+        }
+        overlay_active = bool(
+            frame_symbols & {"open_pause_menu", "odroid_overlay_game_menu", "odroid_overlay_dialog"}
+        )
         if screenshot["all_black"]:
             display_state = "all-black"
         elif overlay_active:
             display_state = "retro-go-overlay"
         else:
             display_state = "non-black"
-        return {"status": status, "display_state": display_state,
-                "screenshot": screenshot, "traceback": trace,
-                "memory": memory, "rings": rings}
+        return {
+            "status": status,
+            "display_state": display_state,
+            "screenshot": screenshot,
+            "traceback": trace,
+            "memory": memory,
+            "rings": rings,
+        }
 
     def qmp(self, execute: str, arguments: dict | None = None) -> dict:
         """Run one structured QMP command against the attached GWemu."""
@@ -2277,6 +2827,7 @@ class DebugSession:
             raise RuntimeError("pass --qmp-socket to enable GWemu QMP controls")
         if self.qmp_socket.startswith("gwprov://"):
             from .qmp import QMPConnection
+
             with QMPConnection(self.qmp_socket) as qmp:
                 return qmp.execute(execute, arguments)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -2297,31 +2848,63 @@ class DebugSession:
         """Press/release a GWemu button explicitly for frame-driven schedules."""
         if not isinstance(down, bool):
             raise ValueError("down must be a boolean")
-        qcodes = {"A": "x", "B": "z", "GAME": "g", "TIME": "t",
-                  "PAUSE": "esc", "POWER": "p", "START": "ret",
-                  "SELECT": "shift_r", "UP": "up", "DOWN": "down",
-                  "LEFT": "left", "RIGHT": "right"}
+        qcodes = {
+            "A": "x",
+            "B": "z",
+            "GAME": "g",
+            "TIME": "t",
+            "PAUSE": "esc",
+            "POWER": "p",
+            "START": "ret",
+            "SELECT": "shift_r",
+            "UP": "up",
+            "DOWN": "down",
+            "LEFT": "left",
+            "RIGHT": "right",
+        }
         button = name.upper()
         if button not in qcodes:
             raise ValueError(f"unknown Game & Watch button {name!r}")
-        return self.qmp("input-send-event", {"events": [{"type": "key",
-            "data": {"down": down, "key": {"type": "qcode", "data": qcodes[button]}}}]})
+        return self.qmp(
+            "input-send-event",
+            {
+                "events": [
+                    {
+                        "type": "key",
+                        "data": {"down": down, "key": {"type": "qcode", "data": qcodes[button]}},
+                    }
+                ]
+            },
+        )
 
     def key(self, name: str, hold_ms: int = 600) -> dict:
         """Send one Game & Watch button through GWemu's QMP keyboard map."""
-        qcodes = {"A": "x", "B": "z", "GAME": "g", "TIME": "t",
-                  "PAUSE": "esc", "POWER": "p", "START": "ret",
-                  "SELECT": "shift_r", "UP": "up", "DOWN": "down",
-                  "LEFT": "left", "RIGHT": "right"}
+        qcodes = {
+            "A": "x",
+            "B": "z",
+            "GAME": "g",
+            "TIME": "t",
+            "PAUSE": "esc",
+            "POWER": "p",
+            "START": "ret",
+            "SELECT": "shift_r",
+            "UP": "up",
+            "DOWN": "down",
+            "LEFT": "left",
+            "RIGHT": "right",
+        }
         button = name.upper()
         if button not in qcodes:
             raise ValueError(f"unknown Game & Watch button {name!r}")
         if hold_ms <= 0:
             raise ValueError("hold_ms must be positive")
-        return self.qmp("send-key", {
-            "keys": [{"type": "qcode", "data": qcodes[button]}],
-            "hold-time": hold_ms,
-        })
+        return self.qmp(
+            "send-key",
+            {
+                "keys": [{"type": "qcode", "data": qcodes[button]}],
+                "hold-time": hold_ms,
+            },
+        )
 
     @staticmethod
     def _qmp_request(stream, request: dict) -> dict:
@@ -2334,43 +2917,68 @@ class DebugSession:
                 return reply
 
     def __repr__(self):
-        return (f"DebugSession(transport={self.transport!r}, "
-                f"symbols={len(self.symbols._symbols)}, "
-                f"sources={[str(p) for p in self.symbols.sources]!r}, "
-                f"rebased={self.symbols._section_deltas!r})")
+        return (
+            f"DebugSession(transport={self.transport!r}, "
+            f"symbols={len(self.symbols._symbols)}, "
+            f"sources={[str(p) for p in self.symbols.sources]!r}, "
+            f"rebased={self.symbols._section_deltas!r})"
+        )
 
 
-def _print_debug_api_help(session: DebugSession, target: str, *,
-                          watchdog_freeze: bool = True) -> None:
+def _print_debug_api_help(
+    session: DebugSession, target: str, *, watchdog_freeze: bool = True
+) -> None:
     """Print workflow notes plus signatures/docstrings for the public debugger API."""
     width = shutil.get_terminal_size((92, 24)).columns
 
     def note(message: str) -> None:
-        print(textwrap.fill(message, width=width, initial_indent="  ",
-                            subsequent_indent="  "))
+        print(textwrap.fill(message, width=width, initial_indent="  ", subsequent_indent="  "))
 
     print("\nDebug workflow notes")
-    if target == "hardware":
+    if target in {"hardware", "remote-gdb"}:
         if watchdog_freeze:
-            note("Watchdogs: GW H7 WWDG1/IWDG1 freeze bits are attempted automatically at attach. "
-                 "When enabled, they freeze only while the CPU is halted. For pre-reset watchdog "
-                 "evidence, arm the WWDG handler breakpoint before reproducing; a post-reset BSOD "
-                 "cannot recover the old stack.")
+            note(
+                "Watchdogs: GW H7 WWDG1/IWDG1 freeze bits are attempted automatically at attach. "
+                "When enabled, they freeze only while the CPU is halted. For pre-reset watchdog "
+                "evidence, arm the WWDG handler breakpoint before reproducing; a post-reset BSOD "
+                "cannot recover the old stack."
+            )
         else:
-            note("Watchdog freeze writes are disabled (--no-watchdog-freeze). Breakpoint halts may "
-                 "still allow watchdogs to reset the MCU.")
-        note("Project autostart: a unique loaded debug/projects ELF is intercepted at app_main; "
-             "r1 is cleared by default. Use --paused to set start_paused, --attach-only to "
-             "skip reset and launch waiting, or --autostart-timeout SECONDS to return here "
-             "after a bounded launch attempt.")
+            note(
+                "Watchdog freeze writes are disabled (--no-watchdog-freeze). Breakpoint halts may "
+                "still allow watchdogs to reset the MCU."
+            )
+        if target == "hardware":
+            note(
+                "Project autostart: a unique loaded debug/projects ELF is intercepted at app_main; "
+                "r1 is cleared by default. Use --paused to set start_paused, --attach-only to "
+                "skip reset and launch waiting, or --autostart-timeout SECONDS to return here "
+                "after a bounded launch attempt."
+            )
+        else:
+            note(
+                "Raw remote GDB does not provide GWProv's managed reset-and-launch workflow. "
+                "Project autostart is skipped; use the backend or target controls directly."
+            )
     else:
         note("Project autostart hooks are automatic only for hardware debug sessions.")
     note("Retro-Go pause menu: B closes the menu and returns to the app.")
     if target == "hardware":
-        note("For an attach without target writes, combine --attach-only and "
-             "--no-watchdog-freeze. The console still performs passive state reads.")
-    note("For a fresh hardware launch: dbg.reset_and_run_project_unpaused(elf=project_elf). "
-         "It waits indefinitely for app_main by default; pass timeout=SECONDS when needed.")
+        note(
+            "For an attach without target writes, combine --attach-only and "
+            "--no-watchdog-freeze. The console still performs passive state reads."
+        )
+    elif target == "remote-gdb":
+        note(
+            "Raw GDB attach does not send halt, continue, reset, or watchdog-freeze writes. "
+            "The server itself may change target state on connect; that behavior is server-specific. "
+            "Use dbg.halt() or dbg.resume() when you want to control execution."
+        )
+    if target == "hardware":
+        note(
+            "For a fresh hardware launch: dbg.reset_and_run_project_unpaused(elf=project_elf). "
+            "It waits indefinitely for app_main by default; pass timeout=SECONDS when needed."
+        )
     print("\ndbg API (signatures and method docstrings)")
     hidden_api = {"press_button"}
     for name, method in inspect.getmembers(session, predicate=callable):
@@ -2379,53 +2987,79 @@ def _print_debug_api_help(session: DebugSession, target: str, *,
         try:
             signature = inspect.signature(method)
             signature = signature.replace(
-                parameters=[parameter.replace(annotation=inspect.Parameter.empty)
-                            for parameter in signature.parameters.values()],
-                return_annotation=inspect.Signature.empty)
+                parameters=[
+                    parameter.replace(annotation=inspect.Parameter.empty)
+                    for parameter in signature.parameters.values()
+                ],
+                return_annotation=inspect.Signature.empty,
+            )
         except (TypeError, ValueError):
             signature = "(...)"
-        usage = textwrap.fill(f"dbg.{name}{signature}", width=width,
-                              initial_indent="  ", subsequent_indent="    ")
+        usage = textwrap.fill(
+            f"dbg.{name}{signature}", width=width, initial_indent="  ", subsequent_indent="    "
+        )
         print(f"\n{usage}")
         description = inspect.getdoc(method) or "No docstring is available for this method."
         for paragraph in description.split("\n\n"):
-            wrapped = textwrap.fill(" ".join(paragraph.split()), width=width,
-                                    initial_indent="    ", subsequent_indent="      ")
+            wrapped = textwrap.fill(
+                " ".join(paragraph.split()),
+                width=width,
+                initial_indent="    ",
+                subsequent_indent="      ",
+            )
             print(wrapped)
 
 
-def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
-                 symbols: list[str] | None = None, openocd_port: int = 6666,
-                 probe_ids: list[str] | None = None, programmers: list[str] | None = None,
-                 remote_urls: list[str] | None = None, remote_origins: list[str] | None = None,
-                 qmp_socket: str | None = None, debug_config: str | None = None,
-                 retro_go_version: str | None = None,
-                 start_paused: bool = False, attach_only: bool = False,
-                 autostart_timeout: float | None = None,
-                 watchdog_freeze: bool = True) -> None:
+def python_shell(
+    *,
+    target: str,
+    host: str = "127.0.0.1",
+    port: int = 1234,
+    symbols: list[str] | None = None,
+    openocd_port: int = 6666,
+    probe_ids: list[str] | None = None,
+    programmers: list[str] | None = None,
+    remote_urls: list[str] | None = None,
+    remote_origins: list[str] | None = None,
+    remote_gdb_endpoints: list[dict] | None = None,
+    qmp_socket: str | None = None,
+    debug_config: str | None = None,
+    retro_go_version: str | None = None,
+    start_paused: bool = False,
+    attach_only: bool = False,
+    autostart_timeout: float | None = None,
+    watchdog_freeze: bool = True,
+) -> None:
     """Attach target sessions and expose them together in one Python REPL."""
     backends = {}
     sessions = {}
+    raw_gdb_target = bool(remote_gdb_endpoints)
     if target == "gwemu":
         if probe_ids or programmers or remote_urls:
             raise ValueError("probe/programmer selections apply only to hardware targets")
         backends["gwemu"] = GwemuGDBBackend(host=host, port=port)
     elif target == "hardware":
-        if not probe_ids and not programmers and not remote_urls:
+        if not probe_ids and not programmers and not remote_urls and not remote_gdb_endpoints:
             raise ValueError(
-                "hardware debug requires DEVICE or --probe-id, --programmer, or --remote-url")
-        from .backends import (SelectedOpenOCDBackend, SelectedPyOCDBackend,
-                               WebSocketBackend)
+                "hardware debug requires DEVICE or an explicit probe, programmer, or remote endpoint"
+            )
+        from .backends import SelectedOpenOCDBackend, SelectedPyOCDBackend, WebSocketBackend
+
         if len(programmers or []) != len(set(programmers or [])):
-            raise ValueError("select each OpenOCD programmer type at most once; use --probe-id for probe IDs")
+            raise ValueError(
+                "select each OpenOCD programmer type at most once; use --probe-id for probe IDs"
+            )
         for programmer in programmers or []:
             key = f"openocd:{programmer}"
             backends[key] = SelectedOpenOCDBackend(programmer, operation="gwprov debug session")
         for probe_id in probe_ids or []:
             key = f"probe:{probe_id}"
-            backends[key] = SelectedPyOCDBackend(probe_id, operation="gwprov debug session",
-                                                  allow_recovery_marker=True,
-                                                  daemon_proxy=True)
+            backends[key] = SelectedPyOCDBackend(
+                probe_id,
+                operation="gwprov debug session",
+                allow_recovery_marker=True,
+                daemon_proxy=True,
+            )
         urls = remote_urls or []
         origins = remote_origins or []
         if origins and len(origins) != len(urls):
@@ -2433,13 +3067,25 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
         for index, remote_url in enumerate(urls):
             key = f"remote:{index + 1}"
             origin = origins[index] if origins else None
-            backends[key] = WebSocketBackend(remote_url, origin=origin,
-                                             operation="gwprov remote debug session",
-                                             allow_recovery_marker=True,
-                                             daemon_proxy=True)
+            backends[key] = WebSocketBackend(
+                remote_url,
+                origin=origin,
+                operation="gwprov remote debug session",
+                allow_recovery_marker=True,
+                daemon_proxy=True,
+            )
+        for endpoint in remote_gdb_endpoints or []:
+            key = f"gdb:{endpoint['name']}"
+            backends[key] = RemoteGDBBackend(
+                str(endpoint["host"]),
+                int(endpoint["port"]),
+                url=str(endpoint["url"]),
+                operation="gwprov remote GDB debug session",
+            )
         if not backends:
             raise ValueError(
-                "select a device or pass --probe-id, --programmer, or --remote-url")
+                "select a device or pass --probe-id, --programmer, --remote-url, or a registered GDB endpoint"
+            )
     else:
         raise ValueError(f"unknown target {target!r}")
 
@@ -2452,10 +3098,12 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
                 try:
                     from .hw_lifecycle import identify_runtime
                     import re
+
                     if session_version is None:
                         runtime = identify_runtime(backend, pc_fallback=True)
                         version_pattern = re.compile(
-                            r"Retro-Go\s+(?:SD\s+)?(v[\w.+-]+)", re.IGNORECASE)
+                            r"Retro-Go\s+(?:SD\s+)?(v[\w.+-]+)", re.IGNORECASE
+                        )
                         # A dual-boot profile may have different Retro-Go builds
                         # in bank 1 and bank 2. Prefer the version identified at
                         # the active VTOR; use installed-bank metadata only when
@@ -2464,33 +3112,39 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
                         if active_match:
                             session_version = active_match.group(1)
                         else:
-                            installed_versions = set(version_pattern.findall(
-                                runtime.get("installed", "")))
+                            installed_versions = set(
+                                version_pattern.findall(runtime.get("installed", ""))
+                            )
                             if len(installed_versions) == 1:
                                 session_version = installed_versions.pop()
                     if session_version:
                         from .debug_symbols import retro_go_profile_symbols
+
                         matched = retro_go_profile_symbols(session_version)
                         if matched:
                             firmware_elf, app_elfs = matched
                             matched_symbols = [str(firmware_elf), *(str(path) for path in app_elfs)]
-                            missing_symbols = [path for path in matched_symbols
-                                               if path not in session_symbols]
+                            missing_symbols = [
+                                path for path in matched_symbols if path not in session_symbols
+                            ]
                             session_symbols.extend(missing_symbols)
                             if missing_symbols:
-                                print(f"[{key}] detected Retro-Go {session_version}; "
-                                      f"using symbols from profile {firmware_elf.parents[1].name}")
+                                print(
+                                    f"[{key}] detected Retro-Go {session_version}; "
+                                    f"using symbols from profile {firmware_elf.parents[1].name}"
+                                )
                 except Exception as error:
                     print(f"[{key}] installed firmware symbol lookup skipped: {error}")
-            session = DebugSession(backend, target,
-                                   qmp_socket=qmp_socket if target == "gwemu" else None)
+            session_target = "hardware" if target == "hardware" else target
+            session = DebugSession(
+                backend, session_target, qmp_socket=qmp_socket if target == "gwemu" else None
+            )
             session.retro_go_version = session_version
             sessions[key] = session
-            if target == "hardware" and watchdog_freeze:
+            if target == "hardware" and watchdog_freeze and not raw_gdb_target:
                 try:
                     frozen = session.enable_watchdog_freeze()
-                    enabled = ", ".join(name for name, state in frozen.items()
-                                         if state["enabled"])
+                    enabled = ", ".join(name for name, state in frozen.items() if state["enabled"])
                     print(f"[{key}] MCU watchdogs freeze while halted: {enabled}")
                 except Exception as error:
                     print(f"[{key}] MCU watchdog freeze unavailable: {error}")
@@ -2502,33 +3156,58 @@ def python_shell(*, target: str, host: str = "127.0.0.1", port: int = 1234,
         first_key = next(iter(sessions))
         session = sessions[first_key]
         backend = backends[first_key]
-        project_elfs = [path for path in session._loaded_elfs()
-                        if "projects" in path.parts
-                        and "app_main" in session.symbols._symbols_by_elf.get(path, {})]
-        if (target == "hardware" and len(sessions) == 1 and len(project_elfs) == 1
-                and not attach_only):
+        project_elfs = [
+            path
+            for path in session._loaded_elfs()
+            if "projects" in path.parts
+            and "app_main" in session.symbols._symbols_by_elf.get(path, {})
+        ]
+        if (
+            target == "hardware"
+            and not raw_gdb_target
+            and len(sessions) == 1
+            and len(project_elfs) == 1
+            and not attach_only
+        ):
             project_elf = project_elfs[0]
             print(f"[{first_key}] preparing project autostart from reset: {project_elf.name}")
             launch_result = session.reset_and_run_project_unpaused(
-                elf=project_elf, timeout=autostart_timeout,
-                force_start_paused=start_paused)
+                elf=project_elf, timeout=autostart_timeout, force_start_paused=start_paused
+            )
             if launch_result.get("intercepted"):
                 mode = "set start_paused" if start_paused else "cleared start_paused"
                 print(f"[{first_key}] app_main reached; {mode}; target resumed")
             else:
-                print(f"[{first_key}] app_main hook did not trigger; "
-                      "continuing to Python console with target state: "
-                      + str(session._target_state()))
+                print(
+                    f"[{first_key}] app_main hook did not trigger; "
+                    "continuing to Python console with target state: "
+                    + str(session._target_state())
+                )
+        elif target == "hardware" and raw_gdb_target:
+            print(
+                "Automatic project autostart skipped: raw GDB endpoints do not provide "
+                "GWProv's managed reset sequence."
+            )
         elif target == "hardware" and attach_only:
             print("Automatic project autostart skipped (--attach-only); target was not reset.")
         elif target == "hardware" and len(project_elfs) > 1:
-            print("Automatic project autostart hook skipped: multiple loaded project ELFs "
-                  "define app_main; use dbg.run_project_unpaused(elf=...) manually.")
+            print(
+                "Automatic project autostart hook skipped: multiple loaded project ELFs "
+                "define app_main; use dbg.run_project_unpaused(elf=...) manually."
+            )
         print("Connected sessions:", {key: repr(value) for key, value in sessions.items()})
         print("Python debugger: dbg is the first session; sessions[key] accesses each target.")
-        _print_debug_api_help(session, target, watchdog_freeze=watchdog_freeze)
-        namespace = {"dbg": session, "sessions": sessions,
-                     "backends": backends, "symbols": session.symbols}
+        _print_debug_api_help(
+            session,
+            "remote-gdb" if raw_gdb_target else target,
+            watchdog_freeze=watchdog_freeze,
+        )
+        namespace = {
+            "dbg": session,
+            "sessions": sessions,
+            "backends": backends,
+            "symbols": session.symbols,
+        }
         code.interact(banner="gwprov interactive debug (Ctrl-D disconnects)", local=namespace)
     finally:
         for backend in reversed(list(backends.values())):

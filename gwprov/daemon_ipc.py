@@ -6,6 +6,7 @@ Windows uses a named pipe with an explicit DACL for the current user and
 SYSTEM; the server also verifies the connecting process token's user SID.
 Messages are newline-delimited UTF-8 JSON objects.
 """
+
 from __future__ import annotations
 
 import json
@@ -29,8 +30,7 @@ def runtime_directory() -> Path:
         path = Path.home() / "Library" / "Caches" / "gwprov" / "run"
     else:
         base = os.environ.get("XDG_RUNTIME_DIR")
-        path = (Path(base) / "gwprov" if base else
-                Path.home() / ".cache" / "gwprov" / "run")
+        path = Path(base) / "gwprov" if base else Path.home() / ".cache" / "gwprov" / "run"
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name != "nt":
         try:
@@ -44,6 +44,7 @@ def endpoint() -> str:
     if os.name == "nt":
         sid = _windows_current_user_sid()
         import hashlib
+
         return r"\\.\pipe\gwprov-" + hashlib.sha256(sid.encode("ascii")).hexdigest()[:24]
     return str(runtime_directory() / "daemon.sock")
 
@@ -55,18 +56,24 @@ def _windows_current_user_sid() -> str:
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi.OpenProcessToken.restype = wintypes.BOOL
-    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                        ctypes.POINTER(wintypes.HANDLE)]
+    advapi.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
     kernel.GetCurrentProcess.restype = wintypes.HANDLE
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.LocalFree.argtypes = [wintypes.HLOCAL]
     advapi.GetTokenInformation.restype = wintypes.BOOL
-    advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                           wintypes.LPVOID, wintypes.DWORD,
-                                           ctypes.POINTER(wintypes.DWORD)]
+    advapi.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
-    advapi.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID,
-                                              ctypes.POINTER(wintypes.LPWSTR)]
+    advapi.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
     token = wintypes.HANDLE()
     if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
         raise ctypes.WinError(ctypes.get_last_error())
@@ -90,8 +97,10 @@ def _windows_current_user_sid() -> str:
 
 def request(message: dict, *, timeout: float = 5.0) -> dict:
     """Send one request and return its structured response."""
-    encoded = json.dumps({"protocol": PROTOCOL_VERSION, **message},
-                         separators=(",", ":")).encode("utf-8") + b"\n"
+    encoded = (
+        json.dumps({"protocol": PROTOCOL_VERSION, **message}, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
     if os.name == "nt":
         return _windows_request(encoded, timeout)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
@@ -126,18 +135,34 @@ def _windows_request(encoded: bytes, timeout: float) -> dict:
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.restype = wintypes.HANDLE
-    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                                   wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
-                                   wintypes.HANDLE]
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.WaitNamedPipeW.restype = wintypes.BOOL
     kernel.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
     kernel.ReadFile.restype = wintypes.BOOL
     kernel.WriteFile.restype = wintypes.BOOL
-    kernel.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-                                ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-    kernel.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
-                                 ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    kernel.ReadFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel.WriteFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
     pipe_name = endpoint()
     deadline = __import__("time").monotonic() + timeout
     handle = wintypes.HANDLE()
@@ -159,10 +184,11 @@ def _windows_request(encoded: bytes, timeout: float) -> dict:
 def _write_handle(kernel, handle, payload: bytes) -> None:
     import ctypes
     from ctypes import wintypes
+
     offset = 0
     while offset < len(payload):
         written = wintypes.DWORD()
-        chunk = payload[offset:offset + 65536]
+        chunk = payload[offset : offset + 65536]
         buffer = ctypes.create_string_buffer(chunk)
         if not kernel.WriteFile(handle, buffer, len(chunk), ctypes.byref(written), None):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -172,6 +198,7 @@ def _write_handle(kernel, handle, payload: bytes) -> None:
 def _read_handle_response(kernel, handle) -> dict:
     import ctypes
     from ctypes import wintypes
+
     data = bytearray()
     while not data.endswith(b"\n"):
         buffer = ctypes.create_string_buffer(65536)
@@ -180,7 +207,7 @@ def _read_handle_response(kernel, handle) -> dict:
             raise ctypes.WinError(ctypes.get_last_error())
         if not read.value:
             raise ConnectionError("GWProv daemon closed the IPC connection")
-        data.extend(buffer.raw[:read.value])
+        data.extend(buffer.raw[: read.value])
         if len(data) > 4 * 1024 * 1024:
             raise ValueError("GWProv daemon response exceeded 4 MiB")
     response = json.loads(data)
@@ -195,10 +222,17 @@ class DaemonServer:
     """Serve one-request local IPC connections to a dispatch callback."""
 
     MAX_CONNECTIONS = 32
-    OVERLOADED_RESPONSE = (json.dumps(
-        {"protocol": PROTOCOL_VERSION, "ok": False,
-         "error": "GWProv daemon is at its request limit; retry shortly"},
-        separators=(",", ":")).encode("utf-8") + b"\n")
+    OVERLOADED_RESPONSE = (
+        json.dumps(
+            {
+                "protocol": PROTOCOL_VERSION,
+                "ok": False,
+                "error": "GWProv daemon is at its request limit; retry shortly",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
 
     def __init__(self, dispatch: Callable[[dict], dict]):
         self.dispatch = dispatch
@@ -258,8 +292,9 @@ class DaemonServer:
                     finally:
                         connection.close()
                     continue
-                thread = threading.Thread(target=self._serve_connection_slot,
-                                          args=(connection,), daemon=True)
+                thread = threading.Thread(
+                    target=self._serve_connection_slot, args=(connection,), daemon=True
+                )
                 thread.start()
         finally:
             listener.close()
@@ -293,17 +328,20 @@ class DaemonServer:
                 if request_data.get("protocol") != PROTOCOL_VERSION:
                     raise RuntimeError("GWProv daemon protocol version mismatch")
                 result = self.dispatch(request_data)
-                response = {"protocol": PROTOCOL_VERSION, "ok": True,
-                            **(result if isinstance(result, dict) else {"result": result})}
+                response = {
+                    "protocol": PROTOCOL_VERSION,
+                    "ok": True,
+                    **(result if isinstance(result, dict) else {"result": result}),
+                }
             except Exception as error:
-                response = {"protocol": PROTOCOL_VERSION, "ok": False,
-                            "error": str(error)}
+                response = {"protocol": PROTOCOL_VERSION, "ok": False, "error": str(error)}
             connection.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
 
     @staticmethod
     def _verify_unix_peer(connection: socket.socket) -> None:
         if hasattr(socket, "SO_PEERCRED"):
             import struct
+
             credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
             _, uid, _ = struct.unpack("3i", credentials)
             if hasattr(os, "getuid") and uid != os.getuid():
@@ -336,28 +374,43 @@ def _windows_create_pipe(name: str):
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateNamedPipeW.restype = wintypes.HANDLE
-    kernel.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                                        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
-                                        wintypes.DWORD, wintypes.LPVOID]
+    kernel.CreateNamedPipeW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+    ]
     kernel.LocalFree.argtypes = [wintypes.HLOCAL]
     advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
     advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID),
-        ctypes.POINTER(wintypes.DWORD)]
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     sid = _windows_current_user_sid()
     sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;{sid})"
     descriptor = wintypes.LPVOID()
     if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl, 1, ctypes.byref(descriptor), None):
+        sddl, 1, ctypes.byref(descriptor), None
+    ):
         raise ctypes.WinError(ctypes.get_last_error())
 
     class SecurityAttributes(ctypes.Structure):
-        _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", wintypes.LPVOID),
-                    ("bInheritHandle", wintypes.BOOL)]
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", wintypes.LPVOID),
+            ("bInheritHandle", wintypes.BOOL),
+        ]
 
     attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
-    handle = kernel.CreateNamedPipeW(name, 0x00000003, 0x00000008,
-                                     1, 65536, 65536, 500, ctypes.byref(attributes))
+    handle = kernel.CreateNamedPipeW(
+        name, 0x00000003, 0x00000008, 1, 65536, 65536, 500, ctypes.byref(attributes)
+    )
     error = ctypes.get_last_error()
     kernel.LocalFree(descriptor)
     if handle == wintypes.HANDLE(-1).value:
@@ -370,6 +423,7 @@ def _windows_create_pipe(name: str):
 def _windows_connect_pipe(handle) -> bool:
     import ctypes
     from ctypes import wintypes
+
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.ConnectNamedPipe.restype = ctypes.c_int
     kernel.ConnectNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
@@ -381,24 +435,30 @@ def _windows_connect_pipe(handle) -> bool:
 def _windows_verify_pipe_client(handle) -> None:
     import ctypes
     from ctypes import wintypes
+
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel.GetNamedPipeClientProcessId.restype = ctypes.c_int
-    kernel.GetNamedPipeClientProcessId.argtypes = [wintypes.HANDLE,
-                                                   ctypes.POINTER(wintypes.ULONG)]
+    kernel.GetNamedPipeClientProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG)]
     kernel.OpenProcess.restype = wintypes.HANDLE
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     advapi.OpenProcessToken.restype = wintypes.BOOL
-    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                        ctypes.POINTER(wintypes.HANDLE)]
+    advapi.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
     advapi.GetTokenInformation.restype = wintypes.BOOL
-    advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                           wintypes.LPVOID, wintypes.DWORD,
-                                           ctypes.POINTER(wintypes.DWORD)]
+    advapi.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
-    advapi.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID,
-                                              ctypes.POINTER(wintypes.LPWSTR)]
+    advapi.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
     kernel.LocalFree.argtypes = [wintypes.HLOCAL]
     pid = wintypes.ULONG()
     if not kernel.GetNamedPipeClientProcessId(handle, ctypes.byref(pid)):
@@ -418,7 +478,6 @@ def _windows_verify_pipe_client(handle) -> None:
                 raise ctypes.WinError(ctypes.get_last_error())
             sid_pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
             peer = wintypes.LPWSTR()
-            current = wintypes.LPWSTR()
             if not advapi.ConvertSidToStringSidW(sid_pointer, ctypes.byref(peer)):
                 raise ctypes.WinError(ctypes.get_last_error())
             own_sid = _windows_current_user_sid()
@@ -436,20 +495,25 @@ def _windows_verify_pipe_client(handle) -> None:
 def _windows_handle_request(handle, dispatch: Callable[[dict], dict]) -> None:
     import ctypes
     from ctypes import wintypes
+
     data = bytearray()
     while not data.endswith(b"\n"):
         buffer = ctypes.create_string_buffer(65536)
         read = wintypes.DWORD()
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.ReadFile.restype = wintypes.BOOL
-        kernel.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-                                    ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-        if not kernel.ReadFile(
-                handle, buffer, len(buffer), ctypes.byref(read), None):
+        kernel.ReadFile.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        ]
+        if not kernel.ReadFile(handle, buffer, len(buffer), ctypes.byref(read), None):
             raise ctypes.WinError(ctypes.get_last_error())
         if not read.value:
             return
-        data.extend(buffer.raw[:read.value])
+        data.extend(buffer.raw[: read.value])
         if len(data) > 4 * 1024 * 1024:
             raise ValueError("GWProv daemon request exceeded 4 MiB")
     try:
@@ -459,8 +523,11 @@ def _windows_handle_request(handle, dispatch: Callable[[dict], dict]) -> None:
         if not isinstance(request_data, dict) or request_data.get("protocol") != PROTOCOL_VERSION:
             raise RuntimeError("GWProv daemon protocol version mismatch")
         result = dispatch(request_data)
-        response = {"protocol": PROTOCOL_VERSION, "ok": True,
-                    **(result if isinstance(result, dict) else {"result": result})}
+        response = {
+            "protocol": PROTOCOL_VERSION,
+            "ok": True,
+            **(result if isinstance(result, dict) else {"result": result}),
+        }
     except Exception as error:
         response = {"protocol": PROTOCOL_VERSION, "ok": False, "error": str(error)}
     payload = json.dumps(response, separators=(",", ":")).encode() + b"\n"
@@ -468,16 +535,21 @@ def _windows_handle_request(handle, dispatch: Callable[[dict], dict]) -> None:
     buffer = ctypes.create_string_buffer(payload)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.WriteFile.restype = wintypes.BOOL
-    kernel.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
-                                 ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-    if not kernel.WriteFile(
-            handle, buffer, len(payload), ctypes.byref(written), None):
+    kernel.WriteFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    if not kernel.WriteFile(handle, buffer, len(payload), ctypes.byref(written), None):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _windows_close_pipe(handle) -> None:
     import ctypes
     from ctypes import wintypes
+
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -489,15 +561,27 @@ def _windows_wake_server(name: str) -> None:
     """Release a blocking ConnectNamedPipe so the server can observe shutdown."""
     import ctypes
     from ctypes import wintypes
+
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.restype = wintypes.HANDLE
-    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                                   wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
-                                   wintypes.HANDLE]
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.WriteFile.restype = wintypes.BOOL
-    kernel.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
-                                 ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    kernel.WriteFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
     handle = kernel.CreateFileW(name, 0xC0000000, 0, None, 3, 0, None)
     if handle != wintypes.HANDLE(-1).value:
         payload = b'{"protocol":0,"op":"shutdown-wake"}\n'

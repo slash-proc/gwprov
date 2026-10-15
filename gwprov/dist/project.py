@@ -1,4 +1,5 @@
 """Resolve and stage GWRG distribution projects."""
+
 from __future__ import annotations
 
 import hashlib
@@ -49,7 +50,9 @@ def normalize_repo(value: str) -> str:
 
 
 def _json(url: str) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"User-Agent": "gwprov/0.1", "Accept": "application/json"})
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "gwprov/0.1", "Accept": "application/json"}
+    )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read(MAX_JSON_BYTES + 1)
@@ -87,7 +90,9 @@ def list_versions(repo: str, *, versions_url: str | None = None) -> dict[str, An
     return index
 
 
-def resolve_project(repo: str, tag: str | None = None, *, versions_url: str | None = None) -> ResolvedProject:
+def resolve_project(
+    repo: str, tag: str | None = None, *, versions_url: str | None = None
+) -> ResolvedProject:
     requested_repo = normalize_repo(repo) if "/" in repo else repo.casefold()
     index_url = versions_url or versions_url_for(repo)
     if urlparse(index_url).scheme != "https":
@@ -105,13 +110,18 @@ def resolve_project(repo: str, tag: str | None = None, *, versions_url: str | No
     versions = index.get("versions")
     if not isinstance(versions, list) or not versions:
         raise ValueError("versions.json has no published versions")
-    selected = next((v for v in versions if isinstance(v, dict) and v.get("tag") == tag), None) if tag else versions[0]
+    selected = (
+        next((v for v in versions if isinstance(v, dict) and v.get("tag") == tag), None)
+        if tag
+        else versions[0]
+    )
     if not isinstance(selected, dict):
         raise ValueError(f"version {tag!r} is not currently published")
     manifest_ref = selected.get("manifest")
     if not isinstance(manifest_ref, str) or not manifest_ref:
         raise ValueError("version entry has no manifest URL")
     from urllib.parse import urljoin
+
     manifest_url = urljoin(index_url, manifest_ref)
     if urlparse(manifest_url).scheme != "https":
         raise ValueError("manifest URL must use HTTPS")
@@ -142,10 +152,14 @@ def load_project_catalog(repo: str = DEFAULT_CATALOG_REPO) -> dict[str, Any]:
     if not isinstance(projects, list):
         raise ValueError("projects.json has no valid projects list")
     for item in projects:
-        if (not isinstance(item, dict) or not isinstance(item.get("project"), str)
-                or not isinstance(item.get("title"), str) or item.get("kind") not in {"core", "homebrew"}
-                or not isinstance(item.get("versionsUrl"), str)
-                or urlparse(item["versionsUrl"]).scheme != "https"):
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("project"), str)
+            or not isinstance(item.get("title"), str)
+            or item.get("kind") not in {"core", "homebrew"}
+            or not isinstance(item.get("versionsUrl"), str)
+            or urlparse(item["versionsUrl"]).scheme != "https"
+        ):
             raise ValueError("projects.json contains an invalid project entry")
     return {"schemaVersion": 1, "source": repo, "projects": projects}
 
@@ -155,10 +169,18 @@ def _catalog_entry(name: str, catalog: dict[str, Any]) -> dict[str, Any] | None:
     for item in catalog["projects"]:
         versions = urlparse(item["versionsUrl"])
         segments = versions.path.strip("/").split("/")
-        repository = segments[-3] if len(segments) >= 3 and segments[-2:] == ["dist", "versions.json"] else ""
+        repository = (
+            segments[-3]
+            if len(segments) >= 3 and segments[-2:] == ["dist", "versions.json"]
+            else ""
+        )
         owner = (versions.hostname or "").split(".", 1)[0]
-        aliases = {item["project"].casefold(), repository.casefold(), f"{owner}/{item['project']}".casefold(),
-                   f"{owner}/{repository}".casefold()}
+        aliases = {
+            item["project"].casefold(),
+            repository.casefold(),
+            f"{owner}/{item['project']}".casefold(),
+            f"{owner}/{repository}".casefold(),
+        }
         if key in aliases:
             return item
     return None
@@ -184,12 +206,17 @@ def _fetch_checked(base_url: str, entry: dict[str, Any], *, url_key: str = "url"
     ref = entry.get(url_key)
     expected_size = entry.get("bytes")
     expected_hash = entry.get("sha256")
-    if (not isinstance(ref, str) or not isinstance(expected_size, int) or expected_size < 0
-            or expected_size > MAX_PUBLISHED_BYTES):
+    if (
+        not isinstance(ref, str)
+        or not isinstance(expected_size, int)
+        or expected_size < 0
+        or expected_size > MAX_PUBLISHED_BYTES
+    ):
         raise ValueError(f"invalid or excessive published file metadata for {filename or ref}")
     if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
         raise ValueError(f"invalid SHA-256 for published file {filename or ref}")
     from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+
     url = urljoin(base_url, ref)
     parts = urlsplit(url)
     url = urlunsplit(parts._replace(path=quote(parts.path, safe="/%:@!$&'()*+,;=-._~")))
@@ -202,7 +229,9 @@ def _fetch_checked(base_url: str, entry: dict[str, Any], *, url_key: str = "url"
     except (urllib.error.URLError, TimeoutError) as exc:
         raise ValueError(f"could not fetch {url}: {exc}") from exc
     if len(data) != expected_size:
-        raise ValueError(f"size mismatch for {filename or ref}: expected {expected_size}, got {len(data)}")
+        raise ValueError(
+            f"size mismatch for {filename or ref}: expected {expected_size}, got {len(data)}"
+        )
     actual = hashlib.sha256(data).hexdigest()
     if actual.lower() != expected_hash.lower():
         raise ValueError(f"SHA-256 mismatch for {filename or ref}")
@@ -210,9 +239,14 @@ def _fetch_checked(base_url: str, entry: dict[str, Any], *, url_key: str = "url"
 
 
 def _plain_name(name: str) -> str:
-    if (not name or len(name) > 200 or name in {".", ".."} or name[0] in {".", " "}
-            or name.endswith((".", " "))
-            or any(ord(c) < 32 or ord(c) == 127 or c in '\\/:*?"<>|' for c in name)):
+    if (
+        not name
+        or len(name) > 200
+        or name in {".", ".."}
+        or name[0] in {".", " "}
+        or name.endswith((".", " "))
+        or any(ord(c) < 32 or ord(c) == 127 or c in '\\/:*?"<>|' for c in name)
+    ):
         raise ValueError(f"unsafe install filename: {name!r}")
     return name
 
@@ -246,7 +280,9 @@ def _target_dir(target: dict[str, Any], role: str, system: str | None = None) ->
         if not system:
             systems = target.get("systems", [])
             if len(systems) != 1:
-                raise ValueError("a core with multiple systems needs uses[].system for each converter")
+                raise ValueError(
+                    "a core with multiple systems needs uses[].system for each converter"
+                )
             system = systems[0].get("id")
         if not isinstance(system, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", system):
             raise ValueError(f"invalid ROM system id {system!r}")
@@ -259,7 +295,9 @@ def _target_dir(target: dict[str, Any], role: str, system: str | None = None) ->
     raise ValueError(f"unknown install role {role!r}")
 
 
-def _input_files(tool: dict[str, Any], file_specs: list[str], dir_specs: list[str], *, require_slots: bool) -> tuple[list[dict[str, Any]], list[str]]:
+def _input_files(
+    tool: dict[str, Any], file_specs: list[str], dir_specs: list[str], *, require_slots: bool
+) -> tuple[list[dict[str, Any]], list[str]]:
     slots: dict[str, list[Path]] = {}
     for spec in file_specs:
         if "=" not in spec:
@@ -274,7 +312,10 @@ def _input_files(tool: dict[str, Any], file_specs: list[str], dir_specs: list[st
         if not directory.is_dir():
             raise ValueError(f"not a directory: {directory}")
         # Slots describe a set such as OpenLara's DATA directory; do not recurse into unrelated subfolders.
-        files = sorted((p for p in directory.iterdir() if p.is_file() and not p.is_symlink()), key=lambda p: p.name.casefold())
+        files = sorted(
+            (p for p in directory.iterdir() if p.is_file() and not p.is_symlink()),
+            key=lambda p: p.name.casefold(),
+        )
         input_spec = next((item for item in tool.get("inputs", []) if item.get("id") == slot), {})
         extensions = {ext.casefold() for ext in input_spec.get("extensions", [])}
         if extensions:
@@ -284,8 +325,11 @@ def _input_files(tool: dict[str, Any], file_specs: list[str], dir_specs: list[st
         hashes = {str(item.get("sha1", "")).lower() for item in input_spec.get("variants", [])}
         for path in files:
             try:
-                _, payload = read_input(path, extensions=extensions,
-                                        max_bytes=int(input_spec.get("maxBytes") or 512 * 1024 * 1024))
+                _, payload = read_input(
+                    path,
+                    extensions=extensions,
+                    max_bytes=int(input_spec.get("maxBytes") or 512 * 1024 * 1024),
+                )
             except ValueError as exc:
                 print(f"warning: skipping {path.name}: {exc}")
                 continue
@@ -318,8 +362,9 @@ def _input_files(tool: dict[str, Any], file_specs: list[str], dir_specs: list[st
                 raise ValueError(f"input file does not exist: {path}")
             extensions = spec.get("extensions", [])
             max_bytes = int(spec.get("maxBytes", 0))
-            name, data = read_input(path, extensions=set(extensions),
-                                    max_bytes=max_bytes or 512 * 1024 * 1024)
+            name, data = read_input(
+                path, extensions=set(extensions), max_bytes=max_bytes or 512 * 1024 * 1024
+            )
             name = _plain_name(name)
             if max_bytes and len(data) > max_bytes:
                 raise ValueError(f"{name}: {len(data)} bytes exceeds maxBytes={max_bytes}")
@@ -327,26 +372,39 @@ def _input_files(tool: dict[str, Any], file_specs: list[str], dir_specs: list[st
             variants = spec.get("variants", [])
             variant = next((v for v in variants if str(v.get("sha1", "")).lower() == sha1), None)
             if variant and variant.get("bytes") is not None and len(data) != int(variant["bytes"]):
-                raise ValueError(f"{name}: size does not match recognised variant {variant.get('id', '')!r}")
+                raise ValueError(
+                    f"{name}: size does not match recognised variant {variant.get('id', '')!r}"
+                )
             if variant is None and spec.get("strict", True):
-                raise ValueError(f"{name}: hash is not a recognised variant for input slot {slot!r}")
+                raise ValueError(
+                    f"{name}: hash is not a recognised variant for input slot {slot!r}"
+                )
             if variant is None and variants:
-                warnings.append(f"{name}: unrecognised input accepted by slot {slot!r} (strict=false)")
+                warnings.append(
+                    f"{name}: unrecognised input accepted by slot {slot!r} (strict=false)"
+                )
             prepared.append({"slot": slot, "filename": name, "bytes": data, "variant": variant})
     # A tool may declare one required file globally but mark its input slots optional only when uses is optional.
     return prepared, warnings
 
 
-def _run_wasm(wasm: bytes, tool: dict[str, Any], inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _run_wasm(
+    wasm: bytes, tool: dict[str, Any], inputs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     try:
         import wasmtime
     except ImportError as exc:
-        raise ValueError("converter execution requires the optional dependency: pip install 'gwprov[dist]'") from exc
+        raise ValueError(
+            "converter execution requires the optional dependency: pip install 'gwprov[dist]'"
+        ) from exc
     processor = tool.get("processor", {})
     if processor.get("type") != "wasm" or processor.get("version") != 1:
         raise ValueError(f"unsupported processor {processor!r}")
     binary = tool.get("binary", {})
-    if len(wasm) != binary.get("bytes") or hashlib.sha256(wasm).hexdigest().lower() != str(binary.get("sha256", "")).lower():
+    if (
+        len(wasm) != binary.get("bytes")
+        or hashlib.sha256(wasm).hexdigest().lower() != str(binary.get("sha256", "")).lower()
+    ):
         raise ValueError("converter binary size or SHA-256 mismatch")
 
     config = wasmtime.Config()
@@ -356,21 +414,42 @@ def _run_wasm(wasm: bytes, tool: dict[str, Any], inputs: list[dict[str, Any]]) -
     if module.imports:
         raise ValueError("converter WASM imports are not allowed")
     abi_signatures = {
-        "abi_version": (0, 1), "alloc": (1, 1), "input_clear": (0, 0),
-        "input_add": (2, 1), "run": (1, 1), "run_begin": (1, 1), "run_step": (0, 1),
-        "stage_count": (0, 1), "stage_index": (0, 1), "stage_name_ptr": (1, 1),
-        "stage_name_len": (1, 1), "output_count": (0, 1), "output_name_ptr": (1, 1),
-        "output_name_len": (1, 1), "output_ptr": (1, 1), "output_len": (1, 1),
-        "error_ptr": (0, 1), "error_len": (0, 1), "warnings_ptr": (0, 1), "warnings_len": (0, 1),
+        "abi_version": (0, 1),
+        "alloc": (1, 1),
+        "input_clear": (0, 0),
+        "input_add": (2, 1),
+        "run": (1, 1),
+        "run_begin": (1, 1),
+        "run_step": (0, 1),
+        "stage_count": (0, 1),
+        "stage_index": (0, 1),
+        "stage_name_ptr": (1, 1),
+        "stage_name_len": (1, 1),
+        "output_count": (0, 1),
+        "output_name_ptr": (1, 1),
+        "output_name_len": (1, 1),
+        "output_ptr": (1, 1),
+        "output_len": (1, 1),
+        "error_ptr": (0, 1),
+        "error_len": (0, 1),
+        "warnings_ptr": (0, 1),
+        "warnings_len": (0, 1),
     }
     exported = {e.name: e for e in module.exports}
     required_names = set(abi_signatures) | {"memory"}
     if not required_names <= set(exported):
-        raise ValueError("converter is missing ABI exports: " + ", ".join(sorted(required_names - set(exported))))
-    extra_functions = [name for name, export in exported.items()
-                       if isinstance(export.type, wasmtime.FuncType) and name not in abi_signatures]
+        raise ValueError(
+            "converter is missing ABI exports: " + ", ".join(sorted(required_names - set(exported)))
+        )
+    extra_functions = [
+        name
+        for name, export in exported.items()
+        if isinstance(export.type, wasmtime.FuncType) and name not in abi_signatures
+    ]
     if extra_functions:
-        raise ValueError("converter has unexpected function exports: " + ", ".join(sorted(extra_functions)))
+        raise ValueError(
+            "converter has unexpected function exports: " + ", ".join(sorted(extra_functions))
+        )
     memory_types = [e.type for e in module.exports if e.name == "memory"]
     if len(memory_types) != 1 or not isinstance(memory_types[0], wasmtime.MemoryType):
         raise ValueError("converter must export exactly one linear memory")
@@ -391,10 +470,29 @@ def _run_wasm(wasm: bytes, tool: dict[str, Any], inputs: list[dict[str, Any]]) -
     instance = wasmtime.Instance(store, module, [])
     exports = instance.exports(store)
     names = {e.name for e in module.exports}
-    required = {"memory", "abi_version", "alloc", "input_clear", "input_add", "run", "run_begin", "run_step",
-                "stage_count", "stage_index", "stage_name_ptr", "stage_name_len", "output_count",
-                "output_name_ptr", "output_name_len", "output_ptr", "output_len", "error_ptr", "error_len",
-                "warnings_ptr", "warnings_len"}
+    required = {
+        "memory",
+        "abi_version",
+        "alloc",
+        "input_clear",
+        "input_add",
+        "run",
+        "run_begin",
+        "run_step",
+        "stage_count",
+        "stage_index",
+        "stage_name_ptr",
+        "stage_name_len",
+        "output_count",
+        "output_name_ptr",
+        "output_name_len",
+        "output_ptr",
+        "output_len",
+        "error_ptr",
+        "error_len",
+        "warnings_ptr",
+        "warnings_len",
+    }
     if not required <= names:
         raise ValueError("converter is missing ABI exports: " + ", ".join(sorted(required - names)))
     memory = exports["memory"]
@@ -402,7 +500,7 @@ def _run_wasm(wasm: bytes, tool: dict[str, Any], inputs: list[dict[str, Any]]) -
         raise ValueError("unsupported converter ABI version")
 
     def u32(value: int) -> int:
-        return value & 0xffffffff
+        return value & 0xFFFFFFFF
 
     def read(ptr: int, length: int, cap: int) -> bytes:
         ptr, length = u32(ptr), u32(length)
@@ -412,7 +510,9 @@ def _run_wasm(wasm: bytes, tool: dict[str, Any], inputs: list[dict[str, Any]]) -
 
     def fail(code: int) -> None:
         try:
-            message = read(exports["error_ptr"](store), exports["error_len"](store), 65536).decode("utf-8", "strict")
+            message = read(exports["error_ptr"](store), exports["error_len"](store), 65536).decode(
+                "utf-8", "strict"
+            )
         except Exception:
             message = ""
         raise ValueError(f"converter failed ({u32(code)}): {message}".rstrip())
@@ -447,7 +547,9 @@ def _run_wasm(wasm: bytes, tool: dict[str, Any], inputs: list[dict[str, Any]]) -
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
     for i in range(count):
-        oid = read(exports["output_name_ptr"](store, i), exports["output_name_len"](store, i), 255).decode("utf-8", "strict")
+        oid = read(
+            exports["output_name_ptr"](store, i), exports["output_name_len"](store, i), 255
+        ).decode("utf-8", "strict")
         spec = specs.get(oid)
         if spec is None:
             matches = [output for output in specs.values() if output.get("filename") == oid]
@@ -501,20 +603,26 @@ def install_project(
     bundle_assets = None
     if bundle_path is not None:
         from .bundle import import_project_bundle
+
         resolved, bundle_assets = import_project_bundle(bundle_path)
         if tag and resolved.version.get("tag") != tag:
-            raise ValueError(f"project bundle contains {resolved.version.get('tag')!r}, not {tag!r}")
+            raise ValueError(
+                f"project bundle contains {resolved.version.get('tag')!r}, not {tag!r}"
+            )
     else:
         resolved = resolve_project(repo, tag, versions_url=versions_url)
     manifest = resolved.manifest
     storage = manifest.get("storage")
-    supported_storage = ([item for item in storage if item in {"flash", "sd"}]
-                         if isinstance(storage, list) else [])
+    supported_storage = (
+        [item for item in storage if item in {"flash", "sd"}] if isinstance(storage, list) else []
+    )
     targets = manifest.get("targets")
     if not isinstance(targets, list) or not targets:
         raise ValueError("manifest has no targets")
     if target_id:
-        target = next((t for t in targets if isinstance(t, dict) and t.get("id") == target_id), None)
+        target = next(
+            (t for t in targets if isinstance(t, dict) and t.get("id") == target_id), None
+        )
     elif len(targets) == 1:
         target = targets[0]
     else:
@@ -528,7 +636,8 @@ def install_project(
             if supported_storage and variant_hint not in supported_storage:
                 raise ValueError(
                     f"destination indicates {variant_hint}, but this project only publishes "
-                    f"{', '.join(supported_storage)}")
+                    f"{', '.join(supported_storage)}"
+                )
             variant = variant_hint
         elif len(set(supported_storage)) == 1:
             variant = supported_storage[0]
@@ -536,11 +645,13 @@ def install_project(
             supported = ", ".join(dict.fromkeys(supported_storage)) or "flash and sd"
             raise ValueError(
                 f"could not infer project variant (project supports {supported}); "
-                "specify --variant flash or --variant sd")
+                "specify --variant flash or --variant sd"
+            )
     elif supported_storage and variant not in supported_storage:
         raise ValueError(
             f"project does not publish a {variant} variant "
-            f"(supports: {', '.join(dict.fromkeys(supported_storage))})")
+            f"(supports: {', '.join(dict.fromkeys(supported_storage))})"
+        )
     kind = target.get("kind")
     if kind not in {"homebrew", "core"}:
         raise ValueError(f"unsupported project target kind {kind!r}")
@@ -552,9 +663,20 @@ def install_project(
     converter_inputs: list[dict[str, Any]] = []
     symbol_files: list[tuple[Path, bytes]] = []
 
-    def add(relative: Path, data: bytes, origin: str, *, allow_identical: bool = False, mapped: bool = False) -> None:
+    def add(
+        relative: Path,
+        data: bytes,
+        origin: str,
+        *,
+        allow_identical: bool = False,
+        mapped: bool = False,
+    ) -> None:
         if variant == "flash":
-            partition = "littlefs" if relative.parts[0] in {"cores", "lang", "data"} and not mapped else "frogfs"
+            partition = (
+                "littlefs"
+                if relative.parts[0] in {"cores", "lang", "data"} and not mapped
+                else "frogfs"
+            )
             relative = Path(partition) / relative
         relative = Path(variant) / relative
         key = relative.as_posix().casefold()
@@ -574,6 +696,7 @@ def install_project(
         if bundle_assets is None:
             return _fetch_checked(base, spec, url_key=url_key)
         from urllib.parse import urljoin
+
         ref = spec.get(url_key)
         if not isinstance(ref, str):
             raise ValueError("project bundle declaration has no URL")
@@ -585,8 +708,13 @@ def install_project(
         expected_hash = spec.get("sha256")
         filename = spec.get("filename") or spec.get("file") or ref
         if not isinstance(expected_size, int) or len(data) != expected_size:
-            raise ValueError(f"size mismatch for {filename}: expected {expected_size}, got {len(data)}")
-        if not isinstance(expected_hash, str) or hashlib.sha256(data).hexdigest().lower() != expected_hash.lower():
+            raise ValueError(
+                f"size mismatch for {filename}: expected {expected_size}, got {len(data)}"
+            )
+        if (
+            not isinstance(expected_hash, str)
+            or hashlib.sha256(data).hexdigest().lower() != expected_hash.lower()
+        ):
             raise ValueError(f"SHA-256 mismatch for {filename}")
         return data
 
@@ -594,7 +722,12 @@ def install_project(
         filename = _plain_name(artifact.get("filename", ""))
         data = fetch_asset(artifact)
         is_mapped = artifact.get("mapped") is True
-        add(_target_dir(target, "artifact") / filename, data, f"artifact:{filename}", mapped=is_mapped)
+        add(
+            _target_dir(target, "artifact") / filename,
+            data,
+            f"artifact:{filename}",
+            mapped=is_mapped,
+        )
         if is_mapped:
             raw_base = artifact.get("relocBase")
             try:
@@ -602,9 +735,15 @@ def install_project(
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"mapped artifact {filename} needs an integer relocBase") from exc
             if not 0 <= reloc_base <= 0xFFFFFFFF:
-                raise ValueError(f"mapped artifact {filename} relocBase is outside the 32-bit address space")
-            mapped_artifacts.append({"path": (_target_dir(target, "artifact") / filename).as_posix(),
-                                     "relocBase": reloc_base})
+                raise ValueError(
+                    f"mapped artifact {filename} relocBase is outside the 32-bit address space"
+                )
+            mapped_artifacts.append(
+                {
+                    "path": (_target_dir(target, "artifact") / filename).as_posix(),
+                    "relocBase": reloc_base,
+                }
+            )
     symbol_specs = target.get("symbols", [])
     if not isinstance(symbol_specs, list):
         raise ValueError("target symbols must be a list")
@@ -616,8 +755,7 @@ def install_project(
         data = fetch_asset(spec)
         if filename.lower().endswith(".elf") and not data.startswith(b"\x7fELF"):
             raise ValueError(f"published debug symbols are not an ELF file: {filename}")
-        relative = _safe_relpath(
-            f"projects/{identity.as_posix()}/{target['id']}/{filename}")
+        relative = _safe_relpath(f"projects/{identity.as_posix()}/{target['id']}/{filename}")
         if any(path == relative for path, _ in symbol_files):
             raise ValueError(f"duplicate target debug symbol destination: {relative}")
         symbol_files.append((relative, data))
@@ -652,18 +790,29 @@ def install_project(
         directory = Path(raw).expanduser().resolve()
         if not directory.is_dir():
             raise ValueError(f"not a game directory: {directory}")
-        candidates = sorted((p for p in directory.iterdir() if p.is_file() and not p.is_symlink()), key=lambda p: p.name.casefold())
+        candidates = sorted(
+            (p for p in directory.iterdir() if p.is_file() and not p.is_symlink()),
+            key=lambda p: p.name.casefold(),
+        )
         game_inputs[sid].extend(candidates)
         directory_games.update(candidates)
 
     for sid, paths in game_inputs.items():
         system = systems_by_id[sid]
-        allowed = {ext.casefold() for item in system.get("extensions", [])
-                   for ext in (item if isinstance(item, list) else [item]) if isinstance(ext, str)}
+        allowed = {
+            ext.casefold()
+            for item in system.get("extensions", [])
+            for ext in (item if isinstance(item, list) else [item])
+            if isinstance(ext, str)
+        }
         for path in paths:
             if not path.is_file():
                 raise ValueError(f"game file does not exist: {path}")
-            if path in directory_games and allowed and path.suffix.casefold() not in allowed | {".zip"}:
+            if (
+                path in directory_games
+                and allowed
+                and path.suffix.casefold() not in allowed | {".zip"}
+            ):
                 continue
             try:
                 filename, data = read_input(path, extensions=allowed)
@@ -673,8 +822,12 @@ def install_project(
                 print(f"warning: skipping {path.name}: {exc}")
                 continue
             filename = _plain_name(filename)
-            add(_target_dir(target, "game", sid) / filename, data,
-                f"user-game:{sid}/{filename}", allow_identical=True)
+            add(
+                _target_dir(target, "game", sid) / filename,
+                data,
+                f"user-game:{sid}/{filename}",
+                allow_identical=True,
+            )
             selected_games.setdefault(sid, []).append((filename, data, f"user:{filename}"))
 
     # Firmware inputs can be supplied by id or found by their declared filename in a directory.
@@ -688,8 +841,11 @@ def install_project(
     for directory in bios_dir_paths:
         if not directory.is_dir():
             raise ValueError(f"not a firmware directory: {directory}")
-    bios_entries = [(sid, system, firmware) for sid, system in systems_by_id.items()
-                    for firmware in _system_firmware(system)]
+    bios_entries = [
+        (sid, system, firmware)
+        for sid, system in systems_by_id.items()
+        for firmware in _system_firmware(system)
+    ]
     bios_id_counts: dict[str, int] = {}
     for _, _, bios in bios_entries:
         if isinstance(bios.get("id"), str):
@@ -708,8 +864,12 @@ def install_project(
             filename = _plain_name(filename)
             data = fetch_asset({**bios, "filename": filename})
             bios_key = _firmware_directory(system, sid)
-            add(Path("bios") / _safe_relpath(bios_key) / filename, data,
-                f"shipped-firmware:{sid}/{filename}", allow_identical=True)
+            add(
+                Path("bios") / _safe_relpath(bios_key) / filename,
+                data,
+                f"shipped-firmware:{sid}/{filename}",
+                allow_identical=True,
+            )
 
     unknown_bios = set(supplied_bios) - set(bios_slots)
     if unknown_bios:
@@ -725,7 +885,9 @@ def install_project(
         names = [_plain_name(name) for name in names]
         if key not in bios_candidates:
             for directory in bios_dir_paths:
-                found = next((directory / name for name in names if (directory / name).is_file()), None)
+                found = next(
+                    (directory / name for name in names if (directory / name).is_file()), None
+                )
                 if found:
                     bios_candidates[key] = found
                     break
@@ -737,8 +899,12 @@ def install_project(
         candidate = bios_candidates.get(key)
         if not candidate:
             if needed:
-                reason = "required" if bios.get("required") else "required for the selected game type"
-                raise ValueError(f"missing {reason} firmware {key!r}; pass --firmware {key}=FILE or --firmware-dir DIR")
+                reason = (
+                    "required" if bios.get("required") else "required for the selected game type"
+                )
+                raise ValueError(
+                    f"missing {reason} firmware {key!r}; pass --firmware {key}=FILE or --firmware-dir DIR"
+                )
             continue
         if not candidate.is_file():
             raise ValueError(f"firmware file does not exist: {candidate}")
@@ -757,8 +923,12 @@ def install_project(
                     raise ValueError(message)
                 print(f"warning: {message} (strict=false)")
         bios_key = _firmware_directory(system, sid)
-        add(Path("bios") / _safe_relpath(bios_key) / filename, data,
-            f"user-firmware:{key}/{filename}", allow_identical=True)
+        add(
+            Path("bios") / _safe_relpath(bios_key) / filename,
+            data,
+            f"user-firmware:{key}/{filename}",
+            allow_identical=True,
+        )
 
     tools = {t.get("id"): t for t in manifest.get("tools", []) if isinstance(t, dict)}
     uses = target.get("uses", [])
@@ -768,6 +938,7 @@ def install_project(
         tool = tools.get(tool_id)
         if not tool:
             raise ValueError(f"target references missing tool {tool_id!r}")
+
         def scoped(specs: list[str] | None, *, allow_bare_dir: bool = False) -> list[str]:
             result: list[str] = []
             input_slots = tool.get("inputs", [])
@@ -777,8 +948,12 @@ def install_project(
                         result.append(f"{input_slots[0].get('id')}={item}")
                         continue
                     if allow_bare_dir and len(uses_by_tool) > 1:
-                        raise ValueError("targets with multiple converters require TOOL.SLOT=DIR syntax")
-                    raise ValueError("converter inputs must use SLOT=FILE or SLOT=DIR syntax; a bare directory is accepted only for a single-slot converter")
+                        raise ValueError(
+                            "targets with multiple converters require TOOL.SLOT=DIR syntax"
+                        )
+                    raise ValueError(
+                        "converter inputs must use SLOT=FILE or SLOT=DIR syntax; a bare directory is accepted only for a single-slot converter"
+                    )
                 key, value = item.split("=", 1)
                 if "." in key:
                     prefix, slot = key.split(".", 1)
@@ -787,27 +962,45 @@ def install_project(
                             result.append(f"{slot}={value}")
                         continue
                 if len(uses_by_tool) > 1:
-                    raise ValueError("targets with multiple converters require TOOL.SLOT=FILE syntax")
+                    raise ValueError(
+                        "targets with multiple converters require TOOL.SLOT=FILE syntax"
+                    )
                 result.append(item)
             return result
+
         provided_files = scoped(input_files)
         provided_dirs = scoped(input_dirs, allow_bare_dir=True)
-        prepared, warnings = _input_files(tool, provided_files, provided_dirs, require_slots=bool(use.get("required", True)))
+        prepared, warnings = _input_files(
+            tool, provided_files, provided_dirs, require_slots=bool(use.get("required", True))
+        )
         for warning in warnings:
             print(f"warning: {warning}")
-        converter_inputs.extend({"tool": tool_id, "slot": item["slot"],
-                                 "filename": item["filename"],
-                                 "sha1": hashlib.sha1(item["bytes"]).hexdigest(),
-                                 "variant": (item.get("variant") or {}).get("id")}
-                                for item in prepared)
+        converter_inputs.extend(
+            {
+                "tool": tool_id,
+                "slot": item["slot"],
+                "filename": item["filename"],
+                "sha1": hashlib.sha1(item["bytes"]).hexdigest(),
+                "variant": (item.get("variant") or {}).get("id"),
+            }
+            for item in prepared
+        )
         if not prepared:
             if use.get("required", True):
                 required_slots = [s.get("id") for s in tool.get("inputs", []) if s.get("required")]
                 if required_slots:
-                    raise ValueError(f"tool {tool_id!r} is required and needs input slot(s): {', '.join(required_slots)}")
+                    raise ValueError(
+                        f"tool {tool_id!r} is required and needs input slot(s): {', '.join(required_slots)}"
+                    )
             continue
         wasm = fetch_asset(tool.get("binary", {}), url_key="url")
-        groups = [[item for item in prepared if item["slot"] in {i.get("id") for i in tool.get("inputs", [])}]]
+        groups = [
+            [
+                item
+                for item in prepared
+                if item["slot"] in {i.get("id") for i in tool.get("inputs", [])}
+            ]
+        ]
         # runPerFile applies per declared slot. For current schemas each runPerFile tool has one slot.
         per_file_slots = {i.get("id") for i in tool.get("inputs", []) if i.get("runPerFile")}
         if per_file_slots:
@@ -824,13 +1017,18 @@ def install_project(
                     filename = _plain_name(spec["filename"])
                 else:
                     variant_spec = input_item.get("variant") or {}
-                    filename = variant_spec.get("filename") or Path(input_item["filename"]).stem + spec["extension"]
+                    filename = (
+                        variant_spec.get("filename")
+                        or Path(input_item["filename"]).stem + spec["extension"]
+                    )
                     filename = _plain_name(filename)
                 outputs.append((spec, converted["bytes"], {**input_item, "filename": filename}))
         use_outputs = set(use.get("outputs", []))
         missing_outputs = use_outputs - produced_ids
         if missing_outputs:
-            raise ValueError(f"converter {tool_id!r} did not produce declared output(s): {', '.join(sorted(missing_outputs))}")
+            raise ValueError(
+                f"converter {tool_id!r} did not produce declared output(s): {', '.join(sorted(missing_outputs))}"
+            )
         for spec, data, input_item in outputs:
             if spec["id"] not in use_outputs:
                 continue
@@ -842,11 +1040,31 @@ def install_project(
                 destination = _target_dir(target, "game", use.get("system"))
             output_path = destination / input_item["filename"]
             variant_id = (input_item.get("variant") or {}).get("id")
-            existing = next((entry for entry in planned if entry[0].as_posix().casefold() == output_path.as_posix().casefold()), None)
-            shipped = next((game for system in systems for game in system.get("games", [])
-                            if (system.get("id") == use.get("system") or len(systems) == 1)
-                            and str(game.get("filename", "")).casefold() == input_item["filename"].casefold()), None)
-            if existing and shipped and variant_id and variant_id.casefold() in input_item["filename"].casefold():
+            existing = next(
+                (
+                    entry
+                    for entry in planned
+                    if entry[0].as_posix().casefold() == output_path.as_posix().casefold()
+                ),
+                None,
+            )
+            shipped = next(
+                (
+                    game
+                    for system in systems
+                    for game in system.get("games", [])
+                    if (system.get("id") == use.get("system") or len(systems) == 1)
+                    and str(game.get("filename", "")).casefold()
+                    == input_item["filename"].casefold()
+                ),
+                None,
+            )
+            if (
+                existing
+                and shipped
+                and variant_id
+                and variant_id.casefold() in input_item["filename"].casefold()
+            ):
                 # The manifest and known input variant name the same game. Keep the shipped,
                 # release-verified bytes as the single install item.
                 continue
@@ -855,16 +1073,26 @@ def install_project(
     # When a recognized variant resolves to the same filename as a shipped game, keep the
     # release-verified shipped bytes and represent the game only once in the staging plan.
     if dry_run:
-        return {"repo": resolved.repo, "tag": resolved.version.get("tag"), "target": target.get("id"),
-                "variant": variant, "files": [p.as_posix() for p, _, _ in planned],
-                "plannedFiles": [{"path": path.as_posix(), "bytes": len(data)}
-                                 for path, data, _origin in planned],
-                "mappedArtifacts": mapped_artifacts,
-                "requiresAbi": target.get("requiresAbi"),
-                "symbols": [p.as_posix() for p, _ in symbol_files],
-                "bundle": bundle_path is not None,
-                "provenance": "local bundle; publisher identity not authenticated" if bundle_path is not None else "verified release",
-                "dry_run": True}
+        return {
+            "repo": resolved.repo,
+            "tag": resolved.version.get("tag"),
+            "target": target.get("id"),
+            "variant": variant,
+            "files": [p.as_posix() for p, _, _ in planned],
+            "plannedFiles": [
+                {"path": path.as_posix(), "bytes": len(data)} for path, data, _origin in planned
+            ],
+            "mappedArtifacts": mapped_artifacts,
+            "requiresAbi": target.get("requiresAbi"),
+            "symbols": [p.as_posix() for p, _ in symbol_files],
+            "bundle": bundle_path is not None,
+            "provenance": (
+                "local bundle; publisher identity not authenticated"
+                if bundle_path is not None
+                else "verified release"
+            ),
+            "dry_run": True,
+        }
 
     # Refuse to overwrite unrelated files. A prior gwprov-owned project install may be upgraded in place.
     marker = root / variant / ".gwprov-projects.json"
@@ -881,7 +1109,9 @@ def install_project(
             if cursor.is_symlink():
                 raise ValueError(f"refusing to follow symlink in install path: {cursor}")
         if destination.exists() and relative.as_posix().casefold() not in prior_files:
-            raise ValueError(f"refusing to overwrite existing file not owned by this project: {destination} ({origin})")
+            raise ValueError(
+                f"refusing to overwrite existing file not owned by this project: {destination} ({origin})"
+            )
     for relative, _data in symbol_files:
         destination = root / "debug" / relative
         cursor = root
@@ -922,19 +1152,35 @@ def install_project(
                 continue
             if stale.is_file():
                 stale.unlink()
-        metadata = {"repo": resolved.repo, "tag": resolved.version.get("tag"),
-                    "project": manifest.get("project"), "target": target.get("id"),
-                    "variant": variant, "files": [p.as_posix() for p, _, _ in planned],
-                    "requiresAbi": target.get("requiresAbi"), "mapped": mapped_artifacts,
-                    "inputs": converter_inputs,
-                    "symbols": sorted(new_symbol_paths)}
+        metadata = {
+            "repo": resolved.repo,
+            "tag": resolved.version.get("tag"),
+            "project": manifest.get("project"),
+            "target": target.get("id"),
+            "variant": variant,
+            "files": [p.as_posix() for p, _, _ in planned],
+            "requiresAbi": target.get("requiresAbi"),
+            "mapped": mapped_artifacts,
+            "inputs": converter_inputs,
+            "symbols": sorted(new_symbol_paths),
+        }
         ownership[project_key] = metadata
         root.mkdir(parents=True, exist_ok=True)
         metadata_path = marker
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(json.dumps(ownership, indent=2) + "\n", encoding="utf-8")
-    return {"repo": resolved.repo, "tag": resolved.version.get("tag"), "target": target.get("id"),
-            "variant": variant, "files": [p.as_posix() for p, _, _ in planned],
-            "symbols": sorted(new_symbol_paths), "bundle": bundle_path is not None,
-            "provenance": "local bundle; publisher identity not authenticated" if bundle_path is not None else "verified release",
-            "dry_run": False}
+    return {
+        "repo": resolved.repo,
+        "tag": resolved.version.get("tag"),
+        "target": target.get("id"),
+        "variant": variant,
+        "files": [p.as_posix() for p, _, _ in planned],
+        "symbols": sorted(new_symbol_paths),
+        "bundle": bundle_path is not None,
+        "provenance": (
+            "local bundle; publisher identity not authenticated"
+            if bundle_path is not None
+            else "verified release"
+        ),
+        "dry_run": False,
+    }

@@ -59,16 +59,25 @@ import os
 import signal
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # --- Shadow cell and bit order: keep in sync with the firmware's
 #     Core/Inc/gw_buttons.h and scripts/remote_input.py ---
 SHADOW_ADDR = 0x30001FF4
 
 BUTTON_BITS = {
-    "up": 0, "down": 1, "left": 2, "right": 3,
-    "a": 4, "b": 5, "start": 6, "select": 7,
-    "pause": 8, "game": 9, "time": 10, "power": 11,
+    "up": 0,
+    "down": 1,
+    "left": 2,
+    "right": 3,
+    "a": 4,
+    "b": 5,
+    "start": 6,
+    "select": 7,
+    "pause": 8,
+    "game": 9,
+    "time": 10,
+    "power": 11,
 }
 BIT_NAME = {v: k for k, v in BUTTON_BITS.items()}
 
@@ -89,10 +98,10 @@ def mask_str(mask: int) -> str:
 
 @dataclass(frozen=True)
 class Event:
-    t: float                # seconds from the start of the run
-    kind: str               # "down" | "release" | "quit" | "screenshot"
+    t: float  # seconds from the start of the run
+    kind: str  # "down" | "release" | "quit" | "screenshot"
     button: str = ""
-    path: str = ""          # screenshot only
+    path: str = ""  # screenshot only
     line: int = 0
 
     def __str__(self):
@@ -127,7 +136,7 @@ def _parse_time(tok):
     mins = 0.0
     if ":" in tok:
         head, tok = tok.split(":", 1)
-        mins = float(head)          # ValueError -> caller reports the line
+        mins = float(head)  # ValueError -> caller reports the line
         if mins < 0:
             raise ValueError(tok)
     if tok.endswith("s"):
@@ -167,14 +176,12 @@ def parse_text(text, name="<timeline>", frame_hz=FRAME_HZ):
             try:
                 t = int(stamp[1:]) / frame_hz
             except ValueError:
-                raise TimelineError(
-                    f"{name}:{lineno}: bad frame number {stamp!r}")
+                raise TimelineError(f"{name}:{lineno}: bad frame number {stamp!r}")
         else:
             try:
                 t = _parse_time(stamp)
             except ValueError:
-                raise TimelineError(
-                    f"{name}:{lineno}: not a timestamp: {stamp!r}")
+                raise TimelineError(f"{name}:{lineno}: not a timestamp: {stamp!r}")
 
         if act == "quit":
             events.append(Event(t, "quit", line=lineno))
@@ -187,7 +194,8 @@ def parse_text(text, name="<timeline>", frame_hz=FRAME_HZ):
         if act not in ("press", "down", "hold", "release"):
             raise TimelineError(
                 f"{name}:{lineno}: unknown action {act!r} (expected "
-                f"press/down/hold/release/screenshot/quit)")
+                f"press/down/hold/release/screenshot/quit)"
+            )
         if len(parts) < 3:
             raise TimelineError(f"{name}:{lineno}: {act} with no button")
 
@@ -197,7 +205,8 @@ def parse_text(text, name="<timeline>", frame_hz=FRAME_HZ):
             if word not in BUTTON_BITS:
                 raise TimelineError(
                     f"{name}:{lineno}: unknown button {word!r}; known: "
-                    f"{' '.join(sorted(BUTTON_BITS))}")
+                    f"{' '.join(sorted(BUTTON_BITS))}"
+                )
             buttons.append(word)
 
         release_after = None
@@ -205,13 +214,11 @@ def parse_text(text, name="<timeline>", frame_hz=FRAME_HZ):
             release_after = TAP_S
         elif act == "hold":
             if len(parts) < 4:
-                raise TimelineError(
-                    f"{name}:{lineno}: hold with no duration")
+                raise TimelineError(f"{name}:{lineno}: hold with no duration")
             try:
                 release_after = float(parts[3])
             except ValueError:
-                raise TimelineError(
-                    f"{name}:{lineno}: bad hold duration {parts[3]!r}")
+                raise TimelineError(f"{name}:{lineno}: bad hold duration {parts[3]!r}")
             if release_after <= 0:
                 raise TimelineError(f"{name}:{lineno}: hold duration must be >0")
         for b in buttons:
@@ -220,8 +227,7 @@ def parse_text(text, name="<timeline>", frame_hz=FRAME_HZ):
             else:
                 events.append(Event(t, "down", b, line=lineno))
                 if release_after is not None:
-                    events.append(Event(t + release_after, "release", b,
-                                        line=lineno))
+                    events.append(Event(t + release_after, "release", b, line=lineno))
     # A stable sort keeps same-timestamp events in file order, which is what a
     # recording means by them.
     events.sort(key=lambda e: e.t)
@@ -247,7 +253,7 @@ def states(events):
     for e in events:
         if e.kind == "quit":
             break
-        if e.kind == "screenshot":      # gwemu-side only; nothing to inject
+        if e.kind == "screenshot":  # gwemu-side only; nothing to inject
             continue
         bit = 1 << BUTTON_BITS[e.button]
         mask = (mask | bit) if e.kind == "down" else (mask & ~bit)
@@ -280,13 +286,15 @@ def short_presses_of(events):
     never observed by the firmware, and a test that quietly presses nothing is
     worse than one that says so.
     """
-    return [p for p in presses(events)
-            if p[2] is not None and (p[2] - p[1]) * 1000 < SHORT_PRESS_MS]
+    return [
+        p for p in presses(events) if p[2] is not None and (p[2] - p[1]) * 1000 < SHORT_PRESS_MS
+    ]
 
 
 @dataclass
 class Delivery:
     """One state change as it was ACTUALLY delivered."""
+
     scheduled: float
     actual: float
     mask: int
@@ -336,8 +344,10 @@ class GwemuPlayer(Player):
         self.events = parse(path)
 
     def report(self):
-        return (f"timeline {self.path}: {len(self.events)} events replayed by "
-                f"gwemu itself (GNW_TIMELINE, emulated time -- exact)")
+        return (
+            f"timeline {self.path}: {len(self.events)} events replayed by "
+            f"gwemu itself (GNW_TIMELINE, emulated time -- exact)"
+        )
 
 
 class ShadowWordPlayer(Player):
@@ -353,8 +363,7 @@ class ShadowWordPlayer(Player):
     quietly does nothing.
     """
 
-    def __init__(self, backend, events, addr=SHADOW_ADDR, lock=None,
-                 verbose=True):
+    def __init__(self, backend, events, addr=SHADOW_ADDR, lock=None, verbose=True):
         self.backend = backend
         self.events = events
         self.addr = addr
@@ -384,18 +393,20 @@ class ShadowWordPlayer(Player):
         self.t0 = t0 if t0 is not None else time.time()
         if self.verbose:
             risky = self.short_presses()
-            print(f"[timeline] {len(self.states)} state changes over "
-                  f"{self.states[-1][0] if self.states else 0:.1f}s "
-                  f"via shadow word 0x{self.addr:08X}")
+            print(
+                f"[timeline] {len(self.states)} state changes over "
+                f"{self.states[-1][0] if self.states else 0:.1f}s "
+                f"via shadow word 0x{self.addr:08X}"
+            )
             if risky:
-                print(f"[timeline] WARNING: {len(risky)} press(es) held for "
-                      f"under {SHORT_PRESS_MS}ms; the device polls buttons "
-                      f"once a frame and may not see them: "
-                      + ", ".join(f"{b}@{d:.3f}s({(r-d)*1000:.0f}ms)"
-                                  for b, d, r in risky[:6]))
+                print(
+                    f"[timeline] WARNING: {len(risky)} press(es) held for "
+                    f"under {SHORT_PRESS_MS}ms; the device polls buttons "
+                    f"once a frame and may not see them: "
+                    + ", ".join(f"{b}@{d:.3f}s({(r-d)*1000:.0f}ms)" for b, d, r in risky[:6])
+                )
         self._install_guard()
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="timeline")
+        self._thread = threading.Thread(target=self._run, daemon=True, name="timeline")
         self._thread.start()
         return self
 
@@ -423,7 +434,8 @@ class ShadowWordPlayer(Player):
             try:
                 prev = signal.getsignal(sig)
             except (ValueError, OSError):
-                continue            # not the main thread: nothing to install
+                continue  # not the main thread: nothing to install
+
             def handler(signum, frame, _prev=prev):
                 self._release_quietly()
                 if callable(_prev):
@@ -431,10 +443,11 @@ class ShadowWordPlayer(Player):
                 elif _prev == signal.SIG_DFL:
                     signal.signal(signum, signal.SIG_DFL)
                     os.kill(os.getpid(), signum)
+
             try:
                 signal.signal(sig, handler)
             except (ValueError, OSError):
-                pass                # not the main thread
+                pass  # not the main thread
 
     def _release_quietly(self):
         """Zero the shadow word, best effort, from any exit path."""
@@ -442,7 +455,7 @@ class ShadowWordPlayer(Player):
         try:
             self._write(0)
         except Exception:
-            pass                    # a dead probe must not mask the real error
+            pass  # a dead probe must not mask the real error
 
     def _run(self):
         try:
@@ -458,15 +471,14 @@ class ShadowWordPlayer(Player):
                     if self._stop.wait(delay):
                         break
                 actual, write_s = self._write(mask)
-                self.deliveries.append(Delivery(sched, actual - self.t0, mask,
-                                                write_s))
+                self.deliveries.append(Delivery(sched, actual - self.t0, mask, write_s))
             # `quit` on hardware = stop injecting, hands off the device.
             if self.quit_at is not None:
                 delay = self.t0 + self.quit_at - time.time()
                 if delay > 0:
                     self._stop.wait(delay)
             self._write(0)
-        except Exception as exc:            # a dead probe must not hang a test
+        except Exception as exc:  # a dead probe must not hang a test
             self.error = exc
         finally:
             self._done.set()
@@ -476,7 +488,7 @@ class ShadowWordPlayer(Player):
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         try:
-            self._write(0)                  # never leave a button held
+            self._write(0)  # never leave a button held
         except Exception:
             pass
 
@@ -537,8 +549,7 @@ class ShadowWordPlayer(Player):
         if not s["delivered"]:
             return "timeline: nothing was delivered"
         lines = [
-            f"timeline: {s['delivered']}/{s['events']} state changes delivered "
-            f"over SWD",
+            f"timeline: {s['delivered']}/{s['events']} state changes delivered " f"over SWD",
             f"  lateness vs the file: mean {s['late_mean']*1000:.1f}ms, "
             f"max {s['late_max']*1000:.1f}ms, min {s['late_min']*1000:.1f}ms",
             f"  shadow-word write: mean {s['write_mean']*1000:.2f}ms, "

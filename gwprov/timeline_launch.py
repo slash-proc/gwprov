@@ -1,9 +1,9 @@
 """Configure GWemu's native guest-clock input recorder and player."""
+
 from pathlib import Path
 
 
-def configure_timeline(env: dict, *, timeline=None, record_timeline=None,
-                       headless=False):
+def configure_timeline(env: dict, *, timeline=None, record_timeline=None, headless=False):
     """Validate before launching; never overwrite an existing recorded route."""
     if timeline and record_timeline:
         raise ValueError("choose --timeline or --record-timeline for this launch")
@@ -23,5 +23,8 @@ def configure_timeline(env: dict, *, timeline=None, record_timeline=None,
         path.parent.mkdir(parents=True, exist_ok=True)
         env["GNW_TIMELINE_RECORD"] = str(path)
         env.pop("GNW_TIMELINE", None)
-        print(f"Recording GUI inputs to {path} using guest time; "
-              "close GWemu cleanly when finished.", flush=True)
+        print(
+            f"Recording GUI inputs to {path} using guest time; "
+            "close GWemu cleanly when finished.",
+            flush=True,
+        )

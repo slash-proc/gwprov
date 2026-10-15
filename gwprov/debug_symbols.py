@@ -1,4 +1,5 @@
 """Resolve local firmware symbols without guessing across releases or builds."""
+
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +15,9 @@ def retro_go_profile_symbols(version: str | None) -> tuple[Path, list[Path]] | N
 
     root = profile_directory()
     matches = []
-    for candidate in sorted(root.iterdir(), key=lambda item: item.name.casefold()) if root.is_dir() else ():
+    for candidate in (
+        sorted(root.iterdir(), key=lambda item: item.name.casefold()) if root.is_dir() else ()
+    ):
         if not candidate.is_dir():
             continue
         metadata_path = candidate / "provision.json"
@@ -34,16 +37,18 @@ def retro_go_profile_symbols(version: str | None) -> tuple[Path, list[Path]] | N
             continue
         debug_root = candidate / "debug"
         payload_symbols = sorted(
-            [*debug_root.joinpath("apps").rglob("*.elf"),
-             *debug_root.joinpath("projects").rglob("*.elf")],
-            key=lambda item: item.as_posix().casefold())
+            [
+                *debug_root.joinpath("apps").rglob("*.elf"),
+                *debug_root.joinpath("projects").rglob("*.elf"),
+            ],
+            key=lambda item: item.as_posix().casefold(),
+        )
         matches.append((candidate, firmware_elf, payload_symbols))
     if not matches:
         return None
 
     firmware_hashes = {
-        hashlib.sha256(firmware_elf.read_bytes()).hexdigest()
-        for _, firmware_elf, _ in matches
+        hashlib.sha256(firmware_elf.read_bytes()).hexdigest() for _, firmware_elf, _ in matches
     }
     if len(firmware_hashes) != 1:
         # A release tag alone cannot distinguish different repositories or
@@ -58,11 +63,9 @@ def retro_go_profile_symbols(version: str | None) -> tuple[Path, list[Path]] | N
             result[relative] = (hashlib.sha256(path.read_bytes()).hexdigest(), path)
         return result
 
-    payload_maps = [payload_hashes(candidate, paths)
-                    for candidate, _, paths in matches]
+    payload_maps = [payload_hashes(candidate, paths) for candidate, _, paths in matches]
     common_payloads = {}
     for relative, (digest, path) in payload_maps[0].items():
-        if all(mapping.get(relative, (None, None))[0] == digest
-               for mapping in payload_maps[1:]):
+        if all(mapping.get(relative, (None, None))[0] == digest for mapping in payload_maps[1:]):
             common_payloads[relative] = path
     return matches[0][1], [common_payloads[name] for name in sorted(common_payloads)]

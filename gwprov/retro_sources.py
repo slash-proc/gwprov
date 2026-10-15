@@ -1,4 +1,5 @@
 """Per-user Retro-Go release index registry."""
+
 from __future__ import annotations
 
 import json
@@ -31,9 +32,11 @@ def normalize_source(value: str) -> dict[str, str]:
         source_id = f"{parsed.hostname}{parsed.path.rsplit('/', 1)[0]}".strip("/").casefold()
         return {"id": source_id, "repo": source_id, "versionsUrl": value}
     if value.startswith("github/"):
-        value = value[len("github/"):]
+        value = value[len("github/") :]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value) or ".." in value:
-        raise ValueError("Retro-Go source must be owner/repo, github/owner/repo, or an HTTPS versions.json URL")
+        raise ValueError(
+            "Retro-Go source must be owner/repo, github/owner/repo, or an HTTPS versions.json URL"
+        )
     repo = value.casefold()
     return {"id": repo, "repo": repo, "versionsUrl": _github_versions_url(repo)}
 
@@ -43,8 +46,11 @@ def _read() -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"schemaVersion": 1, "default": DEFAULT_SOURCE,
-                "sources": [normalize_source(DEFAULT_SOURCE)]}
+        return {
+            "schemaVersion": 1,
+            "default": DEFAULT_SOURCE,
+            "sources": [normalize_source(DEFAULT_SOURCE)],
+        }
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"cannot read Retro-Go source registry {path}: {exc}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("sources"), list):
@@ -67,8 +73,9 @@ def list_sources() -> dict:
     ids = set()
     rows = []
     for source in data["sources"]:
-        if not isinstance(source, dict) or not all(isinstance(source.get(k), str)
-                                                   for k in ("id", "repo", "versionsUrl")):
+        if not isinstance(source, dict) or not all(
+            isinstance(source.get(k), str) for k in ("id", "repo", "versionsUrl")
+        ):
             raise RuntimeError("invalid Retro-Go source entry")
         if source["id"] in ids:
             continue
@@ -117,17 +124,24 @@ def resolve_release(reference: str | None = None) -> tuple[dict[str, str], str]:
     data = _read()
     if reference is None:
         source_id = data.get("default", DEFAULT_SOURCE)
-        raise ValueError(f"select an exact Retro-Go release from `gwprov retro-go list`; default source is {source_id}")
+        raise ValueError(
+            f"select an exact Retro-Go release from `gwprov retro-go list`; default source is {source_id}"
+        )
     try:
         source_id, tag = reference.rsplit(":", 1)
     except ValueError as exc:
-        raise ValueError("Retro-Go release must be SOURCE:VERSION from `gwprov retro-go list`") from exc
+        raise ValueError(
+            "Retro-Go release must be SOURCE:VERSION from `gwprov retro-go list`"
+        ) from exc
     if source_id.startswith("github/"):
-        source_id = source_id[len("github/"):]
-    source = next((item for item in data["sources"] if item.get("id") == source_id.casefold()), None)
+        source_id = source_id[len("github/") :]
+    source = next(
+        (item for item in data["sources"] if item.get("id") == source_id.casefold()), None
+    )
     if source is None:
         raise ValueError(f"Retro-Go release source is not registered: {source_id}")
     from .dist.project import list_versions
+
     index = list_versions(source["repo"], versions_url=source["versionsUrl"])
     if not any(isinstance(item, dict) and item.get("tag") == tag for item in index["versions"]):
         raise ValueError(f"Retro-Go release {reference!r} is not listed by its registered source")
@@ -143,13 +157,19 @@ def list_releases(source_filter: str | None = None) -> list[dict]:
         if not sources:
             raise ValueError(f"Retro-Go source is not registered: {normalized['id']}")
     from .dist.project import list_versions
+
     rows = []
     for source in sources:
         index = list_versions(source["repo"], versions_url=source["versionsUrl"])
         for version in index["versions"]:
             if not isinstance(version, dict) or not isinstance(version.get("tag"), str):
                 continue
-            rows.append({"source": source["id"], "version": version["tag"],
-                         "name": f"{source['id']}:{version['tag']}",
-                         "published": version.get("published") or version.get("date") or ""})
+            rows.append(
+                {
+                    "source": source["id"],
+                    "version": version["tag"],
+                    "name": f"{source['id']}:{version['tag']}",
+                    "published": version.get("published") or version.get("date") or "",
+                }
+            )
     return rows

@@ -1,4 +1,5 @@
 """Download verified Retro-Go release firmware and provision filesystem content."""
+
 from __future__ import annotations
 
 import hashlib
@@ -11,69 +12,86 @@ from .project import DEFAULT_CATALOG_REPO, _fetch_checked, _safe_relpath, resolv
 
 
 def checked_member(archive: zipfile.ZipFile, spec: dict) -> bytes:
-    path = _safe_relpath(spec['path']).as_posix()
+    path = _safe_relpath(spec["path"]).as_posix()
     entries = [entry for entry in archive.infolist() if entry.filename == path]
-    if len(entries) != 1 or entries[0].file_size != spec['bytes']:
-        raise ValueError(f'release bundle has missing, duplicate or wrong-sized member: {path}')
+    if len(entries) != 1 or entries[0].file_size != spec["bytes"]:
+        raise ValueError(f"release bundle has missing, duplicate or wrong-sized member: {path}")
     data = archive.read(entries[0])
-    if hashlib.sha256(data).hexdigest().lower() != str(spec['sha256']).lower():
-        raise ValueError(f'release checksum mismatch: {path}')
+    if hashlib.sha256(data).hexdigest().lower() != str(spec["sha256"]).lower():
+        raise ValueError(f"release checksum mismatch: {path}")
     return data
 
 
-def install_firmware(output: str | Path, *, variant: str = 'flash',
-                     repo: str = DEFAULT_CATALOG_REPO, version: str | None = None,
-                     versions_url: str | None = None) -> dict:
+def install_firmware(
+    output: str | Path,
+    *,
+    variant: str = "flash",
+    repo: str = DEFAULT_CATALOG_REPO,
+    version: str | None = None,
+    versions_url: str | None = None,
+) -> dict:
     release = resolve_project(repo, version, versions_url=versions_url)
-    candidates = [build for build in release.manifest.get('builds', [])
-                  if build.get('storage') == variant and build.get('bank') == 2]
+    candidates = [
+        build
+        for build in release.manifest.get("builds", [])
+        if build.get("storage") == variant and build.get("bank") == 2
+    ]
     if len(candidates) != 1:
-        raise ValueError(f'release must publish exactly one {variant} bank-2 firmware build')
+        raise ValueError(f"release must publish exactly one {variant} bank-2 firmware build")
     build = candidates[0]
-    blob = _fetch_checked(release.manifest_url, build['bundle'])
+    blob = _fetch_checked(release.manifest_url, build["bundle"])
     files: dict[str, bytes] = {}
     with zipfile.ZipFile(io.BytesIO(blob)) as archive:
-        files['firmware/intflash.bin'] = checked_member(archive, build['image'])
+        files["firmware/intflash.bin"] = checked_member(archive, build["image"])
         # Release ZIPs carry the matching, unstripped firmware ELF beside the
         # install image. It is covered by the bundle's published SHA-256 even
         # though it is not a runtime content entry in manifest.json.
-        symbol_name = 'debug/retro-go-debug.elf'
-        symbol_entries = [entry for entry in archive.infolist()
-                          if entry.filename == symbol_name]
+        symbol_name = "debug/retro-go-debug.elf"
+        symbol_entries = [entry for entry in archive.infolist() if entry.filename == symbol_name]
         if len(symbol_entries) != 1 or symbol_entries[0].file_size > 64 * 1024 * 1024:
-            raise ValueError(f'release bundle has missing, duplicate or oversized debug symbols: {symbol_name}')
+            raise ValueError(
+                f"release bundle has missing, duplicate or oversized debug symbols: {symbol_name}"
+            )
         symbols = archive.read(symbol_entries[0])
-        if not symbols.startswith(b'\x7fELF'):
-            raise ValueError(f'release debug symbols are not an ELF file: {symbol_name}')
-        files['firmware/retro-go-debug.elf'] = symbols
-        for spec in build.get('content', []):
-            path = _safe_relpath(spec.get('install', spec['path']))
-            if variant == 'flash':
-                partition = 'littlefs' if path.parts[0] in {'cores', 'lang', 'data'} else 'frogfs'
+        if not symbols.startswith(b"\x7fELF"):
+            raise ValueError(f"release debug symbols are not an ELF file: {symbol_name}")
+        files["firmware/retro-go-debug.elf"] = symbols
+        for spec in build.get("content", []):
+            path = _safe_relpath(spec.get("install", spec["path"]))
+            if variant == "flash":
+                partition = "littlefs" if path.parts[0] in {"cores", "lang", "data"} else "frogfs"
                 path = Path(partition) / path
             dest = (Path(variant) / path).as_posix()
             if dest in files:
-                raise ValueError(f'duplicate firmware content destination: {dest}')
+                raise ValueError(f"duplicate firmware content destination: {dest}")
             files[dest] = checked_member(archive, spec)
     root = Path(output).expanduser().resolve()
-    metadata_path = root / '.gwprov-firmware.json'
+    metadata_path = root / ".gwprov-firmware.json"
     old = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
-    if old and (old.get('repo') != release.repo or old.get('variant') != variant):
-        raise ValueError('content root belongs to another firmware or variant; use a separate output root')
-    owned = set(old.get('files', []))
+    if old and (old.get("repo") != release.repo or old.get("variant") != variant):
+        raise ValueError(
+            "content root belongs to another firmware or variant; use a separate output root"
+        )
+    owned = set(old.get("files", []))
     for relative in files:
         dest = root / relative
         if any(parent.is_symlink() for parent in (dest, *dest.parents)):
-            raise ValueError(f'refusing a symlink in firmware output path: {dest}')
+            raise ValueError(f"refusing a symlink in firmware output path: {dest}")
         if dest.exists() and relative not in owned:
-            raise ValueError(f'refusing to overwrite unrelated content: {dest}')
+            raise ValueError(f"refusing to overwrite unrelated content: {dest}")
     for relative, data in files.items():
         dest = root / relative
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
-    metadata = {'repo': release.repo, 'version': release.version['tag'], 'variant': variant,
-                'build': build['id'], 'firmware': release.manifest['firmware'],
-                'debugSymbols': 'firmware/retro-go-debug.elf',
-                'littlefsBlockSize': build.get('littlefsBlockSize', 4096), 'files': list(files)}
-    metadata_path.write_text(json.dumps(metadata, indent=2) + '\n')
+    metadata = {
+        "repo": release.repo,
+        "version": release.version["tag"],
+        "variant": variant,
+        "build": build["id"],
+        "firmware": release.manifest["firmware"],
+        "debugSymbols": "firmware/retro-go-debug.elf",
+        "littlefsBlockSize": build.get("littlefsBlockSize", 4096),
+        "files": list(files),
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     return metadata

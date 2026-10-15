@@ -71,16 +71,17 @@ the user's filesystem and process permissions.
 
 ## Managed GWemu
 
-`gwprov gwemu start`, `gwprov gwemu run` (profile or raw image), and
-`gwprov gwemu debug` launch GWemu through the daemon. QEMU receives `-qmp stdio`;
+`gwprov start profile:PROFILE` and `gwprov debug python` use the daemon-managed
+GWemu lifecycle. QEMU receives `-qmp stdio`;
 its QMP stream is held only by the daemon. Existing `ps`, screenshot, profiling, diagnosis,
 pause, resume, stop, and Python debugger flows use the daemon handle reported
 in `qmpSocket` instead of opening a QEMU QMP socket. GDB remains a separate
 loopback endpoint when requested.
 
-`gwprov gwemu start` returns after the daemon has launched and queried the VM.
-Use `gwprov gwemu ps` in any terminal to inspect its actual running or halted
-state. `gwprov gwemu stop` requests a graceful QMP quit and waits for the child.
+`gwprov start profile:PROFILE` returns after the daemon has launched and queried
+the VM. A bare target names a device; for a managed GWemu it resumes execution.
+Use `gwprov ps` in any terminal to inspect its actual running or halted
+state. `gwprov device DEVICE stop` requests a graceful QMP quit and waits for the child.
 Debugger launches that need reset-time breakpoints request an initial halt from
 the daemon; ordinary launches start running.
 
@@ -93,8 +94,8 @@ GWemu target uses the same rule for GDB and for its TCP QMP listener (base
 GWemu processes started outside these managed CLI commands remain external
 instances. GWProv can inventory them when process visibility and their existing
 QMP endpoint permit it, but cannot adopt a process whose QMP stream it does not
-own. The explicit `gwprov gwemu run --stdio-gdb` harness mode remains a direct
-launch because GDB and QMP cannot both consume the same QEMU stdin/stdout pipe.
+own. Direct raw-image and stdio-GDB launches are outside the managed CLI workflow;
+use a profile with `gwprov start` so the daemon owns the instance lifecycle.
 
 ## Hardware sessions
 
@@ -138,28 +139,46 @@ marker. After an operation ends, the next poll reads VTOR, DHCSR, mailbox state,
 and firmware signatures from the target and reports what is actually present.
 An idle RAM flasher is therefore observable through the same live polling path.
 
-For coordination with tools that already use gnwmanager, run `gnwmanager serve`
-and register its `ws://.../gdb` endpoint. GWProv's WebSocket backend passes
-target operations through the server. That server currently admits one client;
-multi-client sharing would need to be added to gnwmanager's server rather than
-being inferred from GWProv's local leases.
+For coordination with tools that already use gnwmanager, GWProv can expose a
+device itself:
+
+```sh
+gwprov serve DEVICE start
+gwprov serve DEVICE stop
+```
+
+This serves the gnwmanager WebSocket protocol at `/gdb`, starting at port 8766
+and moving upward when occupied. The default bind address is loopback. A
+GWemu's GDB endpoint handles debugger traffic while QMP supplies its execution
+state; hardware requests use a daemon target session, which suppresses polling
+until the client disconnects. The WebSocket server admits one client at a time.
+GWemu endpoints are discovered from process arguments and the process-owned
+socket table. When socket ownership is hidden by OS permissions, inventory
+reports listener discovery as unavailable rather than guessing. QMP can be
+checked with a read-only query. Unknown TCP listeners are not tested as GDB:
+QEMU halts the VM as soon as a GDB client connects. Select a discovered listener
+explicitly with `--gdb-endpoint HOST:PORT` or `--gdb-endpoint unix:PATH` when
+its launch arguments do not identify it.
 
 ## Repeatable GWemu timing
 
-Managed `gwemu start` and `gwemu run` accept `--timing-mode baseline`,
-`--icount SHIFT`, and `--rtc-epoch UNIX_SECONDS`. For a deterministic experimental
-cycle timeline and a fixed RTC seed:
+Managed `gwprov start profile:PROFILE` accepts `--timing-mode`, `--pacing`,
+`--icount-shift SHIFT` (with `--icount` as a compatibility alias), and
+`--rtc-epoch UNIX_SECONDS`. Baseline timing defaults to real-time pacing for
+interactive use:
 
 ```sh
-gwprov gwemu start --profile NAME --headless --timing-mode baseline --rtc-epoch 1735689600
+gwprov start profile:NAME --timing-mode baseline --audio
 ```
 
-Baseline selects `-icount shift=0,align=off,sleep=off` and
+Baseline selects `-icount shift=0,align=on,sleep=on` and
 `gnw-h7b0-soc.timing-mode=on`. It counts each retired instruction as one cycle
-and drives DWT and virtual-time peripherals from the same live core-clock
-rate. A nonzero `--icount` is rejected with baseline. The default mode preserves
-ordinary GWemu timing; an explicit `--icount` in default mode uses QEMU's fixed
-instruction-to-virtual-time shift without enabling the H7 timing baseline.
+and drives DWT and virtual-time peripherals from the same live core-clock rate.
+Use `--pacing unthrottled` for measurements that intentionally let guest time
+run ahead of host wall time. The experimental M7 mode currently requires
+unthrottled pacing. In default mode, an explicit `--icount-shift` retains the
+legacy unthrottled behavior; use `--pacing realtime` to align it to host time.
+A nonzero shift is rejected with either modeled timing mode.
 
 The current baseline does **not** model Cortex-M7 instruction latency, cache
 misses, memory wait states, or ITCM/DTCM placement advantages. Its DWT values
@@ -168,11 +187,10 @@ cycles, and cannot establish physical-device 60 fps. Firmware can disable or
 reset DWT; retain the control register and raw values when interpreting it.
 A GWemu build without the timing-mode property fails loudly during startup.
 
-`gwprov gwemu ps --output json` records `timing.mode`, `icountShift`, `rtcEpoch`,
+`gwprov ps --output json` records `timing.mode`, `icountShift`, `rtcEpoch`,
 `cycleSemantics`, and `hardwareCycleAccurate` for daemon-managed instances.
-The direct `--stdio-gdb` harness does not support the new timing-mode or RTC
-controls; use the managed path for those controls. Profiles and their files
-remain unchanged by these launch options.
+Use the managed `gwprov start` path for timing-mode and RTC controls. Profiles and
+their files remain unchanged by those launch options.
 
 The QMP profiler reads explicit progress symbols using their ELF object sizes
 (1, 2, 4, or 8 bytes). Its raw observations and wrap-safe deltas therefore
@@ -191,7 +209,7 @@ Profiler `inline_functions` attributes saved PCs through DWARF inline chains.
 additional device traffic; these percentages remain PC sample shares and must
 not be described as exact routine cycles.
 
-`--gwemu-bin PATH` selects an explicit executable for a managed start/run.
+`--gwemu-bin PATH` selects an explicit executable for a managed starts.
 The daemon validates the path and checks the actual running SHA-256 against
 the selected file. Its ping capabilities advertise support, so older running
 daemons cannot silently ignore this option. Finish active VM/hardware sessions

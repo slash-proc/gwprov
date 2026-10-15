@@ -31,7 +31,6 @@ as before -- this script only creates the container and the partition table.
 """
 
 import argparse
-import os
 import struct
 import sys
 
@@ -73,17 +72,17 @@ def main():
         f.truncate(args.size_mb * 1024 * 1024)
 
         entry = (
-            b"\x00"                                  # not bootable
-            + chs(FIRST_LBA)                         # CHS of first sector
-            + bytes([PART_TYPE_FAT32_LBA])           # partition type
-            + chs(FIRST_LBA + part_sectors - 1)      # CHS of last sector
+            b"\x00"  # not bootable
+            + chs(FIRST_LBA)  # CHS of first sector
+            + bytes([PART_TYPE_FAT32_LBA])  # partition type
+            + chs(FIRST_LBA + part_sectors - 1)  # CHS of last sector
             + struct.pack("<II", FIRST_LBA, part_sectors)
         )
         assert len(entry) == 16
 
         f.seek(446)
-        f.write(entry + b"\x00" * 48)                # entry 1, entries 2-4 empty
-        f.write(b"\x55\xaa")                         # MBR signature
+        f.write(entry + b"\x00" * 48)  # entry 1, entries 2-4 empty
+        f.write(b"\x55\xaa")  # MBR signature
 
     print(
         f"Created {args.size_mb}MB SD card image with a FAT32 partition "

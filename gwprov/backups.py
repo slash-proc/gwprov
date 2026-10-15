@@ -1,10 +1,10 @@
 """Discover and remember verified stock firmware backups."""
+
 from __future__ import annotations
 
 import json
 import os
 import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -26,14 +26,23 @@ def _valid_pair(folder: Path, model: str) -> dict | None:
     if external.stat().st_size <= 0 or external.stat().st_size > 256 * 1024 * 1024:
         return None
     import hashlib
+
     internal_data = internal.read_bytes()
     external_data = external.read_bytes()
-    check = external_data[:-8192] if model == "mario" else external_data[0x20000:0x3254a0]
-    if (hashlib.sha1(internal_data[:0x20000]).hexdigest(), hashlib.sha1(check).hexdigest()) != EXPECTED[model]:
+    check = external_data[:-8192] if model == "mario" else external_data[0x20000:0x3254A0]
+    if (
+        hashlib.sha1(internal_data[:0x20000]).hexdigest(),
+        hashlib.sha1(check).hexdigest(),
+    ) != EXPECTED[model]:
         return None
-    return {"model": model, "directory": str(folder.resolve()),
-            "bank1": str(internal.resolve()), "bank0": str(external.resolve()),
-            "bank1Bytes": len(internal_data), "bank0Bytes": len(external_data)}
+    return {
+        "model": model,
+        "directory": str(folder.resolve()),
+        "bank1": str(internal.resolve()),
+        "bank0": str(external.resolve()),
+        "bank1Bytes": len(internal_data),
+        "bank0Bytes": len(external_data),
+    }
 
 
 def search(directory: str | Path = ".") -> list[dict]:
@@ -111,7 +120,9 @@ def add(sources: list[str | Path]) -> list[dict]:
                 found.append(row)
                 seen.add(row["directory"])
     if not found:
-        raise ValueError("no complete Mario or Zelda backup pair found; include internal_flash_backup_<model>.bin and flash_backup_<model>.bin")
+        raise ValueError(
+            "no complete Mario or Zelda backup pair found; include internal_flash_backup_<model>.bin and flash_backup_<model>.bin"
+        )
     return sorted(found, key=lambda row: (row["model"], row["directory"].casefold()))
 
 
@@ -143,8 +154,9 @@ def _write(rows: list[dict]) -> None:
     path = _registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps({"schemaVersion": 1, "backups": rows}, indent=2) + "\n",
-                         encoding="utf-8")
+    temporary.write_text(
+        json.dumps({"schemaVersion": 1, "backups": rows}, indent=2) + "\n", encoding="utf-8"
+    )
     if os.name != "nt":
         temporary.chmod(0o600)
     temporary.replace(path)

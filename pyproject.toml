@@ -18,7 +18,16 @@ remote = ["websockets>=14,<16"]
 reports = ["reportlab>=4,<5"]
 media = ["littlefs-python>=0.9", "pyfatfs>=1.1", "setuptools<81"]
 dist = ["wasmtime>=20"]
-dev = ["pytest>=8", "ruff>=0.9"]
+
+[dependency-groups]
+dev = [
+    "black>=24.10",
+    "coverage[toml]>=7.6",
+    "pre-commit>=4",
+    "pytest>=8",
+    "pytest-cov>=6",
+    "ruff>=0.9",
+]
 
 [project.scripts]
 gwprov = "gwprov.cli:main"
@@ -32,3 +41,30 @@ packages = ["gwprov"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = ["gwprov/vendor"]
+
+[tool.ruff.lint]
+select = ["E4", "E9", "F"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+extend-exclude = "gwprov/vendor"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+
+[tool.coverage.run]
+branch = true
+source = ["gwprov"]
+omit = ["gwprov/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

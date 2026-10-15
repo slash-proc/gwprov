@@ -1,4 +1,5 @@
 """Read and decode Retro-Go's stored /CONFIG for the active GWProv device."""
+
 from __future__ import annotations
 
 import json
@@ -91,10 +92,9 @@ class _MemoryContext:
         data = self.cache.get(block)
         if data is None:
             position = self.start + self.size - (block + 1) * self.block_size
-            data = self.backend.read_memory(EXTERNAL_FLASH_BASE + position,
-                                            self.block_size)
+            data = self.backend.read_memory(EXTERNAL_FLASH_BASE + position, self.block_size)
             self.cache[block] = data
-        return bytearray(data[off:off + size])
+        return bytearray(data[off : off + size])
 
     def prog(self, cfg, block: int, off: int, data: bytes) -> int:
         raise OSError("device CONFIG inspection is read-only")
@@ -129,13 +129,62 @@ def _layout(profile_value: str):
     return profile, extflash_size, start, size, block_size
 
 
+def _profile_uses_sd(profile) -> bool:
+    """Whether a profile stores Retro-Go files, including /CONFIG, on its SD card."""
+    metadata_path = profile.root / "provision.json"
+    if not metadata_path.is_file():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    variant = metadata.get("variant")
+    if variant not in {"flash", "sd"}:
+        firmware = metadata.get("firmware")
+        variant = firmware.get("variant") if isinstance(firmware, dict) else None
+    return variant == "sd"
+
+
+def profile_config_target(profile_value: str) -> str:
+    """Return the profile media target containing Retro-Go's /CONFIG."""
+    from .profiles import DeviceProfile
+
+    profile = DeviceProfile.load(profile_value)
+    if _profile_uses_sd(profile):
+        if profile.resolved_sd is None:
+            raise ValueError("SD Retro-Go profile has no usable SD card image")
+        return "sd"
+    return "flash/ext"
+
+
+def _read_sd_config(image: Path) -> bytes:
+    """Read /CONFIG from a partitioned profile SD image using mtools."""
+    import subprocess
+    import tempfile
+
+    if not image.is_file():
+        raise FileNotFoundError(f"profile SD image is missing: {image}")
+    with tempfile.TemporaryDirectory(prefix="gwprov-config-") as temp_dir:
+        local = Path(temp_dir) / "CONFIG"
+        result = subprocess.run(
+            ["mcopy", "-i", f"{image}@@1M", "::CONFIG", str(local)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode:
+            raise ValueError("the profile's SD card does not contain /CONFIG")
+        return local.read_bytes()
+
+
 def _read_littlefs(context, size: int, block_size: int) -> bytes:
     try:
         from littlefs import LittleFS
     except ImportError as error:
         raise RuntimeError("CONFIG inspection requires the littlefs package") from error
-    fs = LittleFS(context=context, mount=False, block_size=block_size,
-                  block_count=size // block_size)
+    fs = LittleFS(
+        context=context, mount=False, block_size=block_size, block_count=size // block_size
+    )
     mounted = False
     try:
         fs.mount()
@@ -150,7 +199,15 @@ def _read_littlefs(context, size: int, block_size: int) -> bytes:
 
 
 def _profile_blob(profile_value: str):
-    """Read /CONFIG from a managed profile's LittleFS image."""
+    """Read /CONFIG from a managed profile's SD card or LittleFS image."""
+    from .profiles import DeviceProfile, profile_reference
+
+    profile = DeviceProfile.load(profile_value)
+    if _profile_uses_sd(profile):
+        if profile.resolved_sd is None:
+            raise ValueError(f"profile {profile_reference(profile.root)} has no SD card image")
+        return _read_sd_config(profile.resolved_sd), f"profile SD image: {profile.resolved_sd}"
+
     profile, extflash_size, start, size, block_size = _layout(profile_value)
     if not profile.extflash.is_file():
         raise FileNotFoundError(f"profile extflash image is missing: {profile.extflash}")
@@ -175,6 +232,13 @@ def _vm_image(device_id: str):
     profile_value = instance.get("profile")
     if not profile_value or profile_value == "raw image":
         raise ValueError("this GWemu instance has no managed profile layout for LittleFS")
+    from .profiles import DeviceProfile
+
+    profile = DeviceProfile.load(profile_value)
+    if _profile_uses_sd(profile):
+        if profile.resolved_sd is None:
+            raise ValueError("GWemu profile has no SD card image for /CONFIG")
+        return _read_sd_config(profile.resolved_sd), f"GWemu profile SD image: {profile.resolved_sd}"
     profile, _, start, size, block_size = _layout(profile_value)
     process = psutil.Process(pid)
     cwd = Path(process.cwd())
@@ -193,8 +257,7 @@ def _vm_image(device_id: str):
     if extflash_path.stat().st_size < start + size:
         raise ValueError("GWemu extflash image is smaller than its declared LittleFS partition")
     with extflash_path.open("rb") as stream:
-        blob = _read_littlefs(_ImageContext(stream, start, size, block_size),
-                              size, block_size)
+        blob = _read_littlefs(_ImageContext(stream, start, size, block_size), size, block_size)
     return blob, f"GWemu extflash image: {extflash_path}"
 
 
@@ -204,17 +267,19 @@ def _hardware_blob(device_id: str, *, remote_origin: str | None = None) -> tuple
 
     assigned = get_assignment(device_id).get("profile")
     if not assigned:
-        raise ValueError("apply a device profile first with `gwprov profile PROFILE apply DEVICE`; "
-                         "GWProv needs its LittleFS layout to locate /CONFIG")
+        raise ValueError(
+            "apply a device profile first with `gwprov profile PROFILE apply device:DEVICE`; "
+            "GWProv needs its LittleFS layout to locate /CONFIG"
+        )
     profile, extflash_size, start, size, block_size = _layout(assigned)
     if device_id.startswith("probe:"):
         unique_id = device_id.removeprefix("probe:")
-        backend = SelectedPyOCDBackend(unique_id, operation="gwprov config read",
-                                       lease_wait=0)
+        backend = SelectedPyOCDBackend(unique_id, operation="gwprov retro-go config", lease_wait=0)
     elif device_id.startswith("remote:"):
         uri = device_id.removeprefix("remote:")
-        backend = WebSocketBackend(uri, origin=remote_origin,
-                                   operation="gwprov config read", lease_wait=0)
+        backend = WebSocketBackend(
+            uri, origin=remote_origin, operation="gwprov retro-go config", lease_wait=0
+        )
     else:
         raise ValueError(f"unsupported hardware device ID: {device_id}")
     try:
@@ -224,11 +289,13 @@ def _hardware_blob(device_id: str, *, remote_origin: str | None = None) -> tuple
     finally:
         backend.close()
     from .profiles import profile_reference
+
     return blob, f"hardware mapped flash using profile layout: {profile_reference(profile.root)}"
 
 
-def read_config(*, device_id: str | None = None, profile: str | None = None,
-                remote_origin: str | None = None) -> tuple[bytes, str, str | None]:
+def read_config(
+    *, device_id: str | None = None, profile: str | None = None, remote_origin: str | None = None
+) -> tuple[bytes, str, str | None]:
     """Read a CONFIG blob from an explicit device or managed profile."""
     if device_id and profile:
         raise ValueError("choose a device or profile, not both")
@@ -242,21 +309,32 @@ def read_config(*, device_id: str | None = None, profile: str | None = None,
     else:
         blob, source = _hardware_blob(device_id, remote_origin=remote_origin)
     from .device_assignments import get_assignment
+
     assigned = get_assignment(device_id).get("profile")
     return blob, source, assigned
 
 
-def show_device_config(*, output: str = "text", device_id: str | None = None,
-                       profile: str | None = None,
-                       remote_origin: str | None = None) -> int:
-    blob, source, _ = read_config(device_id=device_id, profile=profile,
-                                  remote_origin=remote_origin)
+def show_device_config(
+    *,
+    output: str = "text",
+    device_id: str | None = None,
+    profile: str | None = None,
+    remote_origin: str | None = None,
+) -> int:
+    blob, source, _ = read_config(device_id=device_id, profile=profile, remote_origin=remote_origin)
     decoded = decode_config(blob)
-    report = {"schemaVersion": 1, "device": device_id, "profile": profile,
-              "source": source,
-              "path": "/CONFIG", "bytes": len(blob), **decoded}
-    valid = all(decoded["integrity"][key]
-                for key in ("magic_valid", "version_supported", "crc_valid"))
+    report = {
+        "schemaVersion": 1,
+        "device": device_id,
+        "profile": profile,
+        "source": source,
+        "path": "/CONFIG",
+        "bytes": len(blob),
+        **decoded,
+    }
+    valid = all(
+        decoded["integrity"][key] for key in ("magic_valid", "version_supported", "crc_valid")
+    )
     if output == "json":
         print(json.dumps(report, indent=2))
     else:
@@ -265,8 +343,7 @@ def show_device_config(*, output: str = "text", device_id: str | None = None,
         from rich.text import Text
 
         console = Console()
-        table = Table(title=f"Retro-Go /CONFIG for {device_id}", title_justify="left",
-                      expand=True)
+        table = Table(title=f"Retro-Go /CONFIG for {device_id}", title_justify="left", expand=True)
         table.add_column("SETTING", style="cyan", overflow="fold")
         table.add_column("VALUE", overflow="fold")
         for key, value in decoded["values"].items():
@@ -278,8 +355,7 @@ def show_device_config(*, output: str = "text", device_id: str | None = None,
         console.print(table)
         checks = decoded["integrity"]
         integrity = Text("CONFIG integrity: ", style="bold")
-        integrity.append("valid" if valid else "invalid",
-                         style="green" if valid else "red")
+        integrity.append("valid" if valid else "invalid", style="green" if valid else "red")
         integrity.append(f"\nCRC: {checks['stored_crc32']}")
         console.print(integrity)
         console.print(f"Source: {source}", style="dim")

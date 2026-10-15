@@ -1,4 +1,5 @@
 """Read loose files and single-file ROM ZIPs without extracting to disk."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,8 +8,9 @@ import zipfile
 MAX_INPUT_BYTES = 512 * 1024 * 1024
 
 
-def read_input(path: Path, *, extensions: set[str] | None = None,
-               max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, bytes]:
+def read_input(
+    path: Path, *, extensions: set[str] | None = None, max_bytes: int = MAX_INPUT_BYTES
+) -> tuple[str, bytes]:
     """Use the inner basename as identity; retain native ZIPs declared by a core."""
     extensions = {ext.casefold() for ext in extensions or ()}
     unpack = path.suffix.casefold() == ".zip" and ".zip" not in extensions
@@ -21,12 +23,16 @@ def read_input(path: Path, *, extensions: set[str] | None = None,
             with zipfile.ZipFile(path) as archive:
                 files = [entry for entry in archive.infolist() if not entry.is_dir()]
                 if len(files) != 1:
-                    raise ValueError(f"{path.name}: holds {len(files)} files; a ROM archive must hold exactly one")
+                    raise ValueError(
+                        f"{path.name}: holds {len(files)} files; a ROM archive must hold exactly one"
+                    )
                 entry = files[0]
                 if entry.flag_bits & 1:
                     raise ValueError(f"{path.name}: encrypted ZIP entries are unsupported")
                 if entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
-                    raise ValueError(f"{path.name}: only stored and deflate ZIP entries are supported")
+                    raise ValueError(
+                        f"{path.name}: only stored and deflate ZIP entries are supported"
+                    )
                 if entry.file_size > max_bytes:
                     raise ValueError(f"{path.name}: unpacked input exceeds {max_bytes} bytes")
                 name = entry.filename.rsplit("/", 1)[-1]

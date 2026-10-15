@@ -1,4 +1,5 @@
 """Reader and summarizer for the optional, target-neutral GWProv trace ABI."""
+
 from __future__ import annotations
 
 import struct
@@ -17,8 +18,19 @@ MAX_CAPACITY = 65536
 def _decode_header(raw: bytes) -> dict:
     if len(raw) < HEADER.size:
         raise ValueError("truncated GWProv trace header")
-    (magic, version, header_bytes, entry_bytes, capacity, lock, low, high,
-     dropped, counter_hz, flags) = HEADER.unpack_from(raw)
+    (
+        magic,
+        version,
+        header_bytes,
+        entry_bytes,
+        capacity,
+        lock,
+        low,
+        high,
+        dropped,
+        counter_hz,
+        flags,
+    ) = HEADER.unpack_from(raw)
     if magic != MAGIC:
         raise ValueError(f"GWProv trace magic mismatch: 0x{magic:08x}")
     if version != VERSION:
@@ -29,14 +41,22 @@ def _decode_header(raw: bytes) -> dict:
         raise ValueError(f"invalid GWProv trace capacity {capacity}")
     if lock & 1:
         raise RuntimeError("GWProv trace header is being updated")
-    return {"version": version, "header_bytes": header_bytes,
-            "entry_bytes": entry_bytes, "capacity": capacity,
-            "sequence": (high << 32) | low, "dropped": dropped,
-            "counter_hz": counter_hz, "flags": flags, "seqlock": lock}
+    return {
+        "version": version,
+        "header_bytes": header_bytes,
+        "entry_bytes": entry_bytes,
+        "capacity": capacity,
+        "sequence": (high << 32) | low,
+        "dropped": dropped,
+        "counter_hz": counter_hz,
+        "flags": flags,
+        "seqlock": lock,
+    }
 
 
-def read_trace(read_memory, address: int, *, since_sequence: int | None = None,
-               retries: int = 3) -> dict:
+def read_trace(
+    read_memory, address: int, *, since_sequence: int | None = None, retries: int = 3
+) -> dict:
     """Read a consistent ring snapshot; never halts or controls the target."""
     if address < 0 or address > 0xFFFFFFFF:
         raise ValueError("invalid GWProv trace header address")
@@ -54,8 +74,7 @@ def read_trace(read_memory, address: int, *, since_sequence: int | None = None,
         record_size = first["entry_bytes"]
         raw = bytearray()
         if contiguous:
-            raw.extend(read_memory(ring_start + index * record_size,
-                                   contiguous * record_size))
+            raw.extend(read_memory(ring_start + index * record_size, contiguous * record_size))
         remaining = count - contiguous
         if remaining:
             raw.extend(read_memory(ring_start, remaining * record_size))
@@ -66,18 +85,23 @@ def read_trace(read_memory, address: int, *, since_sequence: int | None = None,
         events = []
         missing = 0
         for index in range(count):
-            chunk = raw[index * record_size:(index + 1) * record_size]
+            chunk = raw[index * record_size : (index + 1) * record_size]
             seq_low, seq_high, cycles, pc, event, flags = ENTRY.unpack_from(chunk)
             sequence = (seq_high << 32) | seq_low
             expected = start + index
             if sequence != expected:
                 missing += 1
                 continue
-            events.append({"sequence": sequence, "cycles": cycles, "pc": pc,
-                           "event": event, "flags": flags})
+            events.append(
+                {"sequence": sequence, "cycles": cycles, "pc": pc, "event": event, "flags": flags}
+            )
         overflow = max(0, earliest - (earliest if since_sequence is None else since_sequence))
-        return {**first, "events": events, "missing": missing,
-                "overwritten_since_sequence": overflow}
+        return {
+            **first,
+            "events": events,
+            "missing": missing,
+            "overwritten_since_sequence": overflow,
+        }
     raise RuntimeError("GWProv trace ring changed during each read attempt")
 
 
@@ -98,8 +122,9 @@ def summarize(events: list[dict], symbol_name=None) -> dict:
             frame = stack.pop()
             elapsed = (event["cycles"] - frame["cycles"]) & 0xFFFFFFFF
             exclusive = max(0, elapsed - frame["children"])
-            row = totals.setdefault(pc, {"pc": pc, "calls": 0,
-                                         "inclusive_cycles": 0, "exclusive_cycles": 0})
+            row = totals.setdefault(
+                pc, {"pc": pc, "calls": 0, "inclusive_cycles": 0, "exclusive_cycles": 0}
+            )
             row["calls"] += 1
             row["inclusive_cycles"] += elapsed
             row["exclusive_cycles"] += exclusive
@@ -111,5 +136,8 @@ def summarize(events: list[dict], symbol_name=None) -> dict:
             row["function"] = symbol_name(row["pc"])
         functions.append(row)
     functions.sort(key=lambda row: row["exclusive_cycles"], reverse=True)
-    return {"functions": functions, "unclosed_entries": len(stack),
-            "unmatched_exits": unmatched_exits}
+    return {
+        "functions": functions,
+        "unclosed_entries": len(stack),
+        "unmatched_exits": unmatched_exits,
+    }

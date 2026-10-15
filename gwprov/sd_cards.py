@@ -1,4 +1,5 @@
 """Registry for mounted SD-card directories used by GWProv."""
+
 from __future__ import annotations
 
 import json
@@ -9,6 +10,7 @@ from pathlib import Path, PureWindowsPath
 
 def _registry_path() -> Path:
     from .adapters import _config_path
+
     return _config_path().with_name("sd-cards.json")
 
 
@@ -36,7 +38,11 @@ def list_cards() -> list[dict[str, str]]:
         raise RuntimeError(f"invalid SD-card registry format in {path}")
     result = []
     for row in rows:
-        if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not isinstance(row.get("path"), str):
+        if (
+            not isinstance(row, dict)
+            or not isinstance(row.get("name"), str)
+            or not isinstance(row.get("path"), str)
+        ):
             raise RuntimeError(f"invalid SD-card entry in {path}")
         result.append({"name": row["name"], "path": row["path"]})
     return result
@@ -48,7 +54,9 @@ def add_card(path_value: str | Path, name: str | None = None) -> dict[str, str]:
         raise ValueError(f"SD card path must be an existing mounted directory: {path}")
     name = (name or _default_name(path)).strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
-        raise ValueError("SD-card name must start with a letter or number and contain only letters, numbers, dot, underscore, or hyphen")
+        raise ValueError(
+            "SD-card name must start with a letter or number and contain only letters, numbers, dot, underscore, or hyphen"
+        )
     rows = list_cards()
     if any(row["name"].casefold() == name.casefold() for row in rows):
         raise ValueError(f"SD-card name already exists: {name}")
@@ -66,10 +74,16 @@ def remove_card(name: str) -> dict[str, str]:
     if found is None:
         raise ValueError(f"SD card not found: {name}")
     from .device_assignments import assignments
-    users = [device for device, values in assignments().items()
-             if values.get("sdcard", "").casefold() == found["name"].casefold()]
+
+    users = [
+        device
+        for device, values in assignments().items()
+        if values.get("sdcard", "").casefold() == found["name"].casefold()
+    ]
     if users:
-        raise ValueError(f"SD card {found['name']!r} is assigned to {', '.join(users)}; clear those assignments first")
+        raise ValueError(
+            f"SD card {found['name']!r} is assigned to {', '.join(users)}; clear those assignments first"
+        )
     _write([row for row in rows if row != found])
     return found
 

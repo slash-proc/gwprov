@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import shutil
 import sys
 
@@ -37,7 +38,9 @@ def profile_directory(override: str | Path | None = None) -> Path:
         base = Path(xdg_data_home).expanduser()
     elif os.name == "nt":
         local_app_data = os.environ.get("LOCALAPPDATA")
-        base = Path(local_app_data).expanduser() if local_app_data else Path.home() / "AppData/Local"
+        base = (
+            Path(local_app_data).expanduser() if local_app_data else Path.home() / "AppData/Local"
+        )
     elif sys.platform == "darwin":
         base = Path.home() / "Library/Application Support"
     else:
@@ -46,13 +49,27 @@ def profile_directory(override: str | Path | None = None) -> Path:
 
 
 def _is_path_reference(value: str) -> bool:
-    return bool(Path(value).is_absolute() or PureWindowsPath(value).drive
-                or "/" in value or "\\" in value or value.startswith("~"))
+    return bool(
+        Path(value).is_absolute()
+        or PureWindowsPath(value).drive
+        or "/" in value
+        or "\\" in value
+        or value.startswith("~")
+    )
+
+
+def validate_resource_name(value: str, *, kind: str = "name") -> str:
+    """Validate a CLI-visible managed name shared by profiles and devices."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError(f"{kind} must contain only letters, numbers, '-' and '_'")
+    return value
 
 
 def resolve_profile_path(profile: str | Path, *, profile_dir: str | Path | None = None) -> Path:
     """Resolve explicit paths directly and bare profile names under the managed root."""
     value = os.fspath(profile)
+    if value.startswith("profile:"):
+        value = value[len("profile:") :]
     path = Path(value).expanduser()
     if _is_path_reference(value):
         return path.resolve()
@@ -80,7 +97,10 @@ def profile_destination(name_or_path: str | Path, *, output_dir: str | Path | No
     if output_dir is not None:
         if _is_path_reference(value) or value in {"", ".", ".."}:
             raise ValueError("--output-dir requires a profile name without a directory path")
+        validate_resource_name(value, kind="profile name")
         return (profile_directory(output_dir) / value).resolve()
+    if not _is_path_reference(value):
+        validate_resource_name(value, kind="profile name")
     return resolve_profile_path(name_or_path)
 
 
@@ -113,15 +133,17 @@ def list_profiles(*, profile_dir: str | Path | None = None) -> list[dict[str, st
                 details = json.loads(metadata.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 details = {}
-        rows.append({
-            "name": directory.name,
-            "display_name": display_name,
-            "path": str(directory.resolve()),
-            "status": status,
-            "error": error,
-            "model": str(details.get("model", "")),
-            "firmware": str(details.get("firmware", "")),
-        })
+        rows.append(
+            {
+                "name": directory.name,
+                "display_name": display_name,
+                "path": str(directory.resolve()),
+                "status": status,
+                "error": error,
+                "model": str(details.get("model", "")),
+                "firmware": str(details.get("firmware", "")),
+            }
+        )
     return rows
 
 
@@ -143,8 +165,9 @@ def _copy_independent_file(source: str | Path, destination: str | Path) -> str:
     return shutil.copy2(source_path, destination_path, follow_symlinks=True)
 
 
-def duplicate_profile(source: str | Path, destination: str | Path, *,
-                      output_dir: str | Path | None = None) -> dict[str, str | int]:
+def duplicate_profile(
+    source: str | Path, destination: str | Path, *, output_dir: str | Path | None = None
+) -> dict[str, str | int]:
     """Create an independent working copy of a complete profile directory."""
     source_path = resolve_profile_path(source)
     destination_path = profile_destination(destination, output_dir=output_dir)
@@ -180,8 +203,11 @@ def duplicate_profile(source: str | Path, destination: str | Path, *,
     # writable shared mappings. Preserve every other file mode, but grant the
     # owner write access to the media images copied into this profile.
     flash = profile_config.get("flash", {})
-    for name, fallback in (("bank1", "bank1.bin"), ("bank2", "bank2.bin"),
-                           ("extflash", "extflash.bin")):
+    for name, fallback in (
+        ("bank1", "bank1.bin"),
+        ("bank2", "bank2.bin"),
+        ("extflash", "extflash.bin"),
+    ):
         image = (destination_path / flash.get(name, fallback)).resolve()
         if destination_path.resolve() not in image.parents:
             shutil.rmtree(destination_path)
@@ -205,9 +231,16 @@ def duplicate_profile(source: str | Path, destination: str | Path, *,
     }
 
 
-def edit_profile_blob(profile_name: str | Path, *, action: str, bank: str,
-                      name: str, source: str | Path | None = None,
-                      offset: int | None = None, replace: bool = False) -> dict[str, Any]:
+def edit_profile_blob(
+    profile_name: str | Path,
+    *,
+    action: str,
+    bank: str,
+    name: str,
+    source: str | Path | None = None,
+    offset: int | None = None,
+    replace: bool = False,
+) -> dict[str, Any]:
     """Add, replace, or remove one mapped component blob and refresh composed images."""
     import yaml
 
@@ -239,13 +272,19 @@ def edit_profile_blob(profile_name: str | Path, *, action: str, bank: str,
     if action == "remove":
         if not matches:
             raise ValueError(f"no {bank} blob named {name!r} in profile {root.name}")
-        mapping[bank] = [entry for entry in entries if not (isinstance(entry, dict) and entry.get("name") == name)]
+        mapping[bank] = [
+            entry
+            for entry in entries
+            if not (isinstance(entry, dict) and entry.get("name") == name)
+        ]
         result = {"action": "removed", "profile": str(root), "bank": bank, "name": name}
     else:
         if source is None or offset is None:
             raise ValueError("adding a blob requires --file and --offset")
         if matches and not replace:
-            raise ValueError(f"{bank} already has a blob named {name!r}; use --replace to update it")
+            raise ValueError(
+                f"{bank} already has a blob named {name!r}; use --replace to update it"
+            )
         source_path = Path(source).expanduser().resolve()
         if not source_path.is_file() or source_path.stat().st_size == 0:
             raise ValueError(f"blob file is missing or empty: {source_path}")
@@ -264,7 +303,8 @@ def edit_profile_blob(profile_name: str | Path, *, action: str, bank: str,
                 raise ValueError(
                     f"{bank} blob {name!r} range 0x{offset:X}–0x{offset + size:X} "
                     f"overlaps {item.get('name', 'unnamed')} at "
-                    f"0x{other_start:X}–0x{other_end:X}")
+                    f"0x{other_start:X}–0x{other_end:X}"
+                )
         blob_dir = root / "blobs"
         blob_dir.mkdir(exist_ok=True)
         slug = "".join(c.lower() if c.isalnum() else "-" for c in name).strip("-") or "blob"
@@ -276,36 +316,61 @@ def edit_profile_blob(profile_name: str | Path, *, action: str, bank: str,
         temp = destination.with_suffix(destination.suffix + ".tmp")
         temp.write_bytes(data)
         os.replace(temp, destination)
-        entry = {"name": name, "file": relative.as_posix(), "offset": offset,
-                 "size": size, "sha256": digest}
-        mapping[bank] = [item for item in entries if not (isinstance(item, dict) and item.get("name") == name)] + [entry]
-        result = {"action": "replaced" if matches else "added", "profile": str(root),
-                  "bank": bank, **entry}
+        entry = {
+            "name": name,
+            "file": relative.as_posix(),
+            "offset": offset,
+            "size": size,
+            "sha256": digest,
+        }
+        mapping[bank] = [
+            item for item in entries if not (isinstance(item, dict) and item.get("name") == name)
+        ] + [entry]
+        result = {
+            "action": "replaced" if matches else "added",
+            "profile": str(root),
+            "bank": bank,
+            **entry,
+        }
     profile = DeviceProfile.load(root)
     capacities = {"bank1": profile.bank1, "bank2": profile.bank2, "bank0": profile.extflash}
     for bank_key, image_path in capacities.items():
         image_capacity = image_path.stat().st_size if image_path.is_file() else 0
-        capacity = min(image_capacity, MAX_EXTFLASH_BYTES) if bank_key == "bank0" else image_capacity
+        capacity = (
+            min(image_capacity, MAX_EXTFLASH_BYTES) if bank_key == "bank0" else image_capacity
+        )
         for item in mapping.get(bank_key, []):
             blob = (root / str(item.get("file", ""))).resolve()
             if root not in blob.parents or not blob.is_file():
-                raise ValueError(f"profile flash-map blob is missing or escapes profile: {item.get('file')}")
+                raise ValueError(
+                    f"profile flash-map blob is missing or escapes profile: {item.get('file')}"
+                )
             start, length = int(item["offset"]), blob.stat().st_size
             if bank_key in {"bank1", "bank2"} and start + length > 256 * 1024:
-                raise ValueError(f"{bank_key} blob {item.get('name')!r} exceeds the 256 KiB bank limit")
+                raise ValueError(
+                    f"{bank_key} blob {item.get('name')!r} exceeds the 256 KiB bank limit"
+                )
             if start < 0 or length <= 0 or start + length > capacity:
-                raise ValueError(f"{bank_key} blob {item.get('name')!r} exceeds composed image size ({capacity} bytes)")
+                raise ValueError(
+                    f"{bank_key} blob {item.get('name')!r} exceeds composed image size ({capacity} bytes)"
+                )
             if int(item.get("size", length)) != length:
                 raise ValueError(f"flash-map size mismatch for {item.get('file')}")
-            if hashlib.sha256(blob.read_bytes()).hexdigest() != str(item.get("sha256", "")).casefold():
+            if (
+                hashlib.sha256(blob.read_bytes()).hexdigest()
+                != str(item.get("sha256", "")).casefold()
+            ):
                 raise ValueError(f"flash-map SHA-256 mismatch for {item.get('file')}")
     serialized = yaml.safe_dump(mapping, sort_keys=False, allow_unicode=True)
     temp_map = map_path.with_suffix(".yaml.tmp")
     temp_map.write_text(serialized, encoding="utf-8")
     os.replace(temp_map, map_path)
     # Rebuild the emulator images from the source blobs; unmapped bytes stay erased.
-    for bank_key, image_path in (("bank1", profile.bank1), ("bank2", profile.bank2),
-                                 ("bank0", profile.extflash)):
+    for bank_key, image_path in (
+        ("bank1", profile.bank1),
+        ("bank2", profile.bank2),
+        ("bank0", profile.extflash),
+    ):
         if not image_path.is_file():
             continue
         os.chmod(image_path, image_path.stat().st_mode | 0o200)
@@ -321,11 +386,15 @@ def edit_profile_blob(profile_name: str | Path, *, action: str, bank: str,
             for item in mapping.get(bank_key, []):
                 blob = (root / item["file"]).resolve()
                 if root not in blob.parents or not blob.is_file():
-                    raise ValueError(f"profile flash-map blob is missing or escapes profile: {item['file']}")
+                    raise ValueError(
+                        f"profile flash-map blob is missing or escapes profile: {item['file']}"
+                    )
                 data = blob.read_bytes()
                 start = int(item["offset"])
                 if start < 0 or start + len(data) > capacity:
-                    raise ValueError(f"{bank_key} blob {item['name']!r} exceeds composed image size")
+                    raise ValueError(
+                        f"{bank_key} blob {item['name']!r} exceeds composed image size"
+                    )
                 image.seek(start)
                 image.write(data)
     return result
@@ -386,8 +455,11 @@ class DeviceProfile:
             sd_mode=sd_mode,
             sd_image=sd_image,
             provenance=flash.get("provenance", {}),
-            extra={key: value for key, value in data.items()
-                   if key not in {"version", "display_name", "created", "flash", "sd"}},
+            extra={
+                key: value
+                for key, value in data.items()
+                if key not in {"version", "display_name", "created", "flash", "sd"}
+            },
             resolved_sd=resolved_sd,
         )
 

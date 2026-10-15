@@ -30,8 +30,9 @@ class WaitStopped(unittest.TestCase):
         self.assertIn("not at a debug halt", result["reason"])
 
     def test_halt_to_reset_race_is_a_state_result_not_exception(self):
-        session = self.make_session(["halted", "reset"],
-                                    register_error=RuntimeError("core is not halted"))
+        session = self.make_session(
+            ["halted", "reset"], register_error=RuntimeError("core is not halted")
+        )
         result = session.wait_stopped(timeout=0.01, poll_interval=0.001)
         self.assertFalse(result["stopped"])
         self.assertEqual(result["observed_status"], "halted")

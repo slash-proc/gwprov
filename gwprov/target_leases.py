@@ -1,4 +1,5 @@
 """Cross-process leases that serialize traffic to one physical debug target."""
+
 from __future__ import annotations
 
 import hashlib
@@ -26,10 +27,22 @@ def operation_is_busy(owner: dict | None) -> bool:
     if not owner:
         return False
     operation = str(owner.get("operation", "")).casefold()
-    return any(word in operation for word in
-               ("deploy", "flash", "erase", "program", "write", "recover",
-                "unlock", "stub start", "debug session", "debug console",
-                "hardware profile"))
+    return any(
+        word in operation
+        for word in (
+            "deploy",
+            "flash",
+            "erase",
+            "program",
+            "write",
+            "recover",
+            "unlock",
+            "stub start",
+            "debug session",
+            "debug console",
+            "hardware profile",
+        )
+    )
 
 
 def operation_suppresses_poll(owner: dict | None) -> bool:
@@ -37,9 +50,19 @@ def operation_suppresses_poll(owner: dict | None) -> bool:
     if not owner:
         return False
     operation = str(owner.get("operation", "")).casefold()
-    return any(word in operation for word in
-               ("deploy", "flash", "erase", "program", "write", "recover",
-                "unlock", "stub start"))
+    return any(
+        word in operation
+        for word in (
+            "deploy",
+            "flash",
+            "erase",
+            "program",
+            "write",
+            "recover",
+            "unlock",
+            "stub start",
+        )
+    )
 
 
 def operation_blocks_drain(owner: dict | None) -> bool:
@@ -47,15 +70,32 @@ def operation_blocks_drain(owner: dict | None) -> bool:
     if not owner:
         return False
     operation = str(owner.get("operation", "")).casefold()
-    return any(word in operation for word in
-               ("deploy", "flash", "erase", "program", "write", "recover",
-                "unlock", "stub start", "debug session", "debug console", "debug python",
-                "hardware profile"))
+    return any(
+        word in operation
+        for word in (
+            "deploy",
+            "flash",
+            "erase",
+            "program",
+            "write",
+            "recover",
+            "unlock",
+            "stub start",
+            "debug session",
+            "debug console",
+            "debug python",
+            "hardware profile",
+        )
+    )
 
 
 def _lock_dir() -> Path:
     override = os.environ.get("GWPROV_LEASE_DIR")
-    return Path(override).expanduser() if override else Path.home() / ".cache" / "gwprov" / "target-leases"
+    return (
+        Path(override).expanduser()
+        if override
+        else Path.home() / ".cache" / "gwprov" / "target-leases"
+    )
 
 
 def _path_for(key: str) -> Path:
@@ -77,6 +117,7 @@ def adapter_for_probe(name: str) -> str | None:
 def _lock(fd: int, *, blocking: bool) -> bool:
     if os.name == "nt":
         import msvcrt
+
         os.lseek(fd, 0, os.SEEK_SET)
         try:
             msvcrt.locking(fd, msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
@@ -84,6 +125,7 @@ def _lock(fd: int, *, blocking: bool) -> bool:
         except OSError:
             return False
     import fcntl
+
     flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
     try:
         fcntl.flock(fd, flags)
@@ -95,10 +137,12 @@ def _lock(fd: int, *, blocking: bool) -> bool:
 def _unlock(fd: int) -> None:
     if os.name == "nt":
         import msvcrt
+
         os.lseek(fd, 0, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     else:
         import fcntl
+
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
@@ -172,8 +216,9 @@ def active_lease_owners() -> list[dict]:
     return owners
 
 
-def update_device_marker(key: str, *, phase: str | None = None,
-                         flasher_ready: bool = False) -> None:
+def update_device_marker(
+    key: str, *, phase: str | None = None, flasher_ready: bool = False
+) -> None:
     """Compatibility shim for old callers; device state is never marked locally."""
     return None
 
@@ -181,10 +226,17 @@ def update_device_marker(key: str, *, phase: str | None = None,
 class TargetLease:
     """Exclusive process-shared target lease, held for a backend's lifetime."""
 
-    def __init__(self, key: str, operation: str, *, wait: float = 30.0,
-                 allow_recovery_marker: bool = False,
-                 register_with_daemon: bool = True, owner_pid: int | None = None,
-                 daemon_owned: bool = False):
+    def __init__(
+        self,
+        key: str,
+        operation: str,
+        *,
+        wait: float = 30.0,
+        allow_recovery_marker: bool = False,
+        register_with_daemon: bool = True,
+        owner_pid: int | None = None,
+        daemon_owned: bool = False,
+    ):
         if not key:
             raise ValueError("target lease key must not be empty")
         self.key = key
@@ -205,8 +257,10 @@ class TargetLease:
     def acquire(self) -> "TargetLease":
         if self.register_with_daemon:
             from .daemon import pause_device_monitor
-            pause_device_monitor(self.key, self.monitor_pause_token,
-                                 self.owner_pid or os.getpid(), self.wait)
+
+            pause_device_monitor(
+                self.key, self.monitor_pause_token, self.owner_pid or os.getpid(), self.wait
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         if os.name == "nt" and os.fstat(fd).st_size == 0:
@@ -216,9 +270,14 @@ class TargetLease:
             if _lock(fd, blocking=False):
                 previous = _read_metadata(fd, self.key)
                 self.fd = fd
-                owner = {**previous, "key": self.key, "operation": self.operation,
-                         "pid": self.owner_pid or os.getpid(), "started": time.time(),
-                         "daemon_owned": self.daemon_owned}
+                owner = {
+                    **previous,
+                    "key": self.key,
+                    "operation": self.operation,
+                    "pid": self.owner_pid or os.getpid(),
+                    "started": time.time(),
+                    "daemon_owned": self.daemon_owned,
+                }
                 for field in ("recovery_required", "flasher_ready", "phase", "recovery_marked"):
                     owner.pop(field, None)
                 self.owner = owner
@@ -227,12 +286,15 @@ class TargetLease:
                     if self.register_with_daemon:
                         token = secrets.token_hex(16)
                         from .daemon import register_lease
+
                         register_lease(token, owner)
                         self.daemon_token = token
                         self._heartbeat_stop.clear()
                         self._heartbeat_thread = threading.Thread(
-                            target=self._heartbeat_loop, daemon=True,
-                            name=f"gwprov-lease-heartbeat-{os.getpid()}")
+                            target=self._heartbeat_loop,
+                            daemon=True,
+                            name=f"gwprov-lease-heartbeat-{os.getpid()}",
+                        )
                         self._heartbeat_thread.start()
                 except Exception:
                     self.release()
@@ -273,6 +335,7 @@ class TargetLease:
             heartbeat_thread.join(timeout=10.0)
         if token:
             from .daemon import release_lease
+
             release_lease(token)
         if fd is not None:
             try:
@@ -289,6 +352,7 @@ class TargetLease:
                 return
             try:
                 from .daemon import heartbeat_lease
+
                 heartbeat_lease(token, self.owner or {})
             except (OSError, RuntimeError, ValueError):
                 # The daemon's dead-client watchdog will reclaim the target if
@@ -297,11 +361,13 @@ class TargetLease:
                 pass
             if self._heartbeat_stop.is_set():
                 from .daemon import release_lease
+
                 release_lease(token)
                 return
 
     def _resume_monitor(self) -> None:
         from .daemon import resume_device_monitor
+
         resume_device_monitor(self.key, self.monitor_pause_token)
 
     def __enter__(self) -> "TargetLease":
@@ -334,21 +400,34 @@ def external_local_owner(adapter: str | None = None) -> dict | None:
         # its arguments happen to mention "pyocd", "openocd", or
         # "gnwmanager".
         def is_module(module: str) -> bool:
-            return any(arg == "-m" and index + 1 < len(argv)
-                       and argv[index + 1] == module
-                       for index, arg in enumerate(argv))
+            return any(
+                arg == "-m" and index + 1 < len(argv) and argv[index + 1] == module
+                for index, arg in enumerate(argv)
+            )
 
         def is_command(command: str) -> bool:
-            return any(Path(arg).name.casefold().removesuffix(".exe") == command
-                       for arg in argv[1:])
+            return any(
+                Path(arg).name.casefold().removesuffix(".exe") == command for arg in argv[1:]
+            )
 
         if name == "openocd" or executable == "openocd":
-            adapter = next((item for item in ("stlink", "jlink", "cmsis-dap", "rpi-gpio")
-                            if item in argv), None)
-            return {"key": "external-openocd", "operation": "external OpenOCD session",
-                    "pid": pid, "command": command[:240], "adapter": adapter}
-        if (name == "gnwmanager" or executable == "gnwmanager"
-                or is_module("gnwmanager") or is_command("gnwmanager")):
+            adapter = next(
+                (item for item in ("stlink", "jlink", "cmsis-dap", "rpi-gpio") if item in argv),
+                None,
+            )
+            return {
+                "key": "external-openocd",
+                "operation": "external OpenOCD session",
+                "pid": pid,
+                "command": command[:240],
+                "adapter": adapter,
+            }
+        if (
+            name == "gnwmanager"
+            or executable == "gnwmanager"
+            or is_module("gnwmanager")
+            or is_command("gnwmanager")
+        ):
             # `gnwmanager -b gdb ...` is a QEMU GDB-stub client.  It does not
             # open or own a USB debug probe, so it must not block a physical
             # PyOCD/OpenOCD session.  Keep unknown and probe-backed manager
@@ -359,31 +438,51 @@ def external_local_owner(adapter: str | None = None) -> dict | None:
                         return None
                 if arg.startswith("--backend=") and arg.partition("=")[2] == "gdb":
                     return None
-            adapter = next((item for item in ("stlink", "jlink", "cmsis-dap", "rpi-gpio")
-                            if item in argv), None)
-            return {"key": "external-gnwmanager", "operation": "external gnwmanager session",
-                    "pid": pid, "command": command[:240], "adapter": adapter}
+            adapter = next(
+                (item for item in ("stlink", "jlink", "cmsis-dap", "rpi-gpio") if item in argv),
+                None,
+            )
+            return {
+                "key": "external-gnwmanager",
+                "operation": "external gnwmanager session",
+                "pid": pid,
+                "command": command[:240],
+                "adapter": adapter,
+            }
         if name == "pyocd" or executable == "pyocd" or is_module("pyocd"):
-            return {"key": "external-pyocd", "operation": "external PyOCD session",
-                    "pid": pid, "command": command[:240], "adapter": None}
+            return {
+                "key": "external-pyocd",
+                "operation": "external PyOCD session",
+                "pid": pid,
+                "command": command[:240],
+                "adapter": None,
+            }
         return None
 
     try:
         import psutil
-        for process in psutil.process_iter(["pid", "name", "cmdline", "uids"]):
-            try:
-                info = process.info
-                pid = info.get("pid")
-                if not pid or pid == current:
+    except ImportError:
+        psutil = None
+
+    if psutil is not None:
+        try:
+            for process in psutil.process_iter(["pid", "name", "cmdline", "uids"]):
+                try:
+                    info = process.info
+                    pid = info.get("pid")
+                    if not pid or pid == current:
+                        continue
+                    owner = describe(
+                        pid, info.get("name") or "", " ".join(info.get("cmdline") or [])
+                    )
+                    if owner and (adapter is None or owner.get("adapter") in (None, adapter)):
+                        return owner
+                except Exception:
                     continue
-                owner = describe(pid, info.get("name") or "",
-                                 " ".join(info.get("cmdline") or []))
-                if owner and (adapter is None or owner.get("adapter") in (None, adapter)):
-                    return owner
-            except Exception:
-                continue
-    except Exception:
-        pass
+        except Exception:
+            pass
+        return None
+
     # Keep the important OpenOCD ownership check working on minimal Linux
     # installs where psutil is not present.
     proc = Path("/proc")
@@ -392,7 +491,9 @@ def external_local_owner(adapter: str | None = None) -> dict | None:
             if not entry.name.isdigit() or int(entry.name) == current:
                 continue
             try:
-                command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+                command = (
+                    (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+                )
                 name = (entry / "comm").read_text(errors="replace").strip()
                 owner = describe(int(entry.name), name, command)
                 if owner and (adapter is None or owner.get("adapter") in (None, adapter)):

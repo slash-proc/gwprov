@@ -15,7 +15,6 @@ from typing import Any
 import psutil
 
 
-
 def _process_scan_restriction() -> str | None:
     """Describe Linux sandbox controls that make an empty process scan inconclusive."""
     if not Path("/proc/self/status").is_file():
@@ -54,34 +53,129 @@ def _option(args: list[str], name: str) -> str | None:
         return None
 
 
+def _qmp_endpoint(value: str | None) -> tuple[str | None, str]:
+    """Normalize QEMU's QMP command-line endpoint without connecting to it."""
+    if not value:
+        return None, "unavailable"
+    transport, separator, address = value.partition(":")
+    if not separator:
+        return None, "unavailable"
+    address = address.split(",", 1)[0]
+    if transport in {"unix", "unix-connect"}:
+        return address, "unix"
+    if transport == "tcp":
+        # QEMU accepts tcp:host:port and tcp::port. Normalize both to a URI
+        # that QMPConnection can consume while retaining the actual endpoint.
+        host, colon, port = address.rpartition(":")
+        if not colon or not port.isdigit():
+            return None, "unavailable"
+        return f"tcp://{host or '127.0.0.1'}:{port}", "tcp"
+    return None, transport
+
+
+def _gdb_endpoint(value: str | None) -> tuple[str | None, int | None, str]:
+    """Read QEMU's GDB listener endpoint from its -gdb argument."""
+    if not value:
+        return None, None, "unavailable"
+    transport, separator, address = value.partition(":")
+    if not separator:
+        return None, None, "unavailable"
+    address = address.split(",", 1)[0]
+    if transport == "tcp":
+        host, colon, port = address.rpartition(":")
+        if not colon:
+            host, port = "127.0.0.1", host
+        if port.isdigit():
+            return f"{host or '127.0.0.1'}:{port}", int(port), "tcp"
+    if transport in {"unix", "unix-connect"}:
+        return address, None, "unix"
+    return None, None, transport
+
+
+def _pid_owns_listener(pid: int, endpoint: str | None, transport: str) -> bool | None:
+    """Correlate the process launch argument with its kernel listener table."""
+    if not endpoint or transport == "unavailable":
+        return False
+    try:
+        connections = psutil.Process(pid).net_connections(kind="all")
+    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+        return None
+    if transport == "tcp":
+        try:
+            port = int(endpoint.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            return False
+        return any(
+            connection.status == psutil.CONN_LISTEN
+            and getattr(connection.laddr, "port", None) == port
+            for connection in connections
+        )
+    path = endpoint.removeprefix("unix:")
+    return any(getattr(connection.laddr, "path", None) == path for connection in connections)
+
+
+def _pid_listeners(pid: int) -> tuple[list[str], list[str]] | None:
+    """Return process-owned TCP ports and Unix socket paths, if visible."""
+    try:
+        connections = psutil.Process(pid).net_connections(kind="all")
+    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+        return None
+    tcp = sorted(
+        {
+            f"{getattr(connection.laddr, 'ip', '') or '*'}:{connection.laddr.port}"
+            for connection in connections
+            if connection.type == socket.SOCK_STREAM
+            and connection.status == psutil.CONN_LISTEN
+            and getattr(connection.laddr, "port", None)
+        }
+    )
+    unix = sorted(
+        {
+            connection.laddr.path
+            for connection in connections
+            if connection.family == socket.AF_UNIX and getattr(connection.laddr, "path", None)
+        }
+    )
+    return tcp, unix
+
+
 def _instance(pid: int, args: list[str]) -> dict[str, Any] | None:
     joined = " ".join(args)
     executable = Path(args[0]).name.lower() if args else ""
-    is_emulator = executable == "gwemu" or executable == "gwemu.exe" \
-        or executable.startswith("qemu-system")
+    is_emulator = (
+        executable == "gwemu" or executable == "gwemu.exe" or executable.startswith("qemu-system")
+    )
     if "gnw-h7b0" not in joined or not is_emulator:
         return None
-    bank1 = next((arg.split("=", 1)[1] for arg in args
-                  if "gnw-h7b0-soc.bank1-image=" in arg), None)
+    bank1 = next((arg.split("=", 1)[1] for arg in args if "gnw-h7b0-soc.bank1-image=" in arg), None)
     profile = str(Path(bank1).resolve().parent) if bank1 else None
-    qmp_arg = _option(args, "-qmp")
-    qmp = None
-    if qmp_arg and qmp_arg.startswith("unix:"):
-        qmp = qmp_arg[5:].split(",", 1)[0]
-    gdb_arg = _option(args, "-gdb")
-    gdb_port = None
-    if gdb_arg and gdb_arg.startswith("tcp:"):
-        try:
-            gdb_port = int(gdb_arg.rsplit(":", 1)[1])
-        except ValueError:
-            pass
+    qmp, qmp_transport = _qmp_endpoint(_option(args, "-qmp"))
+    gdb_endpoint, gdb_port, gdb_transport = _gdb_endpoint(_option(args, "-gdb"))
     process = psutil.Process(pid)
     try:
         created = process.create_time()
     except psutil.Error:
         created = None
+    qmp_listener = _pid_owns_listener(pid, qmp, qmp_transport)
+    gdb_listener = _pid_owns_listener(pid, gdb_endpoint, gdb_transport)
+    listeners = _pid_listeners(pid)
     execution = _qmp_execution(qmp)
     running = execution.get("running")
+    global_options = [
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "-global"
+    ]
+    experimental = any("x-gnw-m7-cycle-model=on" in value for value in global_options)
+    modeled = any("gnw-h7b0-soc.timing-mode=on" in value for value in global_options)
+    timing_mode = "experimental-m7" if experimental else "baseline" if modeled else "default"
+    icount = _option(args, "-icount")
+    if icount and "align=on" in icount and "sleep=on" in icount:
+        pacing = "realtime"
+    elif icount and "align=off" in icount and "sleep=off" in icount:
+        pacing = "unthrottled"
+    else:
+        pacing = "realtime" if timing_mode == "baseline" else "unthrottled"
     return {
         "pid": pid,
         "profile": profile,
@@ -91,10 +185,19 @@ def _instance(pid: int, args: list[str]) -> dict[str, Any] | None:
         "qmpStatus": execution.get("status", "unknown"),
         **({"stateDetail": execution["detail"]} if "detail" in execution else {}),
         "display": "visible" if _option(args, "-display") == "gwemu" else "headless",
+        "timing": {"mode": timing_mode, "pacing": pacing, "hardwareCycleAccurate": False},
         "gdbPort": gdb_port,
+        "gdbEndpoint": gdb_endpoint,
+        "gdbTransport": gdb_transport,
         "qmpSocket": qmp,
         "qmpHandle": qmp,
-        "qmpTransport": "unix" if qmp else "unavailable",
+        "qmpTransport": qmp_transport,
+        "qmpPid": pid if qmp_listener is True else None,
+        "gdbPid": pid if gdb_listener is True else None,
+        "qmpListener": qmp_listener,
+        "gdbListener": gdb_listener,
+        "tcpListeners": listeners[0] if listeners is not None else None,
+        "unixListeners": listeners[1] if listeners is not None else None,
         "created": created,
     }
 
@@ -102,10 +205,14 @@ def _instance(pid: int, args: list[str]) -> dict[str, Any] | None:
 def _qmp_execution(path: str | None) -> dict:
     """Read actual CPU execution state; a debugger connection is not a state."""
     if not path:
-        return {"status": "unavailable", "running": None,
-                "detail": "QMP endpoint is missing; execution state cannot be verified"}
+        return {
+            "status": "unavailable",
+            "running": None,
+            "detail": "QMP endpoint is missing; execution state cannot be verified",
+        }
     if path.startswith("gwprov://"):
         from .qmp import QMPConnection
+
         try:
             with QMPConnection(path, timeout=0.5) as qmp:
                 state = qmp.execute("query-status")["return"]
@@ -114,17 +221,25 @@ def _qmp_execution(path: str | None) -> dict:
             return state
         except (OSError, RuntimeError, ValueError) as exc:
             return {"status": "unavailable", "running": None, "detail": str(exc)}
+    is_tcp = path.startswith("tcp://")
     try:
-        endpoint_exists = Path(path).exists()
+        endpoint_exists = is_tcp or Path(path).exists()
     except PermissionError:
         raise
     except OSError as exc:
-        return {"status": "unavailable", "running": None,
-                "detail": f"QMP endpoint cannot be checked: {exc}"}
+        return {
+            "status": "unavailable",
+            "running": None,
+            "detail": f"QMP endpoint cannot be checked: {exc}",
+        }
     if not endpoint_exists:
-        return {"status": "unavailable", "running": None,
-                "detail": "QMP endpoint is missing; execution state cannot be verified"}
+        return {
+            "status": "unavailable",
+            "running": None,
+            "detail": "QMP endpoint is missing; execution state cannot be verified",
+        }
     from .qmp import QMPConnection
+
     try:
         with QMPConnection(path, timeout=0.5) as qmp:
             state = qmp.execute("query-status")["return"]
@@ -143,6 +258,7 @@ def _qmp_status(path: str | None) -> str:
 
 def _qmp_execute(path: str, command: str, arguments: dict[str, Any] | None = None) -> dict:
     from .qmp import QMPConnection
+
     with QMPConnection(path) as qmp:
         return qmp.execute(command, arguments)
 
@@ -171,7 +287,7 @@ def _read_ppm(ppm: bytes) -> tuple[int, int, bytes]:
             raise ValueError("incomplete PPM header")
         if offset >= len(ppm):
             raise ValueError("PPM header has no pixel-data delimiter")
-        if ppm[offset:offset + 2] == b"\r\n":
+        if ppm[offset : offset + 2] == b"\r\n":
             offset += 2
         else:
             offset += 1
@@ -194,7 +310,7 @@ def _read_ppm(ppm: bytes) -> tuple[int, int, bytes]:
                 converted[index] = (value * 255 + maximum // 2) // maximum
         else:
             for index in range(width * height * 3):
-                value = int.from_bytes(pixels[index * 2:index * 2 + 2], "big")
+                value = int.from_bytes(pixels[index * 2 : index * 2 + 2], "big")
                 converted[index] = (value * 255 + maximum // 2) // maximum
         pixels = bytes(converted)
 
@@ -203,24 +319,26 @@ def _read_ppm(ppm: bytes) -> tuple[int, int, bytes]:
 
 def _rgb_to_png(width: int, height: int, pixels: bytes) -> bytes:
     scanlines = b"".join(
-        b"\x00" + pixels[y * width * 3:(y + 1) * width * 3]
-        for y in range(height)
+        b"\x00" + pixels[y * width * 3 : (y + 1) * width * 3] for y in range(height)
     )
 
     def chunk(kind: bytes, data: bytes) -> bytes:
         body = kind + data
         return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
 
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(scanlines))
-            + chunk(b"IEND", b""))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(scanlines))
+        + chunk(b"IEND", b"")
+    )
 
 
 def screenshot_qmp(qmp_socket: str, output: str | Path | None = None) -> dict[str, Any]:
     """Capture GWemu as PNG and report exact black-screen pixel statistics."""
     if qmp_socket.startswith("gwprov://"):
         from .daemon_ipc import runtime_directory
+
         qmp_path = runtime_directory() / f"gwemu-{qmp_socket.removeprefix('gwprov://')}"
     else:
         qmp_path = Path(qmp_socket).expanduser().resolve()
@@ -239,8 +357,8 @@ def screenshot_qmp(qmp_socket: str, output: str | Path | None = None) -> dict[st
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-                prefix=".gwprov-screenshot-", suffix=".ppm",
-                dir=output_path.parent, delete=False) as temporary:
+            prefix=".gwprov-screenshot-", suffix=".ppm", dir=output_path.parent, delete=False
+        ) as temporary:
             temp_path = Path(temporary.name)
         endpoint = qmp_socket if qmp_socket.startswith("gwprov://") else str(qmp_path)
         _qmp_execute(endpoint, "screendump", {"filename": str(temp_path)})
@@ -250,7 +368,8 @@ def screenshot_qmp(qmp_socket: str, output: str | Path | None = None) -> dict[st
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
     non_black = sum(
-        1 for index in range(0, len(pixels), 3)
+        1
+        for index in range(0, len(pixels), 3)
         if pixels[index] or pixels[index + 1] or pixels[index + 2]
     )
     return {
@@ -262,13 +381,15 @@ def screenshot_qmp(qmp_socket: str, output: str | Path | None = None) -> dict[st
     }
 
 
-def screenshot_instance(*, pid: int | None = None, profile: str | None = None,
-                        output: str | Path | None = None) -> int:
+def screenshot_instance(
+    *, pid: int | None = None, profile: str | None = None, output: str | Path | None = None
+) -> int:
     if (pid is None) == (profile is None):
         raise ValueError("select exactly one instance with --pid or --profile")
     rows = instances()
     if profile:
         from .profiles import resolve_profile_path
+
         root = str(resolve_profile_path(profile))
         rows = [row for row in rows if row["profile"] == root]
     else:
@@ -279,24 +400,32 @@ def screenshot_instance(*, pid: int | None = None, profile: str | None = None,
         raise ValueError("profile matches multiple GWemu instances; select one by --pid")
     qmp_path = rows[0]["qmpSocket"]
     if not qmp_path:
-        raise ValueError("instance has no QMP control channel; it cannot be screenshotted by gwprov")
+        raise ValueError(
+            "instance has no QMP control channel; it cannot be screenshotted by gwprov"
+        )
     result = screenshot_qmp(qmp_path, output)
     print(f"Saved PNG screenshot: {result['path']}")
-    print(f"Frame {result['width']}x{result['height']}; all black: "
-          f"{'yes' if result['all_black'] else 'no'}; "
-          f"nonblack pixels: {result['non_black_pixels']}")
+    print(
+        f"Frame {result['width']}x{result['height']}; all black: "
+        f"{'yes' if result['all_black'] else 'no'}; "
+        f"nonblack pixels: {result['non_black_pixels']}"
+    )
     return 0
 
 
-def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
-                      output: str | Path | None = None,
-                      max_frames: int = 32,
-                      inspect_u32: list[str] | None = None,
-                      inspect_deref: list[str] | None = None,
-                      inspect_bytes: list[str] | None = None,
-                      inspect_values: list[str] | None = None,
-                      inspect_rings: list[str] | None = None,
-                      debug_config: str | None = None) -> int:
+def diagnose_instance(
+    profile: str,
+    *,
+    symbols: list[str] | None = None,
+    output: str | Path | None = None,
+    max_frames: int = 32,
+    inspect_u32: list[str] | None = None,
+    inspect_deref: list[str] | None = None,
+    inspect_bytes: list[str] | None = None,
+    inspect_values: list[str] | None = None,
+    inspect_rings: list[str] | None = None,
+    debug_config: str | None = None,
+) -> int:
     """Capture one running profile's screen and symbol-resolved ARM stack."""
     from .debug_shell import DebugSession, GwemuGDBBackend
     from .profiles import DeviceProfile
@@ -307,8 +436,11 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
     if len(matches) != 1:
         if not matches:
             from .profiles import profile_reference
+
             raise ValueError(f"no GWemu instance is running for profile {profile_reference(root)}")
-        raise ValueError(f"profile has {len(matches)} GWemu instances; select one before diagnosing")
+        raise ValueError(
+            f"profile has {len(matches)} GWemu instances; select one before diagnosing"
+        )
     row = matches[0]
     if not row["gdbPort"]:
         raise ValueError("GWemu instance has no GDB endpoint")
@@ -319,10 +451,15 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
     if not firmware.is_file():
         raise ValueError(f"profile has no bundled firmware symbols: {firmware}")
     app_symbols = sorted((device.root / "debug" / "apps").rglob("*.elf"))
-    symbol_paths = list(dict.fromkeys([
-        firmware, *app_symbols,
-        *(Path(path).expanduser().resolve() for path in symbols or []),
-    ]))
+    symbol_paths = list(
+        dict.fromkeys(
+            [
+                firmware,
+                *app_symbols,
+                *(Path(path).expanduser().resolve() for path in symbols or []),
+            ]
+        )
+    )
     for symbol_path in symbol_paths:
         if not symbol_path.is_file():
             raise FileNotFoundError(symbol_path)
@@ -339,14 +476,18 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
             session.symbols.load(symbol_path)
         if debug_config:
             session.configure(debug_config)
-        report = session.diagnose(output, max_frames=max_frames,
-                                  inspect_u32=inspect_u32 or [],
-                                  inspect_deref=inspect_deref or [],
-                                  inspect_bytes=inspect_bytes or [],
-                                  inspect_values=inspect_values or [],
-                                  inspect_rings=inspect_rings or [])
-        report.update({"pid": row["pid"], "profile": root,
-                       "symbols": [str(path) for path in symbol_paths]})
+        report = session.diagnose(
+            output,
+            max_frames=max_frames,
+            inspect_u32=inspect_u32 or [],
+            inspect_deref=inspect_deref or [],
+            inspect_bytes=inspect_bytes or [],
+            inspect_values=inspect_values or [],
+            inspect_rings=inspect_rings or [],
+        )
+        report.update(
+            {"pid": row["pid"], "profile": root, "symbols": [str(path) for path in symbol_paths]}
+        )
         print(json.dumps(report, indent=2))
         return 0
     finally:
@@ -359,22 +500,27 @@ def diagnose_instance(profile: str, *, symbols: list[str] | None = None,
             backend.close()
 
 
-
-def watch_instance(profile: str, *, symbols: list[str] | None = None,
-                   progress_symbols: list[str] | None = None,
-                   guest_pc_symbols: list[str] | None = None,
-                   rebase_symbols: list[str] | None = None,
-                   watch_u32: list[str] | None = None,
-                   watch_deref: list[str] | None = None,
-                   watch_bytes: list[str] | None = None,
-                   watch_values: list[str] | None = None,
-                   watch_rings: list[str] | None = None,
-                   heartbeat_symbol: str | None = None,
-                   frame_symbol: str | None = None,
-                   guest_pc_symbol: str | None = None,
-                   interval: float = 0.5, stall_after: float = 3.0,
-                   duration: float = 30.0,
-                   output: str | Path | None = None, debug_config: str | None = None) -> int:
+def watch_instance(
+    profile: str,
+    *,
+    symbols: list[str] | None = None,
+    progress_symbols: list[str] | None = None,
+    guest_pc_symbols: list[str] | None = None,
+    rebase_symbols: list[str] | None = None,
+    watch_u32: list[str] | None = None,
+    watch_deref: list[str] | None = None,
+    watch_bytes: list[str] | None = None,
+    watch_values: list[str] | None = None,
+    watch_rings: list[str] | None = None,
+    heartbeat_symbol: str | None = None,
+    frame_symbol: str | None = None,
+    guest_pc_symbol: str | None = None,
+    interval: float = 0.5,
+    stall_after: float = 3.0,
+    duration: float = 30.0,
+    output: str | Path | None = None,
+    debug_config: str | None = None,
+) -> int:
     """Watch a target and save a generic, symbolized triage bundle on suspicion."""
     from datetime import datetime, timezone
     from .debug_shell import DebugSession, GwemuGDBBackend
@@ -386,19 +532,28 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
     root = str(device.root)
     matches = [row for row in instances() if row["profile"] == root]
     if len(matches) != 1:
-        raise ValueError("watch requires exactly one visible GWemu instance for profile; "
-                         "ensure gwprov has process visibility and the instance has GDB/QMP")
+        raise ValueError(
+            "watch requires exactly one visible GWemu instance for profile; "
+            "ensure gwprov has process visibility and the instance has GDB/QMP"
+        )
     row = matches[0]
     if not row["gdbPort"] or not row["qmpSocket"]:
-        raise ValueError("watch requires GDB and QMP endpoints; start with gwprov gwemu start")
+        raise ValueError(
+            "watch requires GDB and QMP endpoints; start the device with gwprov start PROFILE"
+        )
     firmware = device.root / "debug" / "retro-go-debug.elf"
     if not firmware.is_file():
         raise ValueError(f"profile has no bundled firmware symbols: {firmware}")
     app_symbols = sorted((device.root / "debug" / "apps").rglob("*.elf"))
-    symbol_paths = list(dict.fromkeys([
-        firmware, *app_symbols,
-        *(Path(path).expanduser().resolve() for path in symbols or []),
-    ]))
+    symbol_paths = list(
+        dict.fromkeys(
+            [
+                firmware,
+                *app_symbols,
+                *(Path(path).expanduser().resolve() for path in symbols or []),
+            ]
+        )
+    )
     for path in symbol_paths:
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -416,8 +571,7 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
     guest_names = list(guest_pc_symbols or [])
     if guest_pc_symbol and guest_pc_symbol not in guest_names:
         guest_names.append(guest_pc_symbol)
-    watched_names = list(dict.fromkeys([*progress_names, *guest_names,
-                                        *(watch_u32 or [])]))
+    watched_names = list(dict.fromkeys([*progress_names, *guest_names, *(watch_u32 or [])]))
     deref_specs = list(watch_deref or [])
     byte_specs = list(watch_bytes or [])
     rebase_specs: list[tuple[str, str]] = []
@@ -433,9 +587,15 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
     previous_cpu_signature = None
     cpu_stable_since = started
     last_guest_screen_probe = 0.0
-    report_path = (Path(output).expanduser().resolve() if output else
-                   device.root / "runtime" / "gwprov" / "triage" /
-                   f"watch-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json")
+    report_path = (
+        Path(output).expanduser().resolve()
+        if output
+        else device.root
+        / "runtime"
+        / "gwprov"
+        / "triage"
+        / f"watch-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
     image_path = report_path.with_suffix(".png")
     try:
         backend.open()
@@ -458,45 +618,70 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
         if not progress_names:
             for item in symbols_found:
                 name = item["name"].lower()
-                if item["size"] == 4 and item["type"] == "STT_OBJECT" and any(
-                        token in name for token in
-                        ("heartbeat", "frame_count", "frame_counter", "progress_count")):
+                if (
+                    item["size"] == 4
+                    and item["type"] == "STT_OBJECT"
+                    and any(
+                        token in name
+                        for token in ("heartbeat", "frame_count", "frame_counter", "progress_count")
+                    )
+                ):
                     progress_names.append(item["name"])
         if not guest_names:
             for item in symbols_found:
                 name = item["name"].lower()
-                if item["size"] == 4 and item["type"] == "STT_OBJECT" and (
-                        name.endswith(("_cur_pc", "_current_pc", "_resume_pc", "_guest_pc"))):
+                if (
+                    item["size"] == 4
+                    and item["type"] == "STT_OBJECT"
+                    and (name.endswith(("_cur_pc", "_current_pc", "_resume_pc", "_guest_pc")))
+                ):
                     guest_names.append(item["name"])
-        watched_names = list(dict.fromkeys([*progress_names, *guest_names,
-                                            *(watch_u32 or [])]))
+        watched_names = list(dict.fromkeys([*progress_names, *guest_names, *(watch_u32 or [])]))
         for section, pointer_symbol in rebase_specs:
             try:
                 session.at(pointer_symbol)
                 session.symbols.owner(pointer_symbol)
             except KeyError as exc:
                 raise ValueError(f"rebase pointer symbol {pointer_symbol!r} is not loaded") from exc
-            if not any(section in session.symbols.sections(path) for path in session.symbols.sources):
+            if not any(
+                section in session.symbols.sections(path) for path in session.symbols.sources
+            ):
                 raise ValueError(
                     f"ELF section {section!r} is not present in the ELF containing "
-                    f"pointer symbol {pointer_symbol!r}")
+                    f"pointer symbol {pointer_symbol!r}"
+                )
         fault_ranges = []
         for item in symbols_found:
             name = item["name"]
             lowered = name.lower()
-            if item["size"] and any(token in lowered for token in
-                                     ("hardfault", "busfault", "usagefault",
-                                      "memmanagefault", "fault_handler", "error_handler",
-                                      "panic", "assert_fail", "abort")):
-                fault_ranges.append((name, item["address"] & ~1,
-                                     (item["address"] & ~1) + item["size"]))
+            if item["size"] and any(
+                token in lowered
+                for token in (
+                    "hardfault",
+                    "busfault",
+                    "usagefault",
+                    "memmanagefault",
+                    "fault_handler",
+                    "error_handler",
+                    "panic",
+                    "assert_fail",
+                    "abort",
+                )
+            ):
+                fault_ranges.append(
+                    (name, item["address"] & ~1, (item["address"] & ~1) + item["size"])
+                )
         saw_progress = False
         while time.monotonic() - started < duration:
             status = _qmp_execute(row["qmpSocket"], "query-status").get("return", {})
             now = time.monotonic()
             if not status.get("running"):
-                samples.append({"elapsed_seconds": round(now - started, 3),
-                                "state": status.get("status", "paused")})
+                samples.append(
+                    {
+                        "elapsed_seconds": round(now - started, 3),
+                        "state": status.get("status", "paused"),
+                    }
+                )
                 previous_cpu_signature = None
                 value_history.clear()
                 value_stable_since.clear()
@@ -531,53 +716,88 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
             if changed_progress:
                 saw_progress = True
                 last_progress = now
-            fault_name = next((name for name, start, end in fault_ranges
-                               if start <= pc < end), None)
-            guest_stagnant = next((name for name in guest_names
-                                   if now - value_stable_since.get(name, now) >= stall_after), None)
-            cpu_stagnant = (previous_cpu_signature == signature and
-                            now - cpu_stable_since >= stall_after and
-                            (not progress_names or now - last_progress >= stall_after))
+            fault_name = next(
+                (name for name, start, end in fault_ranges if start <= pc < end), None
+            )
+            guest_stagnant = next(
+                (
+                    name
+                    for name in guest_names
+                    if now - value_stable_since.get(name, now) >= stall_after
+                ),
+                None,
+            )
+            cpu_stagnant = (
+                previous_cpu_signature == signature
+                and now - cpu_stable_since >= stall_after
+                and (not progress_names or now - last_progress >= stall_after)
+            )
             guest_stagnant_trigger = False
             screen_probe = None
             if guest_stagnant and now - last_guest_screen_probe >= min(stall_after, 2.0):
                 last_guest_screen_probe = now
                 screen_probe = session.screenshot(image_path)
                 guest_stagnant_trigger = (
-                    screen_probe["all_black"] or not progress_names or
-                    now - last_progress >= stall_after)
+                    screen_probe["all_black"]
+                    or not progress_names
+                    or now - last_progress >= stall_after
+                )
                 if not guest_stagnant_trigger:
                     image_path.unlink(missing_ok=True)
                     screen_probe = None
-            samples.append({"elapsed_seconds": round(now - started, 3),
-                            "values": values,
-                            "pc": pc, "pc_hex": hex(pc), "fault_handler": fault_name,
-                            "sp": regs.get("sp"), "lr": regs.get("lr"),
-                            "guest_pc_stagnant": guest_stagnant,
-                            "cpu_location_stagnant": cpu_stagnant,
-                            "state": status.get("status", "running")})
+            samples.append(
+                {
+                    "elapsed_seconds": round(now - started, 3),
+                    "values": values,
+                    "pc": pc,
+                    "pc_hex": hex(pc),
+                    "fault_handler": fault_name,
+                    "sp": regs.get("sp"),
+                    "lr": regs.get("lr"),
+                    "guest_pc_stagnant": guest_stagnant,
+                    "cpu_location_stagnant": cpu_stagnant,
+                    "state": status.get("status", "running"),
+                }
+            )
             previous_cpu_signature = signature
-            if fault_name or guest_stagnant_trigger or cpu_stagnant or (
-                    progress_names and now - last_progress >= stall_after):
-                diagnosis = session.diagnose(image_path, inspect_u32=watched_names,
-                                             inspect_deref=deref_specs,
-                                             inspect_bytes=byte_specs,
-                                             inspect_values=watch_values or [],
-                                             inspect_rings=watch_rings or [],
-                                             screenshot=screen_probe)
+            if (
+                fault_name
+                or guest_stagnant_trigger
+                or cpu_stagnant
+                or (progress_names and now - last_progress >= stall_after)
+            ):
+                diagnosis = session.diagnose(
+                    image_path,
+                    inspect_u32=watched_names,
+                    inspect_deref=deref_specs,
+                    inspect_bytes=byte_specs,
+                    inspect_values=watch_values or [],
+                    inspect_rings=watch_rings or [],
+                    screenshot=screen_probe,
+                )
                 screenshot = diagnosis.get("screenshot", {})
                 traceback_frames = diagnosis.get("traceback", {}).get("frames", [])
                 traceback_symbols = {
                     frame.get("symbol", {}).get("name", "")
-                    for frame in traceback_frames if frame.get("symbol")
+                    for frame in traceback_frames
+                    if frame.get("symbol")
                 }
-                fatal_symbols = sorted(name for name in traceback_symbols
-                                       if name.lower() in {
-                                           "abort", "bsod", "hardfault_handler",
-                                           "busfault_handler", "usagefault_handler",
-                                           "memmanage_handler", "error_handler",
-                                           "common_fault_handler_c", "panic",
-                                       })
+                fatal_symbols = sorted(
+                    name
+                    for name in traceback_symbols
+                    if name.lower()
+                    in {
+                        "abort",
+                        "bsod",
+                        "hardfault_handler",
+                        "busfault_handler",
+                        "usagefault_handler",
+                        "memmanage_handler",
+                        "error_handler",
+                        "common_fault_handler_c",
+                        "panic",
+                    }
+                )
                 if fault_name:
                     classification = "fault-handler"
                     reason = f"CPU PC is inside {fault_name}"
@@ -589,7 +809,9 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                     reason = f"{guest_stagnant} remained unchanged for {stall_after:g} seconds"
                 elif progress_names and now - last_progress >= stall_after:
                     classification = "suspected-progress-stall"
-                    reason = f"none of the selected progress symbols changed for {stall_after:g} seconds"
+                    reason = (
+                        f"none of the selected progress symbols changed for {stall_after:g} seconds"
+                    )
                 else:
                     classification = "suspected-cpu-loop"
                     reason = f"ARM PC, SP, and LR stayed unchanged for {stall_after:g} seconds"
@@ -601,57 +823,86 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                     "reason": reason,
                     "confidence": "direct" if fault_name or fatal_symbols else "heuristic",
                     "observed_at_utc": datetime.now(timezone.utc).isoformat(),
-                    "profile": root, "pid": row["pid"],
+                    "profile": root,
+                    "pid": row["pid"],
                     "symbols": [str(path) for path in symbol_paths],
                     "progress_symbols": progress_names,
                     "guest_pc_symbols": guest_names,
                     "rebased_sections": [
                         {"section": section, "pointer_symbol": pointer}
-                        for section, pointer in rebase_specs],
+                        for section, pointer in rebase_specs
+                    ],
                     "watch_u32": watch_u32 or [],
                     "watch_deref": deref_specs,
                     "watch_bytes": byte_specs,
                     "runtime_error_symbols": fatal_symbols,
                     "last_values": values,
-                    "stable_seconds": round(now - (value_stable_since.get(guest_stagnant, cpu_stable_since)
-                                                    if guest_stagnant_trigger else cpu_stable_since), 3),
-                    "cpu_location": {"pc": pc, "sp": regs.get("sp"), "lr": regs.get("lr"),
-                                     "symbolized": context},
+                    "stable_seconds": round(
+                        now
+                        - (
+                            value_stable_since.get(guest_stagnant, cpu_stable_since)
+                            if guest_stagnant_trigger
+                            else cpu_stable_since
+                        ),
+                        3,
+                    ),
+                    "cpu_location": {
+                        "pc": pc,
+                        "sp": regs.get("sp"),
+                        "lr": regs.get("lr"),
+                        "symbolized": context,
+                    },
                     "display": screenshot,
-                    "screenshot": str(image_path), "diagnosis": diagnosis,
+                    "screenshot": str(image_path),
+                    "diagnosis": diagnosis,
                     "samples": samples,
                 }
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text(json.dumps(report, indent=2) + "\n")
-                print(json.dumps({"classification": classification,
-                                  "reason": reason,
-                                  "confidence": report["confidence"],
-                                  "values": values,
-                                  "display": screenshot,
-                                  "report": str(report_path),
-                                  "screenshot": str(image_path),
-                                  "cpu_location": context,
-                                  "traceback": diagnosis["traceback"]}, indent=2))
+                print(
+                    json.dumps(
+                        {
+                            "classification": classification,
+                            "reason": reason,
+                            "confidence": report["confidence"],
+                            "values": values,
+                            "display": screenshot,
+                            "report": str(report_path),
+                            "screenshot": str(image_path),
+                            "cpu_location": context,
+                            "traceback": diagnosis["traceback"],
+                        },
+                        indent=2,
+                    )
+                )
                 return 1
             time.sleep(interval)
         classification = "progressing" if saw_progress else "no-progress-symbols-detected"
         report = {
             "classification": classification,
             "observed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "profile": root, "pid": row["pid"],
+            "profile": root,
+            "pid": row["pid"],
             "symbols": [str(path) for path in symbol_paths],
             "progress_symbols": progress_names,
             "guest_pc_symbols": guest_names,
             "rebased_sections": [
-                {"section": section, "pointer_symbol": pointer}
-                for section, pointer in rebase_specs],
+                {"section": section, "pointer_symbol": pointer} for section, pointer in rebase_specs
+            ],
             "samples": samples,
         }
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, indent=2) + "\n")
-        print(json.dumps({"classification": report["classification"],
-                          "report": str(report_path),
-                          "samples": len(samples)}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "classification": report["classification"],
+                    "report": str(report_path),
+                    "samples": len(samples),
+                },
+                indent=2,
+            )
+        )
         return 0 if saw_progress else 2
     finally:
         if getattr(backend, "_socket", None) is not None:
@@ -661,8 +912,10 @@ def watch_instance(profile: str, *, symbols: list[str] | None = None,
                 backend.halt()
             backend.close()
 
+
 def instances() -> list[dict[str, Any]]:
     from .daemon import managed_instances
+
     result = managed_instances()
     managed_pids = {row["pid"] for row in result}
     for proc in psutil.process_iter(["pid", "cmdline"]):
@@ -680,6 +933,7 @@ def _qmp_read_memory(path: str, address: int, size: int) -> bytes:
     if size <= 0:
         return b""
     from .qmp import QMPConnection
+
     with QMPConnection(path) as qmp:
         return qmp.read_memory(address, size)
 
@@ -690,7 +944,9 @@ def _dwarf_struct_members(elf_path: Path, variable_name: str) -> dict[str, int]:
 
     def attr_name(die, key):
         attr = die.attributes.get(key)
-        return attr.value.decode(errors="replace") if attr and isinstance(attr.value, bytes) else None
+        return (
+            attr.value.decode(errors="replace") if attr and isinstance(attr.value, bytes) else None
+        )
 
     def referenced_type(cu, die):
         attr = die.attributes.get("DW_AT_type")
@@ -699,8 +955,11 @@ def _dwarf_struct_members(elf_path: Path, variable_name: str) -> dict[str, int]:
         offset = attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
         target = cu.get_DIE_from_refaddr(offset)
         while target and target.tag in {
-            "DW_TAG_typedef", "DW_TAG_const_type", "DW_TAG_volatile_type",
-            "DW_TAG_restrict_type", "DW_TAG_atomic_type",
+            "DW_TAG_typedef",
+            "DW_TAG_const_type",
+            "DW_TAG_volatile_type",
+            "DW_TAG_restrict_type",
+            "DW_TAG_atomic_type",
         }:
             attr = target.attributes.get("DW_AT_type")
             if not attr:
@@ -744,16 +1003,23 @@ def _dwarf_typedef_members(elf_path: Path, typedef_name: str) -> dict[str, int]:
                 attr = die.attributes.get("DW_AT_type")
                 if not attr:
                     continue
-                offset = attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
+                offset = (
+                    attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
+                )
                 target = cu.get_DIE_from_refaddr(offset)
                 while target and target.tag in {
-                    "DW_TAG_typedef", "DW_TAG_const_type", "DW_TAG_volatile_type",
-                    "DW_TAG_restrict_type", "DW_TAG_atomic_type",
+                    "DW_TAG_typedef",
+                    "DW_TAG_const_type",
+                    "DW_TAG_volatile_type",
+                    "DW_TAG_restrict_type",
+                    "DW_TAG_atomic_type",
                 }:
                     attr = target.attributes.get("DW_AT_type")
                     if not attr:
                         break
-                    offset = attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
+                    offset = (
+                        attr.value if attr.form == "DW_FORM_ref_addr" else cu.cu_offset + attr.value
+                    )
                     target = cu.get_DIE_from_refaddr(offset)
                 if not target or target.tag != "DW_TAG_structure_type":
                     continue
@@ -772,12 +1038,14 @@ def _dwarf_typedef_members(elf_path: Path, typedef_name: str) -> dict[str, int]:
 
 def _qmp_registers(path: str) -> dict[str, int]:
     from .qmp import QMPConnection
+
     with QMPConnection(path) as qmp:
         return qmp.registers()
 
 
-def _application_state_from_target(symbol_table, firmware: Path, app_elfs: list[Path],
-                                   read_memory, registers: dict[str, int]) -> str:
+def _application_state_from_target(
+    symbol_table, firmware: Path, app_elfs: list[Path], read_memory, registers: dict[str, int]
+) -> str:
     """Classify a paused target from shared Retro-Go and project ELF symbols."""
     pc = registers["pc"]
     frames = []
@@ -795,11 +1063,22 @@ def _application_state_from_target(symbol_table, firmware: Path, app_elfs: list[
     active_names = set(frames) | {current_name}
     lowered_names = {name.casefold() for name in active_names}
 
-    fatal_names = sorted(name for name in active_names if name.casefold() in {
-        "bsod", "abort", "hardfault_handler", "busfault_handler",
-        "usagefault_handler", "memmanage_handler", "common_fault_handler_c",
-        "error_handler", "panic",
-    })
+    fatal_names = sorted(
+        name
+        for name in active_names
+        if name.casefold()
+        in {
+            "bsod",
+            "abort",
+            "hardfault_handler",
+            "busfault_handler",
+            "usagefault_handler",
+            "memmanage_handler",
+            "common_fault_handler_c",
+            "error_handler",
+            "panic",
+        }
+    )
     if fatal_names:
         return "Fault: " + ", ".join(fatal_names)
 
@@ -822,14 +1101,21 @@ def _application_state_from_target(symbol_table, firmware: Path, app_elfs: list[
     # name. It is read directly from the app ELF, so custom state text needs no
     # per-project code in gwprov and does not depend on relocated pointers.
     for elf in reversed(app_elfs):
-        state_symbol = next((item for item in symbol_table.nm("gwprov_application_state", elf)
-                             if item["name"] == "gwprov_application_state"), None)
+        state_symbol = next(
+            (
+                item
+                for item in symbol_table.nm("gwprov_application_state", elf)
+                if item["name"] == "gwprov_application_state"
+            ),
+            None,
+        )
         if state_symbol and state_symbol["size"] >= 2:
             # The state array lives in data/BSS, not executable code. Prove
             # the app is active from the current PC or its caller frames.
             app_active = (current and current.get("elf") == str(elf)) or any(
                 (frame.get("symbol") or {}).get("elf") == str(elf)
-                for frame in trace.get("frames", []))
+                for frame in trace.get("frames", [])
+            )
             if app_active:
                 raw = read_memory(state_symbol["address"], min(state_symbol["size"], 64))
                 custom = raw.split(b"\0", 1)[0].decode("utf-8", errors="replace").strip()
@@ -838,15 +1124,28 @@ def _application_state_from_target(symbol_table, firmware: Path, app_elfs: list[
 
     # Retro-Go's GUI is a runtime tab registry. DWARF keeps this compatible
     # with firmware releases that change the layout of gui and tab_t.
-    gui_address = next((item["address"] for item in symbol_table.nm()
-                        if item["name"] == "gui" and item["elf"] == str(firmware)), None)
+    gui_address = next(
+        (
+            item["address"]
+            for item in symbol_table.nm()
+            if item["name"] == "gui" and item["elf"] == str(firmware)
+        ),
+        None,
+    )
     gui_members = _dwarf_struct_members(firmware, "gui")
     tab_members = _dwarf_typedef_members(firmware, "tab_t")
     in_picker = any(name == "retro_loop" or name.startswith("gui_") for name in active_names)
-    if in_picker and gui_address is not None and {"tabs", "selected"}.issubset(gui_members) and "name" in tab_members:
+    if (
+        in_picker
+        and gui_address is not None
+        and {"tabs", "selected"}.issubset(gui_members)
+        and "name" in tab_members
+    ):
         gui_head = read_memory(gui_address, max(gui_members.values()) + 4)
-        tabs_ptr = int.from_bytes(gui_head[gui_members["tabs"]:gui_members["tabs"] + 4], "little")
-        selected = int.from_bytes(gui_head[gui_members["selected"]:gui_members["selected"] + 4], "little", signed=True)
+        tabs_ptr = int.from_bytes(gui_head[gui_members["tabs"] : gui_members["tabs"] + 4], "little")
+        selected = int.from_bytes(
+            gui_head[gui_members["selected"] : gui_members["selected"] + 4], "little", signed=True
+        )
         if tabs_ptr and 0 <= selected < 32:
             tab_ptr = int.from_bytes(read_memory(tabs_ptr + selected * 4, 4), "little")
             if tab_ptr:
@@ -862,8 +1161,7 @@ def _application_state_from_target(symbol_table, firmware: Path, app_elfs: list[
 
     function_names = {name for name in active_names if name}
     if current and current["elf"] != str(firmware):
-        project = next((elf for elf in reversed(app_elfs)
-                        if str(elf) == current["elf"]), None)
+        project = next((elf for elf in reversed(app_elfs) if str(elf) == current["elf"]), None)
         return f"Running: {project.stem}" if project else "Running"
     if function_names & {"run_gwhb_homebrew", "run_homebrew"}:
         return "Starting"
@@ -894,13 +1192,13 @@ def _application_state(row: dict[str, Any]) -> str:
         app_elfs.extend(sorted(project_root.rglob("*.elf")))
     for elf in app_elfs:
         symbol_table.load(elf)
+
     def read_memory(address, size):
         return _qmp_read_memory(qmp, address, size)
+
     symbol_table.rebase_from_runtime_pointers(read_memory)
     registers = _qmp_registers(qmp)
-    return _application_state_from_target(symbol_table, firmware, app_elfs,
-                                          read_memory, registers)
-
+    return _application_state_from_target(symbol_table, firmware, app_elfs, read_memory, registers)
 
 
 def show_instances(*, output: str = "text", no_pager: bool = False) -> int:
@@ -908,8 +1206,10 @@ def show_instances(*, output: str = "text", no_pager: bool = False) -> int:
     if not rows:
         restriction = _process_scan_restriction()
         if restriction:
-            raise RuntimeError("cannot confirm whether GWemu is running: process scan is "
-                               f"restricted ({restriction}); grant PID namespace visibility")
+            raise RuntimeError(
+                "cannot confirm whether GWemu is running: process scan is "
+                f"restricted ({restriction}); grant PID namespace visibility"
+            )
     for row in rows:
         try:
             row["application"] = _application_state(row)
@@ -921,26 +1221,31 @@ def show_instances(*, output: str = "text", no_pager: bool = False) -> int:
     elif not rows:
         restriction = _process_scan_restriction()
         if restriction:
-            print("Cannot confirm whether GWemu is running: this process scan is "
-                  f"restricted ({restriction}). gwprov requires visibility of the "
-                  "GWemu PID namespace. Daemon IPC uses the per-user local endpoint; "
-                  "GDB may require loopback TCP connect access. This is not inherently "
-                  "a NET_ADMIN requirement; an empty scan is inconclusive.")
+            print(
+                "Cannot confirm whether GWemu is running: this process scan is "
+                f"restricted ({restriction}). gwprov requires visibility of the "
+                "GWemu PID namespace. Daemon IPC uses the per-user local endpoint; "
+                "GDB may require loopback TCP connect access. This is not inherently "
+                "a NET_ADMIN requirement; an empty scan is inconclusive."
+            )
             return 2
         print("No GWemu instances running in the current process namespace.")
     else:
         from .cli.text import print_process_list
+
         print_process_list(rows, title="GWemu instances", no_pager=no_pager)
     return 2 if any(row["running"] is None for row in rows) else 0
 
 
-def stop_instance(*, pid: int | None = None, profile: str | None = None,
-                  timeout: float = 10.0) -> int:
+def stop_instance(
+    *, pid: int | None = None, profile: str | None = None, timeout: float = 10.0
+) -> int:
     if (pid is None) == (profile is None):
         raise ValueError("select exactly one instance with --pid or --profile")
     rows = instances()
     if profile:
         from .profiles import resolve_profile_path
+
         root = str(resolve_profile_path(profile))
         rows = [row for row in rows if row["profile"] == root]
     else:
@@ -974,8 +1279,7 @@ def stop_instance(*, pid: int | None = None, profile: str | None = None,
             except OSError:
                 pass
         except OSError as exc:
-            path_too_long = exc.errno == errno.ENAMETOOLONG or \
-                "AF_UNIX path too long" in str(exc)
+            path_too_long = exc.errno == errno.ENAMETOOLONG or "AF_UNIX path too long" in str(exc)
             if exc.errno not in (errno.ENOENT, errno.ECONNREFUSED) and not path_too_long:
                 raise
             # QMP may be missing, refused, or impossible to address because
@@ -991,18 +1295,20 @@ def stop_instance(*, pid: int | None = None, profile: str | None = None,
     except psutil.TimeoutExpired as exc:
         raise RuntimeError(f"GWemu pid {row['pid']} did not exit after QMP quit") from exc
     from .profiles import profile_reference
+
     print(f"Stopped GWemu pid {row['pid']} ({profile_reference(row['profile'])}).")
     return 0
 
 
-
-def set_instance_running(profile: str | None = None, *, pid: int | None = None,
-                         running: bool) -> int:
+def set_instance_running(
+    profile: str | None = None, *, pid: int | None = None, running: bool
+) -> int:
     """Pause or resume one visible instance through its QMP endpoint."""
     if (profile is None) == (pid is None):
         raise ValueError("select exactly one GWemu instance with profile or pid")
     if profile:
         from .profiles import DeviceProfile
+
         root = str(DeviceProfile.load(profile).root)
         matches = [row for row in instances() if row["profile"] == root]
         selector = root
@@ -1013,15 +1319,15 @@ def set_instance_running(profile: str | None = None, *, pid: int | None = None,
         if _process_scan_restriction() and not matches:
             raise RuntimeError(
                 "cannot verify the GWemu process in this restricted process view; "
-                "grant PID namespace visibility before sending QMP commands")
+                "grant PID namespace visibility before sending QMP commands"
+            )
         raise ValueError(f"expected one GWemu instance for {selector}, found {len(matches)}")
     row = matches[0]
     if not row["qmpSocket"]:
         raise ValueError("GWemu instance has no QMP control channel")
     status = _qmp_execute(row["qmpSocket"], "query-status").get("return", {})
     if bool(status.get("running")) == running:
-        print(f"GWemu pid {row['pid']} already "
-              f"{'running' if running else 'paused'}.")
+        print(f"GWemu pid {row['pid']} already " f"{'running' if running else 'paused'}.")
         return 0
     command = "cont" if running else "stop"
     _qmp_execute(row["qmpSocket"], command)
@@ -1031,18 +1337,29 @@ def set_instance_running(profile: str | None = None, *, pid: int | None = None,
         if observed.get("running") is running:
             break
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"QMP {command} did not establish the requested execution state: {observed}")
+            raise RuntimeError(
+                f"QMP {command} did not establish the requested execution state: {observed}"
+            )
         time.sleep(0.05)
     print(f"GWemu pid {row['pid']} {'resumed' if running else 'paused'}.")
     return 0
 
 
-def start_instance(profile: str, *, audio: bool = False,
-                   gdb_port: int | None = None, qmp_socket: str | None = None,
-                   headless: bool = False, timeline: str | None = None,
-                   record_timeline: str | None = None, timing_mode: str = "default",
-                   icount: int | None = None, rtc_epoch: int | None = None,
-                   gwemu_bin: str | None = None) -> int:
+def start_instance(
+    profile: str,
+    *,
+    audio: bool = False,
+    gdb_port: int | None = None,
+    qmp_socket: str | None = None,
+    headless: bool = False,
+    timeline: str | None = None,
+    record_timeline: str | None = None,
+    timing_mode: str = "default",
+    icount: int | None = None,
+    pacing: str | None = None,
+    rtc_epoch: int | None = None,
+    gwemu_bin: str | None = None,
+) -> int:
     from .profiles import DeviceProfile
 
     device = DeviceProfile.load(profile)
@@ -1051,22 +1368,43 @@ def start_instance(profile: str, *, audio: bool = False,
     if matches:
         row = matches[0]
         from .profiles import profile_reference
-        raise ValueError(f"profile {profile_reference(root)} already has GWemu pid {row['pid']} ({row['status']}); "
-                         "use `gwprov gwemu ps` or `gwprov gwemu stop`")
+
+        raise ValueError(
+            f"profile {profile_reference(root)} already has GWemu pid {row['pid']} ({row['status']}); "
+            "use `gwprov ps` or `gwprov device DEVICE stop`"
+        )
     if qmp_socket:
-        raise ValueError("managed GWemu uses QMP over the private GWProv daemon channel; "
-                         "--qmp-socket is not available for `gwprov gwemu start`")
+        raise ValueError(
+            "managed GWemu uses QMP over the private GWProv daemon channel; "
+            "--qmp-socket is not available for `gwprov start`"
+        )
     if gdb_port is None:
         from .ports import DEFAULT_GDB_PORT, find_free_port
+
         gdb_port = find_free_port(DEFAULT_GDB_PORT)
     else:
         from .ports import validate_requested_port
+
         gdb_port = validate_requested_port(gdb_port)
     from .daemon import start_instance as daemon_start
-    row = daemon_start(str(root), audio=audio, gdb_port=gdb_port, headless=headless,
-                      timeline=timeline, record_timeline=record_timeline,
-                      timing_mode=timing_mode, icount=icount, rtc_epoch=rtc_epoch, gwemu_bin=gwemu_bin)
+
+    row = daemon_start(
+        str(root),
+        audio=audio,
+        gdb_port=gdb_port,
+        headless=headless,
+        timeline=timeline,
+        record_timeline=record_timeline,
+        timing_mode=timing_mode,
+        icount=icount,
+        pacing=pacing,
+        rtc_epoch=rtc_epoch,
+        gwemu_bin=gwemu_bin,
+    )
     display = "headless" if headless else "visible"
-    print(f"Started {display} GWemu for {root} (pid {row['pid']}); "
-          f"GDB :{gdb_port}; QMP managed by GWProv daemon.", flush=True)
+    print(
+        f"Started {display} GWemu for {root} (pid {row['pid']}); "
+        f"GDB :{gdb_port}; QMP managed by GWProv daemon.",
+        flush=True,
+    )
     return 0

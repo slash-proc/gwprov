@@ -1,4 +1,5 @@
 """Selectable local probe and remote gnwmanager backends for GWProv."""
+
 from __future__ import annotations
 
 import json
@@ -10,7 +11,9 @@ from urllib.parse import urlparse
 
 from gnwmanager.ocdbackend.base import OCDBackend
 from gnwmanager.ocdbackend.openocd_backend import (
-    OpenOCDBackend, _drain_stderr, _openocd_launch_commands,
+    OpenOCDBackend,
+    _drain_stderr,
+    _openocd_launch_commands,
 )
 from .target_leases import DeviceBusyError, TargetLease, adapter_for_probe
 
@@ -51,35 +54,47 @@ class _DaemonTargetProxy:
     def get_state(self):
         name = self.backend._daemon_call("get_state")
         from pyocd.core.target import Target
+
         return Target.State[name]
 
     def step(self):
         return self.backend._daemon_call("step")
 
     def set_breakpoint(self, address, kind):
-        return self.backend._daemon_call("set_breakpoint", address,
-                                         getattr(kind, "name", str(kind)))
+        return self.backend._daemon_call(
+            "set_breakpoint", address, getattr(kind, "name", str(kind))
+        )
 
     def remove_breakpoint(self, address):
         return self.backend._daemon_call("remove_breakpoint", address)
 
     def set_watchpoint(self, address, size, kind):
         return self.backend._daemon_call(
-            "set_watchpoint", address, size, getattr(kind, "name", str(kind)))
+            "set_watchpoint", address, size, getattr(kind, "name", str(kind))
+        )
 
     def remove_watchpoint(self, address, size, kind):
         return self.backend._daemon_call(
-            "remove_watchpoint", address, size, getattr(kind, "name", str(kind)))
+            "remove_watchpoint", address, size, getattr(kind, "name", str(kind))
+        )
 
 
 class SelectedPyOCDBackend(OCDBackend):
     """PyOCD backend pinned to one stable probe unique ID."""
 
-    def __init__(self, unique_id: str, *, frequency: int | None = None,
-                 operation: str = "GWProv hardware session", lease_wait: float = 30.0,
-                 probe_adapter: str | None = None, allow_recovery_marker: bool = False,
-                 daemon_managed: bool = False, daemon_proxy: bool = False,
-                 resume_on_disconnect: bool = True):
+    def __init__(
+        self,
+        unique_id: str,
+        *,
+        frequency: int | None = None,
+        operation: str = "GWProv hardware session",
+        lease_wait: float = 30.0,
+        probe_adapter: str | None = None,
+        allow_recovery_marker: bool = False,
+        daemon_managed: bool = False,
+        daemon_proxy: bool = False,
+        resume_on_disconnect: bool = True,
+    ):
         super().__init__()
         if not unique_id:
             raise ValueError("probe unique ID must not be empty")
@@ -97,7 +112,9 @@ class SelectedPyOCDBackend(OCDBackend):
             from pyocd.core.helpers import ConnectHelper
             from pyocd.target import TARGET
         except ImportError as exc:
-            raise RuntimeError("install PyOCD to select local probes by ID: pip install pyocd") from exc
+            raise RuntimeError(
+                "install PyOCD to select local probes by ID: pip install pyocd"
+            ) from exc
 
         options = {
             "connect_mode": "attach",
@@ -112,9 +129,16 @@ class SelectedPyOCDBackend(OCDBackend):
         self._connect_helper = ConnectHelper
         self._session_options = options
         self.session = None
-        self._lease = (None if daemon_managed or self._daemon_proxy else
-                       TargetLease(f"probe:{unique_id}", operation, wait=lease_wait,
-                                   allow_recovery_marker=allow_recovery_marker))
+        self._lease = (
+            None
+            if daemon_managed or self._daemon_proxy
+            else TargetLease(
+                f"probe:{unique_id}",
+                operation,
+                wait=lease_wait,
+                allow_recovery_marker=allow_recovery_marker,
+            )
+        )
         self._opened = False
         self._frequency_override = frequency or 0
         self.version = tuple(int(x) for x in pyocd.__version__.split("."))
@@ -144,9 +168,14 @@ class SelectedPyOCDBackend(OCDBackend):
     def open(self):
         if self._daemon_proxy:
             from .daemon import open_target_session
-            probe = {"id": self.unique_id, "backend": "pyocd",
-                     "name": self._probe_name, "vendor": "STMicroelectronics",
-                     "adapter": self.probe_adapter}
+
+            probe = {
+                "id": self.unique_id,
+                "backend": "pyocd",
+                "name": self._probe_name,
+                "vendor": "STMicroelectronics",
+                "adapter": self.probe_adapter,
+            }
             opened = open_target_session(probe, self._operation)
             self._daemon_token = opened["token"]
             self._opened = True
@@ -159,24 +188,32 @@ class SelectedPyOCDBackend(OCDBackend):
                 raise
             return self
         from .target_leases import external_local_owner
+
         if self.probe_adapter is None:
             try:
-                matching = next((probe for probe in enumerate_local_probes()
-                                 if probe["id"] == self.unique_id), None)
+                matching = next(
+                    (probe for probe in enumerate_local_probes() if probe["id"] == self.unique_id),
+                    None,
+                )
                 if matching:
                     self.probe_adapter = adapter_for_probe(
-                        f"{matching['vendor']} {matching['name']}")
+                        f"{matching['vendor']} {matching['name']}"
+                    )
             except RuntimeError:
                 pass
         if not self.daemon_managed:
             external = external_local_owner()
-            if external and (external.get("adapter") is None or self.probe_adapter is None
-                             or external.get("adapter") == self.probe_adapter):
+            if external and (
+                external.get("adapter") is None
+                or self.probe_adapter is None
+                or external.get("adapter") == self.probe_adapter
+            ):
                 raise DeviceBusyError(f"probe:{self.unique_id}", external)
             self._lease.acquire()
         try:
             self.session = self._connect_helper.session_with_chosen_probe(
-                unique_id=self.unique_id, options=self._session_options)
+                unique_id=self.unique_id, options=self._session_options
+            )
             if self.session is None:
                 raise RuntimeError(f"debug probe {self.unique_id!r} is not available")
             # PyOCD's H7 discovery probes APB-D ROM-table entry #5, whose
@@ -211,6 +248,7 @@ class SelectedPyOCDBackend(OCDBackend):
             self._opened = False
             if token:
                 from .daemon import close_target_session
+
                 close_target_session(token)
             return
         try:
@@ -224,15 +262,21 @@ class SelectedPyOCDBackend(OCDBackend):
 
     def _start_daemon_heartbeat(self):
         token = self._daemon_token
-        if not token or (self._daemon_heartbeat_thread and
-                         self._daemon_heartbeat_thread.is_alive()):
+        if not token or (
+            self._daemon_heartbeat_thread and self._daemon_heartbeat_thread.is_alive()
+        ):
             return
         self._daemon_heartbeat_stop.clear()
-        owner = {"key": f"probe:{self.unique_id}", "operation": self._operation,
-                 "pid": os.getpid(), "daemon_owned": True}
+        owner = {
+            "key": f"probe:{self.unique_id}",
+            "operation": self._operation,
+            "pid": os.getpid(),
+            "daemon_owned": True,
+        }
 
         def heartbeat():
             from .daemon import heartbeat_proxy_session
+
             while not self._daemon_heartbeat_stop.wait(2.0):
                 try:
                     heartbeat_proxy_session(token, owner)
@@ -242,7 +286,8 @@ class SelectedPyOCDBackend(OCDBackend):
                     continue
 
         self._daemon_heartbeat_thread = threading.Thread(
-            target=heartbeat, daemon=True, name=f"gwprov-session-heartbeat-{self.unique_id}")
+            target=heartbeat, daemon=True, name=f"gwprov-session-heartbeat-{self.unique_id}"
+        )
         self._daemon_heartbeat_thread.start()
 
     def _stop_daemon_heartbeat(self):
@@ -270,8 +315,7 @@ class SelectedPyOCDBackend(OCDBackend):
             if addr < 0 or addr + len(data) > 0x100000000:
                 raise ValueError("invalid PyOCD memory range")
             for offset in range(0, len(data), 65536):
-                self._daemon_call("write_memory", addr + offset,
-                                  data[offset:offset + 65536])
+                self._daemon_call("write_memory", addr + offset, data[offset : offset + 65536])
             return None
         self.target.write_memory_block8(addr, data)
 
@@ -318,6 +362,7 @@ class SelectedPyOCDBackend(OCDBackend):
 
     def _daemon_call(self, method: str, *arguments):
         from .daemon import call_target_session
+
         return call_target_session(self._daemon_token, method, list(arguments))
 
     def start_gdbserver(self, port, logging=True, blocking=True):
@@ -343,10 +388,19 @@ class WebSocketBackend(OCDBackend):
     PROTOCOL_VERSION = 1
     MAX_MEMORY = 65536
 
-    def __init__(self, uri: str, *, frequency: int | None = None, timeout: float = 10.0,
-                 origin: str | None = None, operation: str = "GWProv remote session",
-                 lease_wait: float = 30.0, allow_recovery_marker: bool = False,
-                 daemon_managed: bool = False, daemon_proxy: bool = False):
+    def __init__(
+        self,
+        uri: str,
+        *,
+        frequency: int | None = None,
+        timeout: float = 10.0,
+        origin: str | None = None,
+        operation: str = "GWProv remote session",
+        lease_wait: float = 30.0,
+        allow_recovery_marker: bool = False,
+        daemon_managed: bool = False,
+        daemon_proxy: bool = False,
+    ):
         super().__init__()
         parsed = urlparse(uri)
         if parsed.scheme not in {"ws", "wss"} or not parsed.netloc or parsed.path != "/gdb":
@@ -364,9 +418,16 @@ class WebSocketBackend(OCDBackend):
         self._daemon_token: str | None = None
         self._daemon_heartbeat_stop = threading.Event()
         self._daemon_heartbeat_thread: threading.Thread | None = None
-        self._lease = (None if daemon_managed or self._daemon_proxy else
-                       TargetLease(f"remote:{uri}", operation, wait=lease_wait,
-                                   allow_recovery_marker=allow_recovery_marker))
+        self._lease = (
+            None
+            if daemon_managed or self._daemon_proxy
+            else TargetLease(
+                f"remote:{uri}",
+                operation,
+                wait=lease_wait,
+                allow_recovery_marker=allow_recovery_marker,
+            )
+        )
 
     @property
     def probe_name(self) -> str:
@@ -375,10 +436,16 @@ class WebSocketBackend(OCDBackend):
     def open(self):
         if self._daemon_proxy:
             from .daemon import open_target_session
+
             opened = open_target_session(
-                {"url": self.uri, "origin": self.origin,
-                 "key": f"remote:{self.uri}", "name": self.probe_name},
-                self._operation)
+                {
+                    "url": self.uri,
+                    "origin": self.origin,
+                    "key": f"remote:{self.uri}",
+                    "name": self.probe_name,
+                },
+                self._operation,
+            )
             self._daemon_token = opened["token"]
             self._start_daemon_heartbeat()
             if self.frequency is not None:
@@ -391,15 +458,25 @@ class WebSocketBackend(OCDBackend):
         try:
             from websockets.sync.client import connect
         except ImportError as exc:
-            raise RuntimeError('install remote support with `pip install "gwprov[remote]"`') from exc
+            raise RuntimeError(
+                'install remote support with `pip install "gwprov[remote]"`'
+            ) from exc
         if self._lease is not None:
             self._lease.acquire()
         try:
-            self._ws = connect(self.uri, open_timeout=self.timeout, close_timeout=self.timeout,
-                               max_size=self.MAX_MEMORY * 2 + 1024, origin=self.origin)
+            self._ws = connect(
+                self.uri,
+                open_timeout=self.timeout,
+                close_timeout=self.timeout,
+                max_size=self.MAX_MEMORY * 2 + 1024,
+                origin=self.origin,
+            )
             hello = json.loads(self._ws.recv(timeout=self.timeout))
-            if (hello.get("type") != "hello" or hello.get("backend") != "gnwmanager"
-                    or hello.get("version") != self.PROTOCOL_VERSION):
+            if (
+                hello.get("type") != "hello"
+                or hello.get("backend") != "gnwmanager"
+                or hello.get("version") != self.PROTOCOL_VERSION
+            ):
                 raise RuntimeError(f"unsupported gnwmanager WebSocket handshake: {hello!r}")
             self._backend_name = f"gnwmanager/{hello.get('targetControl', 'arm')}"
             self._call("attach", [])
@@ -416,6 +493,7 @@ class WebSocketBackend(OCDBackend):
             token, self._daemon_token = self._daemon_token, None
             if token:
                 from .daemon import close_target_session
+
                 close_target_session(token)
             return
         ws, self._ws = self._ws, None
@@ -440,19 +518,26 @@ class WebSocketBackend(OCDBackend):
 
     def _daemon_call(self, method: str, *arguments):
         from .daemon import call_target_session
+
         return call_target_session(self._daemon_token, method, list(arguments))
 
     def _start_daemon_heartbeat(self):
         token = self._daemon_token
-        if not token or (self._daemon_heartbeat_thread and
-                         self._daemon_heartbeat_thread.is_alive()):
+        if not token or (
+            self._daemon_heartbeat_thread and self._daemon_heartbeat_thread.is_alive()
+        ):
             return
         self._daemon_heartbeat_stop.clear()
-        owner = {"key": f"remote:{self.uri}", "operation": self._operation,
-                 "pid": os.getpid(), "daemon_owned": True}
+        owner = {
+            "key": f"remote:{self.uri}",
+            "operation": self._operation,
+            "pid": os.getpid(),
+            "daemon_owned": True,
+        }
 
         def heartbeat():
             from .daemon import heartbeat_proxy_session
+
             while not self._daemon_heartbeat_stop.wait(2.0):
                 try:
                     heartbeat_proxy_session(token, owner)
@@ -460,7 +545,8 @@ class WebSocketBackend(OCDBackend):
                     continue
 
         self._daemon_heartbeat_thread = threading.Thread(
-            target=heartbeat, daemon=True, name="gwprov-remote-session-heartbeat")
+            target=heartbeat, daemon=True, name="gwprov-remote-session-heartbeat"
+        )
         self._daemon_heartbeat_thread.start()
 
     def _stop_daemon_heartbeat(self):
@@ -493,12 +579,14 @@ class WebSocketBackend(OCDBackend):
             raise ValueError("invalid remote memory range")
         if self._daemon_proxy:
             for offset in range(0, len(data), self.MAX_MEMORY):
-                self._daemon_call("write_memory", addr + offset,
-                                  data[offset:offset + self.MAX_MEMORY])
+                self._daemon_call(
+                    "write_memory", addr + offset, data[offset : offset + self.MAX_MEMORY]
+                )
             return None
         for offset in range(0, len(data), self.MAX_MEMORY):
-            self._call("write_memory", [addr + offset,
-                                         data[offset:offset + self.MAX_MEMORY].hex()])
+            self._call(
+                "write_memory", [addr + offset, data[offset : offset + self.MAX_MEMORY].hex()]
+            )
 
     def read_register(self, name: str) -> int:
         if self._daemon_proxy:
@@ -562,19 +650,27 @@ def enumerate_local_probes() -> list[dict]:
     finally:
         root_logger.removeHandler(handler)
     if not probes:
-        unavailable = next((line for line in captured if "no libusb" in line.casefold()
-                            or "not supported because" in line.casefold()), None)
+        unavailable = next(
+            (
+                line
+                for line in captured
+                if "no libusb" in line.casefold() or "not supported because" in line.casefold()
+            ),
+            None,
+        )
         if unavailable:
             raise RuntimeError(f"PyOCD probe enumeration is unavailable: {unavailable}")
     rows = []
     for probe in probes:
-        rows.append({
-            "id": str(getattr(probe, "unique_id", "") or ""),
-            "name": str(getattr(probe, "product_name", "") or type(probe).__name__),
-            "vendor": str(getattr(probe, "vendor_name", "") or ""),
-            "product": str(getattr(probe, "product_name", "") or ""),
-            "backend": "pyocd",
-        })
+        rows.append(
+            {
+                "id": str(getattr(probe, "unique_id", "") or ""),
+                "name": str(getattr(probe, "product_name", "") or type(probe).__name__),
+                "vendor": str(getattr(probe, "vendor_name", "") or ""),
+                "product": str(getattr(probe, "product_name", "") or ""),
+                "backend": "pyocd",
+            }
+        )
     return sorted(rows, key=lambda row: (row["name"].casefold(), row["id"]))
 
 
@@ -583,11 +679,19 @@ class SelectedOpenOCDBackend(OpenOCDBackend):
 
     ADAPTERS = ("stlink", "jlink", "cmsis-dap", "rpi-gpio")
 
-    def __init__(self, adapter: str, *, port: int | None = None,
-                 operation: str = "GWProv OpenOCD session", lease_wait: float = 30.0,
-                 allow_recovery_marker: bool = False):
+    def __init__(
+        self,
+        adapter: str,
+        *,
+        port: int | None = None,
+        operation: str = "GWProv OpenOCD session",
+        lease_wait: float = 30.0,
+        allow_recovery_marker: bool = False,
+    ):
         if adapter not in self.ADAPTERS:
-            raise ValueError(f"unsupported OpenOCD adapter {adapter!r}; choose {', '.join(self.ADAPTERS)}")
+            raise ValueError(
+                f"unsupported OpenOCD adapter {adapter!r}; choose {', '.join(self.ADAPTERS)}"
+            )
         if port is None:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
                 listener.bind(("127.0.0.1", 0))
@@ -595,8 +699,12 @@ class SelectedOpenOCDBackend(OpenOCDBackend):
         super().__init__(port=port)
         self.adapter = adapter
         self._connected = False
-        self._lease = TargetLease(f"adapter:{adapter}", operation, wait=lease_wait,
-                                  allow_recovery_marker=allow_recovery_marker)
+        self._lease = TargetLease(
+            f"adapter:{adapter}",
+            operation,
+            wait=lease_wait,
+            allow_recovery_marker=allow_recovery_marker,
+        )
         self._probe_leases = []
         self._allow_recovery_marker = allow_recovery_marker
 
@@ -607,8 +715,11 @@ class SelectedOpenOCDBackend(OpenOCDBackend):
         import time
 
         from .target_leases import external_local_owner
+
         external = external_local_owner()
-        if external and (external.get("adapter") is None or external.get("adapter") == self.adapter):
+        if external and (
+            external.get("adapter") is None or external.get("adapter") == self.adapter
+        ):
             raise DeviceBusyError("local hardware", external)
         try:
             matching_probes = []
@@ -625,25 +736,36 @@ class SelectedOpenOCDBackend(OpenOCDBackend):
             matching_probes = []
         try:
             for probe in sorted(matching_probes, key=lambda row: row["id"]):
-                lease = TargetLease(f"probe:{probe['id']}", self._lease.operation,
-                                    wait=self._lease.wait,
-                                    allow_recovery_marker=self._allow_recovery_marker)
+                lease = TargetLease(
+                    f"probe:{probe['id']}",
+                    self._lease.operation,
+                    wait=self._lease.wait,
+                    allow_recovery_marker=self._allow_recovery_marker,
+                )
                 lease.acquire()
                 self._probe_leases.append(lease)
             self._lease.acquire()
-            command = next((cmd for name, cmd in _openocd_launch_commands(self._address[1])
-                            if name == self.adapter), None)
+            command = next(
+                (
+                    cmd
+                    for name, cmd in _openocd_launch_commands(self._address[1])
+                    if name == self.adapter
+                ),
+                None,
+            )
             if command is None:
                 raise RuntimeError(f"gnwmanager has no OpenOCD config for {self.adapter}")
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._stderr_buffer = deque(maxlen=1000)
             self._openocd_process = subprocess.Popen(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE)
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
             level = logging.INFO if os.environ.get("GNWMANAGER_OPENOCD_DEBUG") else logging.DEBUG
             self._stderr_thread = Thread(
                 target=_drain_stderr,
-                args=(self._openocd_process.stderr, self._stderr_buffer, level), daemon=True)
+                args=(self._openocd_process.stderr, self._stderr_buffer, level),
+                daemon=True,
+            )
             self._stderr_thread.start()
             deadline = time.monotonic() + 10.0
             last_error = None
@@ -665,6 +787,7 @@ class SelectedOpenOCDBackend(OpenOCDBackend):
 
     def close(self):
         import subprocess
+
         try:
             if getattr(self, "_connected", False):
                 try:
@@ -703,8 +826,13 @@ class AutoOpenOCDBackend(OCDBackend):
 
     ADAPTERS = SelectedOpenOCDBackend.ADAPTERS
 
-    def __init__(self, *, operation: str = "GWProv OpenOCD session", port: int | None = None,
-                 allow_recovery_marker: bool = False):
+    def __init__(
+        self,
+        *,
+        operation: str = "GWProv OpenOCD session",
+        port: int | None = None,
+        allow_recovery_marker: bool = False,
+    ):
         super().__init__()
         self.operation = operation
         self.port = port
@@ -715,9 +843,13 @@ class AutoOpenOCDBackend(OCDBackend):
     def open(self):
         failures = []
         for adapter in self.ADAPTERS:
-            backend = SelectedOpenOCDBackend(adapter, port=self.port,
-                                             operation=self.operation, lease_wait=0,
-                                             allow_recovery_marker=self.allow_recovery_marker)
+            backend = SelectedOpenOCDBackend(
+                adapter,
+                port=self.port,
+                operation=self.operation,
+                lease_wait=0,
+                allow_recovery_marker=self.allow_recovery_marker,
+            )
             try:
                 backend.open()
             except Exception as error:
@@ -729,8 +861,9 @@ class AutoOpenOCDBackend(OCDBackend):
             self.backend = backend
             self.version = backend.version
             return self
-        raise RuntimeError("unable to open any supported OpenOCD adapter (" +
-                           "; ".join(failures) + ")")
+        raise RuntimeError(
+            "unable to open any supported OpenOCD adapter (" + "; ".join(failures) + ")"
+        )
 
     def close(self):
         backend, self.backend = self.backend, None

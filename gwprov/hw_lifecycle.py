@@ -1,4 +1,5 @@
 """Safe hardware lifecycle checks shared by destructive GWProv operations."""
+
 from __future__ import annotations
 
 import hashlib
@@ -102,20 +103,31 @@ def inspect_target_mode(backend) -> dict:
     # Keep this service signal separate from application identity, which is
     # classified from VTOR for unlocked targets.
     service_state = _classify_gnwmanager_state(
-        status=status, halted=halted, mailbox_alive=mailbox_alive)
+        status=status, halted=halted, mailbox_alive=mailbox_alive
+    )
     alive = service_state == "idle"
     detected = stub_resident or service_state is not None
-    return {"mode": "gnwmanager-recovery" if detected else "application",
-            "stubResident": stub_resident, "stubAlive": alive,
-            "stubDetected": detected, "locked": locked,
-            "serviceState": service_state,
-            "vtor": vtor, "dhcsr": dhcsr, "status": status,
-            "halted": halted}
+    return {
+        "mode": "gnwmanager-recovery" if detected else "application",
+        "stubResident": stub_resident,
+        "stubAlive": alive,
+        "stubDetected": detected,
+        "locked": locked,
+        "serviceState": service_state,
+        "vtor": vtor,
+        "dhcsr": dhcsr,
+        "status": status,
+        "halted": halted,
+    }
 
 
-def identify_runtime(backend, *, start_locked_stub: bool = False,
-                     cached_banks: list[dict] | None = None,
-                     pc_fallback: bool = False) -> dict:
+def identify_runtime(
+    backend,
+    *,
+    start_locked_stub: bool = False,
+    cached_banks: list[dict] | None = None,
+    pc_fallback: bool = False,
+) -> dict:
     """Passively identify the currently selected firmware/runtime.
 
     This mirrors gnw-web-builder's VTOR classifier and stock ITCM fingerprints.
@@ -148,42 +160,62 @@ def identify_runtime(backend, *, start_locked_stub: bool = False,
     # VTOR in flash. Unlocked runtime naming below still follows VTOR, so a
     # ready mailbox cannot replace the visible stock/Retro-Go identity.
     service_state = _classify_gnwmanager_state(
-        status=status, halted=halted, mailbox_alive=mailbox_alive)
+        status=status, halted=halted, mailbox_alive=mailbox_alive
+    )
     stub_alive = service_state == "idle"
     confirmed_stub = service_state is not None
-    unlocked_flash_runtime = (locked is False and
-                              (VTOR_BANK1_START <= vtor < VTOR_BANK2_START or
-                               VTOR_BANK2_START <= vtor < VTOR_BANK_END))
-    state = {"mode": "gnwmanager-recovery"
-             if stub_resident or (confirmed_stub and not unlocked_flash_runtime)
-             else "application",
-             "stubResident": stub_resident, "stubAlive": stub_alive,
-             "stubDetected": stub_resident or confirmed_stub,
-             "serviceState": service_state,
-             "vtor": vtor, "dhcsr": dhcsr,
-             "status": status, "halted": halted}
-    result = {"application": "Unknown", "detail": None, "installed": "Unknown",
-              "banks": [], **state}
+    unlocked_flash_runtime = locked is False and (
+        VTOR_BANK1_START <= vtor < VTOR_BANK2_START or VTOR_BANK2_START <= vtor < VTOR_BANK_END
+    )
+    state = {
+        "mode": (
+            "gnwmanager-recovery"
+            if stub_resident or (confirmed_stub and not unlocked_flash_runtime)
+            else "application"
+        ),
+        "stubResident": stub_resident,
+        "stubAlive": stub_alive,
+        "stubDetected": stub_resident or confirmed_stub,
+        "serviceState": service_state,
+        "vtor": vtor,
+        "dhcsr": dhcsr,
+        "status": status,
+        "halted": halted,
+    }
+    result = {
+        "application": "Unknown",
+        "detail": None,
+        "installed": "Unknown",
+        "banks": [],
+        **state,
+    }
     result["locked"] = locked
     if service_state in {"busy", "stalled"}:
         if locked is True:
             result["installed"] = "Locked: firmware scan unavailable"
         elif cached_banks is not None:
-            result.update(banks=cached_banks,
-                          installed=("; ".join(item["image"] for item in cached_banks
-                                               if item["image"] != "Erased")
-                                     or "No firmware detected"))
+            result.update(
+                banks=cached_banks,
+                installed=(
+                    "; ".join(item["image"] for item in cached_banks if item["image"] != "Erased")
+                    or "No firmware detected"
+                ),
+            )
         else:
             result["installed"] = "Internal flash scan deferred while gnwmanager is active"
         if service_state == "busy":
             service_status = GNWMANAGER_STATUS_NAMES.get(
-                status, f"0x{status:08x}" if isinstance(status, int) else "unknown")
+                status, f"0x{status:08x}" if isinstance(status, int) else "unknown"
+            )
             detail = f"gnwmanager reports {service_status}; internal flash scan deferred"
         else:
             service_status = GNWMANAGER_STATUS_NAMES.get(
-                status, f"0x{status:08x}" if isinstance(status, int) else "unknown")
-            detail = (f"gnwmanager reports {service_status} while the core is halted; "
-                      "internal flash scan deferred")
+                status, f"0x{status:08x}" if isinstance(status, int) else "unknown"
+            )
+            detail = (
+                f"gnwmanager reports {service_status} while the core is halted; "
+                "internal flash scan deferred"
+            )
         result.update(application="gnwmanager Recovery stub", detail=detail)
         return result
     if locked is True and not state["stubDetected"] and start_locked_stub:
@@ -192,39 +224,61 @@ def identify_runtime(backend, *, start_locked_stub: bool = False,
         mark_backend_recovery_required(backend, "starting recovery flasher for locked device")
         try:
             from gnwmanager.gnw import GnW
+
             gnw = GnW(backend)
             start_gnwmanager_verified(backend, gnw)
             live = inspect_target_mode(backend)
             if not live["stubAlive"]:
                 raise TargetModeError(
                     "gnwmanager did not reach live IDLE after startup "
-                    f"(VTOR 0x{live['vtor']:08x}, status 0x{live['status']:08x})")
+                    f"(VTOR 0x{live['vtor']:08x}, status 0x{live['status']:08x})"
+                )
             mark_backend_flasher_ready(backend)
-            state = {"mode": "gnwmanager-recovery", "stubResident": live["stubResident"],
-                     "stubAlive": True, "stubDetected": True, "serviceState": "idle",
-                     "vtor": live["vtor"],
-                     "dhcsr": live["dhcsr"], "status": live["status"],
-                     "halted": live["halted"]}
-            result.update(state, application="gnwmanager Recovery stub",
-                          detail="Locked device; RAM flasher started and verified live")
-            result["installed"] = (f"Stock {stock_model} (locked; bank scan unavailable)"
-                                    if stock_model else "Locked: firmware scan unavailable")
+            state = {
+                "mode": "gnwmanager-recovery",
+                "stubResident": live["stubResident"],
+                "stubAlive": True,
+                "stubDetected": True,
+                "serviceState": "idle",
+                "vtor": live["vtor"],
+                "dhcsr": live["dhcsr"],
+                "status": live["status"],
+                "halted": live["halted"],
+            }
+            result.update(
+                state,
+                application="gnwmanager Recovery stub",
+                detail="Locked device; RAM flasher started and verified live",
+            )
+            result["installed"] = (
+                f"Stock {stock_model} (locked; bank scan unavailable)"
+                if stock_model
+                else "Locked: firmware scan unavailable"
+            )
             return result
         except Exception as exc:
-            result.update(application="Unknown: recovery start failed",
-                          detail=f"Locked device; could not start recovery flasher: {exc}")
-            result["installed"] = (f"Stock {stock_model} (locked; bank scan unavailable)"
-                                    if stock_model else "Locked: firmware scan unavailable")
+            result.update(
+                application="Unknown: recovery start failed",
+                detail=f"Locked device; could not start recovery flasher: {exc}",
+            )
+            result["installed"] = (
+                f"Stock {stock_model} (locked; bank scan unavailable)"
+                if stock_model
+                else "Locked: firmware scan unavailable"
+            )
             return result
     if locked is True:
         result["installed"] = "Locked: firmware scan unavailable"
     elif locked is not False:
         result["installed"] = "Lock state unknown: firmware scan unavailable"
     elif cached_banks is not None:
-        result.update(banks=cached_banks,
-                      installed=("; ".join(item["image"] for item in cached_banks
-                                           if item["image"] != "Erased")
-                                 or "No firmware detected"))
+        result.update(
+            banks=cached_banks,
+            installed=(
+                "; ".join(item["image"] for item in cached_banks if item["image"] != "Erased")
+                or "No firmware detected"
+            ),
+        )
     else:
         try:
             banks, installed = identify_installed_firmware(backend)
@@ -235,30 +289,44 @@ def identify_runtime(backend, *, start_locked_stub: bool = False,
     # Keep the builder's service-liveness signal separate from the runtime
     # name: an unlocked flash VTOR remains the authoritative application view.
     if state["serviceState"] == "idle" and not unlocked_flash_runtime:
-        result.update(application="gnwmanager Recovery stub",
-                      detail="gnwmanager mailbox is IDLE and the core is running")
+        result.update(
+            application="gnwmanager Recovery stub",
+            detail="gnwmanager mailbox is IDLE and the core is running",
+        )
         return result
     if state["serviceState"] == "idle":
         result["detail"] = (
             "Unlocked firmware runtime follows VTOR; the gnwmanager mailbox "
-            "also reports a live idle service")
+            "also reports a live idle service"
+        )
 
     if RAM_STUB_START <= vtor < RAM_STUB_END:
         status = state["status"]
         mailbox = f"0x{status:08x}" if status is not None else "unreadable mailbox"
-        core = ("halted" if state["halted"] else "running"
-                if state["halted"] is not None else "core state unknown")
+        core = (
+            "halted"
+            if state["halted"]
+            else "running" if state["halted"] is not None else "core state unknown"
+        )
         if isinstance(status, int) and status & 0xFFFF0000 == 0xBAD00000:
             error_name = GNWMANAGER_STATUS_NAMES.get(status, mailbox)
-            result.update(application=f"gnwmanager Recovery stub: {error_name}",
-                          detail=f"RAM flasher reported {error_name}; {core}")
+            result.update(
+                application=f"gnwmanager Recovery stub: {error_name}",
+                detail=f"RAM flasher reported {error_name}; {core}",
+            )
             return result
-        application = ("Unverified SRAM runtime"
-                       if status is None or state["halted"] is None
-                       else "Transient RAM application")
-        result.update(application=application,
-                      detail=(f"VTOR is in SRAM; gnwmanager Recovery stub is not verified live "
-                              f"({mailbox}, {core})"))
+        application = (
+            "Unverified SRAM runtime"
+            if status is None or state["halted"] is None
+            else "Transient RAM application"
+        )
+        result.update(
+            application=application,
+            detail=(
+                f"VTOR is in SRAM; gnwmanager Recovery stub is not verified live "
+                f"({mailbox}, {core})"
+            ),
+        )
         return result
 
     if VTOR_BANK1_START <= vtor < VTOR_BANK2_START:
@@ -270,58 +338,86 @@ def identify_runtime(backend, *, start_locked_stub: bool = False,
         # OFW vectors. In particular, do not interpret a stray GIT_TAG string
         # in the unused/bootloader portion of stock bank 1 as the running app.
         bank1_is_ofw = " OFW (" in installed_image
-        version = (_retrogo_version(backend, VTOR_BANK1_START)
-                   if locked is False and not bank1_is_ofw else None)
+        version = (
+            _retrogo_version(backend, VTOR_BANK1_START)
+            if locked is False and not bank1_is_ofw
+            else None
+        )
         # gnw-web-builder classifies the bank-1 bootloader vector range before
         # interpreting the residual ITCM stock fingerprint.
         if BOOTLOADER_START <= vtor < BOOTLOADER_END:
-            result.update(application="Bootloader",
-                          detail="VTOR is in the bank 1 bootloader region")
+            result.update(
+                application="Bootloader", detail="VTOR is in the bank 1 bootloader region"
+            )
         elif installed_image.startswith("Retro-Go "):
             image = f"Retro-Go {version}" if version else installed_image
             _refresh_bank_image(result, 1, image)
-            result.update(application=image,
-                          detail=("VTOR is in bank 1; its Retro-Go version marker was read live"
-                                  if version else
-                                  "VTOR is in bank 1; bank inventory identifies a Retro-Go image"))
+            result.update(
+                application=image,
+                detail=(
+                    "VTOR is in bank 1; its Retro-Go version marker was read live"
+                    if version
+                    else "VTOR is in bank 1; bank inventory identifies a Retro-Go image"
+                ),
+            )
         elif installed_image.startswith("Sylverb bootloader (standalone)"):
-            result.update(application="Bootloader",
-                          detail="Installed bank 1 matches the standalone bootloader")
+            result.update(
+                application="Bootloader",
+                detail="Installed bank 1 matches the standalone bootloader",
+            )
         elif " OFW (" in installed_image:
             installed_model = installed_image.split(" OFW (", 1)[0]
-            protection = ("locked" if locked is True else "unlocked"
-                          if locked is False else "lock state unknown")
-            result.update(application=f"Stock {installed_model} ({protection})",
-                          detail="VTOR is in bank 1; installed bank scan found stock firmware")
+            protection = (
+                "locked"
+                if locked is True
+                else "unlocked" if locked is False else "lock state unknown"
+            )
+            result.update(
+                application=f"Stock {installed_model} ({protection})",
+                detail="VTOR is in bank 1; installed bank scan found stock firmware",
+            )
         elif version:
             image = f"Retro-Go {version}"
             _refresh_bank_image(result, 1, image)
-            result.update(application=image,
-                          detail="VTOR is in bank 1; its Retro-Go version marker was read live")
+            result.update(
+                application=image,
+                detail="VTOR is in bank 1; its Retro-Go version marker was read live",
+            )
         elif model:
-            protection = "locked" if locked is True else "unlocked" if locked is False else "lock state unknown"
-            result.update(application=f"Stock {model} ({protection})",
-                          detail=("VTOR is in bank 1; residual ITCM matches the stock firmware "
-                                  f"fingerprint; device is {protection}"))
+            protection = (
+                "locked"
+                if locked is True
+                else "unlocked" if locked is False else "lock state unknown"
+            )
+            result.update(
+                application=f"Stock {model} ({protection})",
+                detail=(
+                    "VTOR is in bank 1; residual ITCM matches the stock firmware "
+                    f"fingerprint; device is {protection}"
+                ),
+            )
         else:
             version = _retrogo_version(backend, VTOR_BANK1_START)
             if version:
-                result.update(application=f"Retro-Go {version}",
-                              detail="VTOR is in bank 1; Retro-Go version marker found")
+                result.update(
+                    application=f"Retro-Go {version}",
+                    detail="VTOR is in bank 1; Retro-Go version marker found",
+                )
         if result["application"] != "Unknown":
             return result
 
     if VTOR_BANK2_START <= vtor < VTOR_BANK_END:
-        version = (_retrogo_version(backend, VTOR_BANK2_START)
-                   if locked is False else None)
+        version = _retrogo_version(backend, VTOR_BANK2_START) if locked is False else None
         image = f"Retro-Go {version}" if version else "Retro-Go"
         _refresh_bank_image(result, 2, image)
         # On this hardware bank 2 is the Retro-Go runtime region. The builder
         # reports Retro-Go from VTOR even when the optional version-string scan
         # misses (older or customized builds can omit the expected GIT_TAG).
-        detail = ("VTOR is in bank 2; its Retro-Go version marker was read live"
-                  if version else
-                  "VTOR is in bank 2; Retro-Go runtime identified by its vector table")
+        detail = (
+            "VTOR is in bank 2; its Retro-Go version marker was read live"
+            if version
+            else "VTOR is in bank 2; Retro-Go runtime identified by its vector table"
+        )
         result.update(application=image, detail=detail)
         return result
 
@@ -332,10 +428,13 @@ def identify_runtime(backend, *, start_locked_stub: bool = False,
             pc, resumed = _read_pc_snapshot(backend, halted)
             pc_runtime = _runtime_from_pc(pc, result["banks"], stock_model, locked)
             if pc_runtime:
-                result.update(application=pc_runtime[0],
-                              detail=f"VTOR 0x{vtor:08x} was unclassified; {pc_runtime[1]} "
-                                     f"(PC 0x{pc:08x})",
-                              pc=pc, halted=resumed)
+                result.update(
+                    application=pc_runtime[0],
+                    detail=f"VTOR 0x{vtor:08x} was unclassified; {pc_runtime[1]} "
+                    f"(PC 0x{pc:08x})",
+                    pc=pc,
+                    halted=resumed,
+                )
                 return result
         except Exception as exc:
             result["runtimeDetail"] = f"PC fallback was unavailable: {exc}"
@@ -366,8 +465,9 @@ def _read_pc_snapshot(backend, was_halted: bool | None) -> tuple[int, bool | Non
     return pc, final_halted
 
 
-def _runtime_from_pc(pc: int, banks: list[dict], stock_model: str | None,
-                     locked: bool | None) -> tuple[str, str] | None:
+def _runtime_from_pc(
+    pc: int, banks: list[dict], stock_model: str | None, locked: bool | None
+) -> tuple[str, str] | None:
     address = pc & ~1
     if RAM_STUB_START <= address < RAM_STUB_END:
         return "Transient RAM application", "PC points into SRAM"
@@ -376,21 +476,34 @@ def _runtime_from_pc(pc: int, banks: list[dict], stock_model: str | None,
     if VTOR_BANK2_START <= address < VTOR_BANK_END:
         row = next((item for item in banks if item["bank"] == 2), {})
         image = row.get("image", "")
-        return (image if image.startswith("Retro-Go ") else "Retro-Go",
-                "PC points into the bank 2 Retro-Go region")
+        return (
+            image if image.startswith("Retro-Go ") else "Retro-Go",
+            "PC points into the bank 2 Retro-Go region",
+        )
     if VTOR_BANK1_START <= address < VTOR_BANK2_START:
         row = next((item for item in banks if item["bank"] == 1), {})
         image = row.get("image", "")
         if stock_model:
-            variant = "locked" if locked is True else "unlocked" if locked is False else "lock state unknown"
-            return f"Stock {stock_model} ({variant})", "PC points into bank 1; ITCM matches stock firmware"
+            variant = (
+                "locked"
+                if locked is True
+                else "unlocked" if locked is False else "lock state unknown"
+            )
+            return (
+                f"Stock {stock_model} ({variant})",
+                "PC points into bank 1; ITCM matches stock firmware",
+            )
         if image.startswith("Retro-Go "):
             return image, "PC points into the installed Retro-Go image in bank 1"
         if image.startswith("Sylverb bootloader (standalone)"):
             return "Bootloader", "PC points into the installed standalone bootloader"
         if " OFW (" in image:
             model = image.split(" OFW", 1)[0]
-            variant = "locked" if locked is True else "unlocked" if locked is False else "lock state unknown"
+            variant = (
+                "locked"
+                if locked is True
+                else "unlocked" if locked is False else "lock state unknown"
+            )
             return f"Stock {model} ({variant})", "PC points into installed stock firmware in bank 1"
     return None
 
@@ -402,12 +515,16 @@ def _retrogo_version(backend, bank_base: int) -> str | None:
         match = re.search(rb"Retro-Go (SD )?(v\d[\w.+-]*|NOTAG)", window)
     except Exception:
         return None
-    return (("SD " if match.group(1) else "") +
-            match.group(2).decode("ascii", errors="replace")) if match else None
+    return (
+        (("SD " if match.group(1) else "") + match.group(2).decode("ascii", errors="replace"))
+        if match
+        else None
+    )
 
 
-def _classify_gnwmanager_state(*, status: int | None, halted: bool | None,
-                               mailbox_alive: bool) -> str | None:
+def _classify_gnwmanager_state(
+    *, status: int | None, halted: bool | None, mailbox_alive: bool
+) -> str | None:
     """Mirror web-builder's mailbox liveness and expose active service work."""
     if mailbox_alive:
         return "idle"
@@ -422,8 +539,9 @@ def _refresh_bank_image(result: dict, index: int, image: str) -> None:
         if bank.get("bank") == index:
             bank["image"] = image
             break
-    parts = [bank.get("image", "") for bank in result.get("banks", [])
-             if bank.get("image") != "Erased"]
+    parts = [
+        bank.get("image", "") for bank in result.get("banks", []) if bank.get("image") != "Erased"
+    ]
     result["installed"] = "; ".join(parts) if parts else "No firmware detected"
 
 
@@ -459,16 +577,19 @@ def identify_installed_firmware(backend) -> tuple[list[dict], str]:
         # happens to equal an OFW model signature.
         version = _retrogo_version(backend, base) if index == 2 else None
         if version and _valid_app_vectors(sp, pc):
-            banks.append({"bank": index,
-                          "image": f"Retro-Go {version}",
-                          "size": _installed_bank_size(backend, base)})
+            banks.append(
+                {
+                    "bank": index,
+                    "image": f"Retro-Go {version}",
+                    "size": _installed_bank_size(backend, base),
+                }
+            )
             continue
         if model:
             marker = backend.read_memory(base + OFW_IMAGE_SIZE - 1, 1)
             patched = len(marker) == 1 and marker[0] != 0xFF
             label = f"{model} OFW ({'patched' if patched else 'stock'})"
-            if index == 1 and _bootloader_match(backend, base + 0x32000,
-                                               DUAL_BOOTLOADER_HASHES):
+            if index == 1 and _bootloader_match(backend, base + 0x32000, DUAL_BOOTLOADER_HASHES):
                 label += " + Sylverb bootloader"
             banks.append({"bank": index, "image": label, "size": OFW_IMAGE_SIZE})
             continue
@@ -488,8 +609,14 @@ def identify_installed_firmware(backend) -> tuple[list[dict], str]:
             has_retrogo = b"Retro-Go" in image
             if has_retrogo:
                 match = re.search(rb"Retro-Go (SD )?(v\d[\w.+-]*|NOTAG)", image)
-                version = (("SD " if match.group(1) else "") +
-                           match.group(2).decode("ascii", errors="replace")) if match else None
+                version = (
+                    (
+                        ("SD " if match.group(1) else "")
+                        + match.group(2).decode("ascii", errors="replace")
+                    )
+                    if match
+                    else None
+                )
         if has_retrogo and _valid_app_vectors(sp, pc):
             label = f"Retro-Go {version}" if version else "Retro-Go (older release)"
             banks.append({"bank": index, "image": label, "size": used_size})
@@ -501,8 +628,11 @@ def identify_installed_firmware(backend) -> tuple[list[dict], str]:
         if index == 1:
             # Web-builder verifies release hashes at the standalone vector and
             # dual-bootloader offsets before calling bank 1 a bootloader.
-            if (_valid_app_vectors(sp, pc) and (pc & ~1) < base + 0x32000 and
-                    _bootloader_match(backend, base, STANDALONE_BOOTLOADER_HASHES)):
+            if (
+                _valid_app_vectors(sp, pc)
+                and (pc & ~1) < base + 0x32000
+                and _bootloader_match(backend, base, STANDALONE_BOOTLOADER_HASHES)
+            ):
                 label = "Sylverb bootloader (standalone)"
             elif _bootloader_match(backend, base + 0x32000, DUAL_BOOTLOADER_HASHES):
                 label = "Sylverb bootloader (dual-boot)"
@@ -516,14 +646,15 @@ def identify_installed_firmware(backend) -> tuple[list[dict], str]:
 def _bootloader_match(backend, address: int, signatures: set[tuple[int, str]]) -> bool:
     maximum = max((size for size, _ in signatures), default=0)
     candidate = backend.read_memory(address, maximum)
-    return any(len(candidate) >= size and hashlib.sha256(candidate[:size]).hexdigest() == digest
-               for size, digest in signatures)
+    return any(
+        len(candidate) >= size and hashlib.sha256(candidate[:size]).hexdigest() == digest
+        for size, digest in signatures
+    )
 
 
 def _valid_app_vectors(sp: int, pc: int) -> bool:
     sp_ok = (sp >> 24) in (0x20, 0x24, 0x30, 0x38) and sp not in (0, 0xFFFFFFFF)
-    pc_ok = ((pc >> 24) == 0x08 and pc & 1 and
-             VTOR_BANK1_START <= (pc & ~1) < VTOR_BANK_END)
+    pc_ok = (pc >> 24) == 0x08 and pc & 1 and VTOR_BANK1_START <= (pc & ~1) < VTOR_BANK_END
     return sp_ok and pc_ok
 
 
@@ -581,9 +712,12 @@ def assert_application_mode(backend, *, operation: str) -> dict:
     state = inspect_target_mode(backend)
     if state["stubDetected"]:
         mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
-        state_label = ("live and idle" if state["stubAlive"] else
-                       f"resident but not confirmed idle (status 0x{state['status']:08x}, "
-                       f"{'halted' if state['halted'] else 'running'})")
+        state_label = (
+            "live and idle"
+            if state["stubAlive"]
+            else f"resident but not confirmed idle (status 0x{state['status']:08x}, "
+            f"{'halted' if state['halted'] else 'running'})"
+        )
         raise TargetModeError(
             f"Cannot {operation}: the gnwmanager RAM flasher is {state_label} "
             f"(VTOR 0x{state['vtor']:08x}). This operation requires application "
@@ -616,12 +750,14 @@ def start_gnwmanager_verified(backend, gnw, *, retries: int = 3) -> None:
         except Exception as error:
             raise TargetModeError(
                 "Reset did not leave the core halted; GWProv could not confirm an "
-                f"explicit halt ({error}). No flasher image or registers were written.") from error
+                f"explicit halt ({error}). No flasher image or registers were written."
+            ) from error
         if not dhcsr & S_HALT:
             raise TargetModeError(
                 "Reset did not leave the core halted, and an explicit halt was not "
                 "confirmed (DHCSR.S_HALT is clear). No flasher image or registers "
-                "were written.")
+                "were written."
+            )
     firmware = (files("gnwmanager") / "firmware.bin").read_bytes()
     if len(firmware) < 8:
         raise TargetModeError("gnwmanager RAM flasher image is too short to contain its vectors")
@@ -633,18 +769,26 @@ def start_gnwmanager_verified(backend, gnw, *, retries: int = 3) -> None:
             actual = backend.read_memory(GNWMANAGER_FIRMWARE_ADDR, len(firmware))
             if actual == firmware:
                 break
-            mismatch = next((index for index, (expected, found) in
-                             enumerate(zip(firmware, actual)) if expected != found),
-                            min(len(firmware), len(actual)))
-            last_error = (f"read-back mismatch at image offset 0x{mismatch:x} "
-                          f"(expected {len(firmware)} bytes, read {len(actual)})")
+            mismatch = next(
+                (
+                    index
+                    for index, (expected, found) in enumerate(zip(firmware, actual))
+                    if expected != found
+                ),
+                min(len(firmware), len(actual)),
+            )
+            last_error = (
+                f"read-back mismatch at image offset 0x{mismatch:x} "
+                f"(expected {len(firmware)} bytes, read {len(actual)})"
+            )
         except Exception as error:
             last_error = str(error)
         if attempt == max(1, retries):
             raise TargetModeError(
                 "gnwmanager RAM flasher failed read-back verification after "
                 f"{attempt} attempt(s): {last_error}. The core remains halted; "
-                "the damaged image was not started.")
+                "the damaged image was not started."
+            )
 
     gnw.write_uint32("status", 0)
     gnw.write_uint32("status_override", 0)
@@ -659,7 +803,8 @@ def start_gnwmanager_verified(backend, gnw, *, retries: int = 3) -> None:
             "gnwmanager RAM flasher vector registers did not read back correctly "
             f"(MSP expected 0x{msp:08x}, read 0x{actual_msp:08x}; "
             f"PC expected 0x{pc:08x}, read 0x{actual_pc:08x}). "
-            "The core remains halted; the image was not started.")
+            "The core remains halted; the image was not started."
+        )
 
     _resume_after_stub_transition(backend, watchdog_freezes)
     gnw.wait_for_idle()
@@ -678,7 +823,8 @@ def _reset_and_halt_for_stub(backend, gnw) -> dict[int, tuple[int, int]]:
     if not dhcsr & S_HALT:
         # Keep watchdogs frozen if reset did not leave the core safely halted.
         raise TargetModeError(
-            "Core did not halt after reset; watchdogs remain frozen and no RAM image was written")
+            "Core did not halt after reset; watchdogs remain frozen and no RAM image was written"
+        )
     return changed
 
 
@@ -690,8 +836,7 @@ def _resume_after_stub_transition(backend, watchdog_freezes) -> None:
 def _freeze_h7_watchdogs(backend) -> dict[int, tuple[int, int]]:
     """Freeze H7 watchdog counters before halting; return only bits we changed."""
     changed: dict[int, tuple[int, int]] = {}
-    for address, mask in ((DBGMCU_APB3FZ1, DBG_WWDG1),
-                          (DBGMCU_APB4FZ1, DBG_IWDG1)):
+    for address, mask in ((DBGMCU_APB3FZ1, DBG_WWDG1), (DBGMCU_APB4FZ1, DBG_IWDG1)):
         try:
             value = int(backend.read_uint32(address)) & 0xFFFFFFFF
             if value == 0xFFFFFFFF or value & mask:
@@ -745,17 +890,26 @@ def attach_to_idle_gnwmanager(backend, gnw, *, timeout: float = 5.0) -> int:
         ready_before = [backend.read_uint32(addr) & 0xFFFFFFFF for addr in ready_addresses]
         upload_before = gnw.read_uint32("upload_in_progress") & 0xFFFFFFFF
         download_before = gnw.read_uint32("download_in_progress") & 0xFFFFFFFF
-        if (status_before == STATUS_IDLE and ready_before == [0, 0]
-                and upload_before == 0 and download_before == 0):
+        if (
+            status_before == STATUS_IDLE
+            and ready_before == [0, 0]
+            and upload_before == 0
+            and download_before == 0
+        ):
             counter = backend.read_uint32(GNWMANAGER_CONTEXT_COUNTER) & 0xFFFFFFFF
             status_after = backend.read_uint32(MAILBOX_STATUS) & 0xFFFFFFFF
             ready_after = [backend.read_uint32(addr) & 0xFFFFFFFF for addr in ready_addresses]
             upload_after = gnw.read_uint32("upload_in_progress") & 0xFFFFFFFF
             download_after = gnw.read_uint32("download_in_progress") & 0xFFFFFFFF
             counter_after = backend.read_uint32(GNWMANAGER_CONTEXT_COUNTER) & 0xFFFFFFFF
-            if (status_after == STATUS_IDLE and ready_after == [0, 0]
-                    and upload_after == 0 and download_after == 0
-                    and counter != 0 and counter_after == counter):
+            if (
+                status_after == STATUS_IDLE
+                and ready_after == [0, 0]
+                and upload_after == 0
+                and download_after == 0
+                and counter != 0
+                and counter_after == counter
+            ):
                 gnw.context_counter = counter
                 gnw._gnwmanager_started = True
                 return counter
@@ -770,6 +924,7 @@ def recover_flasher(backend, gnw=None) -> dict:
     """Start or synchronize with the RAM flasher, leaving it ready for commands."""
     if gnw is None:
         from gnwmanager.gnw import GnW
+
         gnw = GnW(backend)
 
     state = inspect_target_mode(backend)
@@ -785,8 +940,9 @@ def recover_flasher(backend, gnw=None) -> dict:
         mark_backend_flasher_ready(backend)
         return {**state, "contextCounter": counter, "started": False}
     terminal_error = (state["status"] & 0xFFFF0000) == 0xBAD00000
-    recoverable_resident_stub = (state["stubResident"] and
-                                 state["status"] == STATUS_IDLE and state["halted"])
+    recoverable_resident_stub = (
+        state["stubResident"] and state["status"] == STATUS_IDLE and state["halted"]
+    )
     if state["stubDetected"] and not (terminal_error or recoverable_resident_stub):
         raise TargetModeError(
             "Recovery refused: gnwmanager is resident but not confirmed live and idle "
@@ -813,4 +969,3 @@ def recover_flasher(backend, gnw=None) -> dict:
         )
     mark_backend_flasher_ready(backend)
     return {**state, "contextCounter": counter, "started": True}
-

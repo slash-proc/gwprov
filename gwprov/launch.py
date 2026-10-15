@@ -27,7 +27,7 @@ def timing_launch_args(*, timing_mode="default", icount=None, pacing=None, rtc_e
     """Build guest timing and host pacing controls independently.
 
     Interactive baseline timing defaults to host wall-clock pacing. The
-    experimental M7 cycle producer currently requires unthrottled execution.
+    experimental M7 cycle producer also supports explicit realtime alignment.
     """
     if timing_mode not in ("default", "baseline", "experimental-m7"):
         raise ValueError("timing mode must be default, baseline or experimental-m7")
@@ -43,8 +43,6 @@ def timing_launch_args(*, timing_mode="default", icount=None, pacing=None, rtc_e
 
     if pacing is None:
         pacing = "realtime" if timing_mode == "baseline" else "unthrottled"
-    if timing_mode == "experimental-m7" and pacing != "unthrottled":
-        raise ValueError("experimental-m7 currently requires --pacing unthrottled")
 
     args = []
     if timing_mode in ("baseline", "experimental-m7"):

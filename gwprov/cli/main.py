@@ -4186,7 +4186,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("realtime", "unthrottled"),
         help=(
             "host wall-clock pacing (baseline defaults to realtime; "
-            "experimental-m7 requires unthrottled)"
+            "experimental-m7 defaults to unthrottled)"
         ),
     )
     start_profile.add_argument("--rtc-epoch", type=int)

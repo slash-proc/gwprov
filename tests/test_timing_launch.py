@@ -35,8 +35,9 @@ class TimingLaunch(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             timing_launch_args(timing_mode="experimental-m7", icount=1)
-        with self.assertRaisesRegex(ValueError, "unthrottled"):
-            timing_launch_args(timing_mode="experimental-m7", pacing="realtime")
+        args = timing_launch_args(timing_mode="experimental-m7", pacing="realtime")
+        self.assertEqual(args[-2:], ["-icount", "shift=0,align=on,sleep=on"])
+        self.assertIn("cortex-m7-arm-cpu.x-gnw-m7-cycle-model=on", args)
 
     def test_stale_daemon_timing_mode_rejected(self):
         from unittest.mock import patch
@@ -74,7 +75,6 @@ class TimingLaunch(unittest.TestCase):
     def test_invalid_controls_fail_before_launch(self):
         for options in (
             {"timing_mode": "baseline", "icount": 4},
-            {"timing_mode": "experimental-m7", "pacing": "realtime"},
             {"timing_mode": "default", "pacing": "realtime"},
             {"pacing": "fast"},
             {"icount": -1},

@@ -13,6 +13,10 @@ jobs:
         python-version: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y mtools
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true

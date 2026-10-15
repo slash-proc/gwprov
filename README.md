@@ -39,8 +39,10 @@ eval "$(gwprov completion bash)"
 # eval "$(gwprov completion zsh)"
 ```
 
-On macOS, install Python and mtools first (`brew install python@3.11 mtools`)
-and use `python3.11` in place of `python3`; Apple's system Python may be too old.
+SD-card image operations require mtools. On Debian or Ubuntu, install it with
+`sudo apt install mtools`. On macOS, install Python and mtools first
+(`brew install python@3.11 mtools`) and use `python3.11` in place of `python3`;
+Apple's system Python may be too old.
 
 ## Quick start: create and flash a profile
 

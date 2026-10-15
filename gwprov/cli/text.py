@@ -237,9 +237,7 @@ def _device_state(row: dict[str, Any]) -> str:
 def _state_read(row: dict[str, Any]) -> str:
     last_observed = row.get("lastObserved")
     observed = (
-        last_observed.get("polledAt")
-        if isinstance(last_observed, dict)
-        else row.get("polledAt")
+        last_observed.get("polledAt") if isinstance(last_observed, dict) else row.get("polledAt")
     )
     if not isinstance(observed, (int, float)):
         return "Not read"
@@ -398,9 +396,7 @@ def device_detail_data(row: dict[str, Any]) -> dict[str, Any]:
             pacing = "unthrottled"
         elif pacing is None and mode == "baseline":
             pacing = "realtime"
-        pacing_label = {"realtime": "Realtime", "unthrottled": "No pacing"}.get(
-            pacing, "Unknown"
-        )
+        pacing_label = {"realtime": "Realtime", "unthrottled": "No pacing"}.get(pacing, "Unknown")
         identity = row.get("binaryIdentity")
         version = identity.get("version") if isinstance(identity, dict) else None
         commit = identity.get("commit") if isinstance(identity, dict) else None

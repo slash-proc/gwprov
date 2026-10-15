@@ -888,8 +888,13 @@ class RemoteGDBBackend(GwemuGDBBackend):
     """Direct TCP GDB backend with optional target XML register numbering."""
 
     def __init__(
-        self, host: str, port: int, *, url: str | None = None,
-        operation: str = "gwprov debug session", daemon_managed: bool = False
+        self,
+        host: str,
+        port: int,
+        *,
+        url: str | None = None,
+        operation: str = "gwprov debug session",
+        daemon_managed: bool = False,
     ):
         super().__init__(host=host, port=port)
         from .target_leases import TargetLease
@@ -933,9 +938,7 @@ class RemoteGDBBackend(GwemuGDBBackend):
                 self._socket.connect((self.host, self.port))
                 self._sock_file = self._socket.makefile("rb", buffering=8192)
                 with suppress(GDBError):
-                    self._send_command(
-                        b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+"
-                    )
+                    self._send_command(b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+")
                 self._is_running = None
             except Exception as error:
                 cause = error.__cause__

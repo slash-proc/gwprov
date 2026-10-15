@@ -40,9 +40,7 @@ def test_device_inventory_uses_daemon_observed_states(monkeypatch, tmp_path):
     assert rows[0]["application"] == "Retro-Go SD v2.0.0-rc1"
 
 
-def test_device_inventory_preserves_daemon_busy_state_without_polling(
-    monkeypatch, tmp_path
-):
+def test_device_inventory_preserves_daemon_busy_state_without_polling(monkeypatch, tmp_path):
     monkeypatch.setenv("GWPROV_CONFIG_DIR", str(tmp_path / "config"))
     owner = {"key": "probe:busy-probe", "operation": "hardware profiling", "pid": 1234}
     monkeypatch.setattr(gwemu_manager, "instances", lambda: [])

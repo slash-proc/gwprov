@@ -653,7 +653,9 @@ class Service:
                 "activeLeases": active_leases,
                 "blockingLeases": blocking_leases,
                 "capabilities": [
-                    "gwemu-bin", "process-binary-inode", "timing-experimental-m7",
+                    "gwemu-bin",
+                    "process-binary-inode",
+                    "timing-experimental-m7",
                     "timing-pacing",
                 ],
             }

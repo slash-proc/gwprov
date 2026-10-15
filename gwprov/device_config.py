@@ -238,7 +238,10 @@ def _vm_image(device_id: str):
     if _profile_uses_sd(profile):
         if profile.resolved_sd is None:
             raise ValueError("GWemu profile has no SD card image for /CONFIG")
-        return _read_sd_config(profile.resolved_sd), f"GWemu profile SD image: {profile.resolved_sd}"
+        return (
+            _read_sd_config(profile.resolved_sd),
+            f"GWemu profile SD image: {profile.resolved_sd}",
+        )
     profile, _, start, size, block_size = _layout(profile_value)
     process = psutil.Process(pid)
     cwd = Path(process.cwd())

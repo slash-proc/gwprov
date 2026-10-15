@@ -2189,9 +2189,7 @@ def _debug_python(args) -> int:
         elif args.device.startswith("profile:"):
             raise ValueError("debug python requires a device target, not a profile")
         if any((probe_ids, programmers, remote_urls, remote_gdb_endpoints)):
-            raise ValueError(
-                "use either the positional device or explicit adapter options"
-            )
+            raise ValueError("use either the positional device or explicit adapter options")
         from gwprov.devices import device_rows
 
         rows = device_rows()
@@ -4176,11 +4174,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--timing-mode", choices=("default", "baseline", "experimental-m7"), default="default"
     )
     start_profile.add_argument(
-        "--icount-shift", "--icount", dest="icount", type=int, choices=range(11),
+        "--icount-shift",
+        "--icount",
+        dest="icount",
+        type=int,
+        choices=range(11),
         help="precise instruction-count shift (legacy alias: --icount)",
     )
     start_profile.add_argument(
-        "--pacing", choices=("realtime", "unthrottled"),
+        "--pacing",
+        choices=("realtime", "unthrottled"),
         help=(
             "host wall-clock pacing (baseline defaults to realtime; "
             "experimental-m7 requires unthrottled)"

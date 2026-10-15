@@ -108,7 +108,12 @@ def list_gdb() -> list[dict[str, str | int]]:
         url = normalize_gdb_url(row["url"])
         parsed = urlparse(url)
         result.append(
-            {"name": row["name"], "url": url, "host": parsed.hostname or "", "port": parsed.port or 0}
+            {
+                "name": row["name"],
+                "url": url,
+                "host": parsed.hostname or "",
+                "port": parsed.port or 0,
+            }
         )
     return result
 
@@ -258,9 +263,7 @@ def _write(
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(
-            {"schemaVersion": 1, "remote": rows, "gdb": gdb_rows or []}, stream, indent=2
-        )
+        json.dump({"schemaVersion": 1, "remote": rows, "gdb": gdb_rows or []}, stream, indent=2)
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())

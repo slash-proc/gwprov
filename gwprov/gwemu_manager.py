@@ -162,9 +162,7 @@ def _instance(pid: int, args: list[str]) -> dict[str, Any] | None:
     execution = _qmp_execution(qmp)
     running = execution.get("running")
     global_options = [
-        args[index + 1]
-        for index, value in enumerate(args[:-1])
-        if value == "-global"
+        args[index + 1] for index, value in enumerate(args[:-1]) if value == "-global"
     ]
     experimental = any("x-gnw-m7-cycle-model=on" in value for value in global_options)
     modeled = any("gnw-h7b0-soc.timing-mode=on" in value for value in global_options)

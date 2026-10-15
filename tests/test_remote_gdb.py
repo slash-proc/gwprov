@@ -15,9 +15,7 @@ from gwprov.adapters import (
 def test_remote_gdb_registry_coexists_with_gnwmanager_adapters(tmp_path, monkeypatch):
     monkeypatch.setenv("GWPROV_CONFIG_DIR", str(tmp_path))
 
-    add_remote(
-        "manager", "ws://manager.example:8765/gdb", origin="https://builder.example"
-    )
+    add_remote("manager", "ws://manager.example:8765/gdb", origin="https://builder.example")
     adapter = add_gdb("test-target", "gdb://debug-target.example.invalid:3333")
 
     assert adapter == {
@@ -43,9 +41,7 @@ def test_remote_gdb_registry_coexists_with_gnwmanager_adapters(tmp_path, monkeyp
         "url": "gdb://debug-target.example.invalid:3333",
     }
 
-    assert (
-        remove_remote("test-target")["url"] == "gdb://debug-target.example.invalid:3333"
-    )
+    assert remove_remote("test-target")["url"] == "gdb://debug-target.example.invalid:3333"
     assert list_gdb() == []
     assert len(list_remote()) == 1
 
@@ -91,9 +87,7 @@ def test_remote_gdb_inventory_is_metadata_only(tmp_path, monkeypatch):
     assert row["url"] == "gdb://debug-target.example.invalid:3333"
 
 
-def test_device_inventory_and_completion_include_raw_gdb_without_connecting(
-    tmp_path, monkeypatch
-):
+def test_device_inventory_and_completion_include_raw_gdb_without_connecting(tmp_path, monkeypatch):
     monkeypatch.setenv("GWPROV_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
     add_gdb("test-target", "gdb://debug-target.example.invalid:3333")
@@ -120,9 +114,7 @@ def test_device_inventory_and_completion_include_raw_gdb_without_connecting(
     )
     lease.acquire()
     try:
-        active = next(
-            item for item in devices.device_rows() if item["name"] == "test-target"
-        )
+        active = next(item for item in devices.device_rows() if item["name"] == "test-target")
         assert active["status"] == "busy"
     finally:
         lease.release()
@@ -193,9 +185,7 @@ def test_daemon_error_is_attached_to_registered_gdb_device(tmp_path, monkeypatch
     assert "stale daemon did not exit" in rows[0]["detail"]
 
 
-def test_daemon_discovery_registers_remote_gdb_for_heartbeat_polling(
-    tmp_path, monkeypatch
-):
+def test_daemon_discovery_registers_remote_gdb_for_heartbeat_polling(tmp_path, monkeypatch):
     monkeypatch.setenv("GWPROV_CONFIG_DIR", str(tmp_path / "config"))
     add_gdb("test-target", "gdb://debug-target.example.invalid:3333")
     monkeypatch.setattr("gwprov.backends.enumerate_local_probes", lambda: [])
@@ -215,9 +205,7 @@ def test_daemon_discovery_registers_remote_gdb_for_heartbeat_polling(
     assert row["remoteGdb"] is True
 
 
-def test_daemon_poller_records_remote_gdb_firmware_and_execution_state(
-    tmp_path, monkeypatch
-):
+def test_daemon_poller_records_remote_gdb_firmware_and_execution_state(tmp_path, monkeypatch):
     monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
     from gwprov import daemon, debug_shell, hw_lifecycle
 
@@ -362,9 +350,7 @@ def test_remote_gdb_backend_uses_target_xml_and_releases_lease(tmp_path, monkeyp
     monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
     fake_socket = FakeSocket()
     monkeypatch.setattr("gwprov.debug_shell.socket.socket", lambda *args: fake_socket)
-    backend = RemoteGDBBackend(
-        "debug-target.example.invalid", 3333, daemon_managed=True
-    )
+    backend = RemoteGDBBackend("debug-target.example.invalid", 3333, daemon_managed=True)
     xml = (
         b'<target><feature name="org.gnu.gdb.arm.core">'
         b'<reg name="r0" regnum="0" bitsize="32" type="uint32"/>'
@@ -388,9 +374,7 @@ def test_remote_gdb_backend_uses_target_xml_and_releases_lease(tmp_path, monkeyp
     backend.close()
 
 
-def test_raw_gdb_backend_falls_back_when_target_xml_is_unsupported(
-    tmp_path, monkeypatch
-):
+def test_raw_gdb_backend_falls_back_when_target_xml_is_unsupported(tmp_path, monkeypatch):
     from gnwmanager.ocdbackend.gdb_backend import GDBError
 
     class FakeSocket:
@@ -419,9 +403,7 @@ def test_raw_gdb_backend_falls_back_when_target_xml_is_unsupported(
     monkeypatch.setattr("gwprov.debug_shell.socket.socket", lambda *args: FakeSocket())
     from gwprov.debug_shell import RemoteGDBBackend
 
-    backend = RemoteGDBBackend(
-        "debug-target.example.invalid", 3333, daemon_managed=True
-    )
+    backend = RemoteGDBBackend("debug-target.example.invalid", 3333, daemon_managed=True)
     monkeypatch.setattr(
         backend,
         "_send_command",
@@ -429,9 +411,7 @@ def test_raw_gdb_backend_falls_back_when_target_xml_is_unsupported(
             b"OK"
             if command.startswith(b"qSupported:")
             else (_ for _ in ()).throw(
-                GDBError(
-                    "GDB error response: 01 for qXfer:features:read:target.xml:0,fff"
-                )
+                GDBError("GDB error response: 01 for qXfer:features:read:target.xml:0,fff")
             )
         ),
     )

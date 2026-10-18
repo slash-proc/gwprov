@@ -14,7 +14,6 @@ import yaml
 
 MIB = 1024 * 1024
 BANK_SIZE = 256 * 1024
-FROGFS_OFFSET = 16 * MIB
 
 
 def _flash_map_entry(name: str, relative_file: str, offset: int, path: Path) -> dict:
@@ -39,6 +38,7 @@ def patch_layout(
     extflash_size: int,
     littlefs_length: int,
     frogfs_offset: int = 0,
+    reserved_offset: int = 0,
 ) -> bytes:
     if declaration != {"magic": "GWLB", "version": 2, "structSize": 36}:
         raise ValueError(f"unsupported firmware layout declaration: {declaration}")
@@ -59,7 +59,7 @@ def patch_layout(
         frogfs_offset,
         frogfs_length,
         extflash_size,
-        0,
+        reserved_offset,
         littlefs_length,
         flags,
     )
@@ -93,6 +93,9 @@ def create_profile(
     bootloader_repo: str = "sylverb/game-and-watch-bootloader",
     bootloader_version: str = "v1.0.8",
     bootloader_file: str | Path | None = None,
+    base_extflash: str | Path | None = None,
+    stock_model: str | None = None,
+    erase_block_size: int = 64 * 1024,
 ) -> dict:
     source = Path(content).expanduser().resolve()
     metadata = json.loads((source / ".gwprov-firmware.json").read_text())
@@ -138,6 +141,8 @@ def create_profile(
     if root.exists():
         raise ValueError(f"profile already exists; select a new instance directory: {root}")
     select_extflash_mib(0, extflash_mib)
+    if stock_model not in {None, "mario", "zelda"}:
+        raise ValueError("stock model must be mario or zelda")
     if variant == "flash" and not 1 <= littlefs_mib < (extflash_mib or 256):
         raise ValueError("LittleFS must be at least 1 MiB and smaller than the extflash chip")
     from .bootloader import resolve_bootloader
@@ -152,12 +157,14 @@ def create_profile(
     if variant == "sd":
         chip_mib = select_extflash_mib(0, extflash_mib or 64)
         total = chip_mib * MIB
+        reserved_offset = _profile_reserved_offset(base_extflash, erase_block_size, stock_model)
         firmware = patch_layout(
             (source / "firmware/intflash.bin").read_bytes(),
             metadata["firmware"]["superblock"],
             frogfs_length=0,
             extflash_size=total,
             littlefs_length=0,
+            reserved_offset=reserved_offset,
         )
         if len(firmware) > BANK_SIZE:
             raise ValueError("firmware is larger than bank 2")
@@ -215,6 +222,7 @@ def create_profile(
                     "extflashBytes": total,
                     "sdImageBytes": sd_image.stat().st_size,
                     "sdLabel": sd_label,
+                    "reservedOffset": reserved_offset,
                 },
                 "boot": "official bootloader at 0x08000000",
                 "bootloader": boot_info,
@@ -328,11 +336,24 @@ def create_profile(
     from .vendor.retrogo_sd.scripts import gen_frogfs_image, gen_littlefs_image
 
     total = (extflash_mib or 256) * MIB
+    reserved_offset = _profile_reserved_offset(base_extflash, erase_block_size, stock_model)
+    scanned = []
+    if base_extflash is not None:
+        from .extflash_scan import scan_extflash
+
+        scanned = scan_extflash(base_extflash)
+    existing_frogfs = next((part for part in scanned if part.get("fs") == "frogfs"), None)
+    frogfs_offset = (
+        existing_frogfs["offset"]
+        if existing_frogfs
+        and existing_frogfs["offset"] % erase_block_size == 0
+        and existing_frogfs["offset"] >= reserved_offset
+        else reserved_offset
+    )
+    reserved_offset = max(reserved_offset, frogfs_offset)
     littlefs_size = littlefs_mib * MIB
-    if total <= FROGFS_OFFSET + littlefs_size:
-        raise ValueError(
-            "extflash must leave space for FrogFS after the 16 MiB stock-assets area and LittleFS"
-        )
+    if total <= frogfs_offset + littlefs_size:
+        raise ValueError("extflash must leave space for FrogFS after detected reserved data and LittleFS")
     with tempfile.TemporaryDirectory(prefix=".gwprov-profile-", dir=root.parent) as tmp:
         work = Path(tmp)
         frogfs_tree = source / "flash/frogfs"
@@ -351,9 +372,9 @@ def create_profile(
             "--build-dir",
             str(work / "frogfs-build"),
             "--extflash-offset",
-            str(FROGFS_OFFSET),
+            str(frogfs_offset),
             "--reserve-size",
-            str(total - FROGFS_OFFSET - littlefs_size),
+            str(total - frogfs_offset - littlefs_size),
             "--no-gencovers",
         ]
         for item in ("bios", "covers", "fonts", "roms"):
@@ -415,11 +436,11 @@ def create_profile(
         if gen_littlefs_image.main(lfs_args):
             raise ValueError("LittleFS build failed")
         frogfs = (work / "frogfs.bin").read_bytes()
-        chip_mib = select_extflash_mib(FROGFS_OFFSET + len(frogfs) + littlefs_size, extflash_mib)
+        chip_mib = select_extflash_mib(frogfs_offset + len(frogfs) + littlefs_size, extflash_mib)
         total = chip_mib * MIB
-        if FROGFS_OFFSET + len(frogfs) > total - littlefs_size:
+        if frogfs_offset + len(frogfs) > total - littlefs_size:
             raise ValueError(
-                f"content needs {FROGFS_OFFSET + len(frogfs)} bytes; only {total - littlefs_size} fit before LittleFS"
+                f"content needs {frogfs_offset + len(frogfs)} bytes; only {total - littlefs_size} fit before LittleFS"
             )
         firmware = patch_layout(
             (source / "firmware/intflash.bin").read_bytes(),
@@ -427,7 +448,8 @@ def create_profile(
             frogfs_length=len(frogfs),
             extflash_size=total,
             littlefs_length=littlefs_size,
-            frogfs_offset=FROGFS_OFFSET,
+            frogfs_offset=frogfs_offset,
+            reserved_offset=reserved_offset,
         )
         if len(firmware) > BANK_SIZE:
             raise ValueError("firmware is larger than bank 2")
@@ -445,7 +467,7 @@ def create_profile(
         with (instance / "extflash.bin").open("wb") as output:
             for _ in range(chip_mib):
                 output.write(b"\xff" * MIB)
-            output.seek(FROGFS_OFFSET)
+            output.seek(frogfs_offset)
             output.write(frogfs)
             output.seek(total - littlefs_size)
             with (work / "littlefs.bin").open("rb") as packed:
@@ -459,7 +481,8 @@ def create_profile(
             "projectSymbols": project_symbols,
             "layout": {
                 "extflashBytes": total,
-                "frogfsOffset": FROGFS_OFFSET,
+                "frogfsOffset": frogfs_offset,
+                "reservedOffset": reserved_offset,
                 "frogfsBytes": len(frogfs),
                 "littlefsOffset": total - littlefs_size,
                 "littlefsBytes": littlefs_size,
@@ -481,7 +504,7 @@ def create_profile(
             ],
             "bank0": [
                 _flash_map_entry(
-                    "Retro-Go FrogFS", "blobs/frogfs.bin", FROGFS_OFFSET, blobs / "frogfs.bin"
+                    "Retro-Go FrogFS", "blobs/frogfs.bin", frogfs_offset, blobs / "frogfs.bin"
                 ),
                 _flash_map_entry(
                     "Retro-Go LittleFS",
@@ -498,6 +521,21 @@ def create_profile(
         (instance / "gwemu.toml").write_text("[general]\nshow_welcome = false\n")
         instance.rename(root)
     return report
+
+
+def _profile_reserved_offset(
+    base_extflash: str | Path | None,
+    erase_block_size: int,
+    stock_model: str | None,
+) -> int:
+    from .extflash_scan import next_free_offset, scan_extflash
+
+    if erase_block_size <= 0:
+        raise ValueError("external-flash erase block size must be positive")
+    partitions = scan_extflash(base_extflash) if base_extflash else []
+    return next_free_offset(
+        partitions, block_size=erase_block_size, stock_model=stock_model
+    )
 
 
 def _write_profile_images(

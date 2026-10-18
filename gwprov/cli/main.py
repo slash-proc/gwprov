@@ -426,6 +426,8 @@ def _profile_create(args) -> int:
                     content=content,
                     littlefs_mib=args.littlefs_mib,
                     extflash_mib=args.extflash_mib,
+                    base_extflash=destination / "extflash.bin",
+                    stock_model=model,
                 )
                 mapping = yaml.safe_load((assembled / "flash-map.yaml").read_text())
                 # A stock profile's erased-bank placeholder is a real mapped
@@ -3373,7 +3375,7 @@ def _project_install(args) -> int:
                 for item in planned
                 if item["path"].startswith("frogfs/")
             }
-            frogfs_offset = 16 * 1024 * 1024
+            frogfs_offset = 0
             if profile_root is not None:
                 provision_path = profile_root / "provision.json"
                 profile_metadata = (

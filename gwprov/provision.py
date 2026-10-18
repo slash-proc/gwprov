@@ -353,7 +353,9 @@ def create_profile(
     reserved_offset = max(reserved_offset, frogfs_offset)
     littlefs_size = littlefs_mib * MIB
     if total <= frogfs_offset + littlefs_size:
-        raise ValueError("extflash must leave space for FrogFS after detected reserved data and LittleFS")
+        raise ValueError(
+            "extflash must leave space for FrogFS after detected reserved data and LittleFS"
+        )
     with tempfile.TemporaryDirectory(prefix=".gwprov-profile-", dir=root.parent) as tmp:
         work = Path(tmp)
         frogfs_tree = source / "flash/frogfs"
@@ -533,9 +535,7 @@ def _profile_reserved_offset(
     if erase_block_size <= 0:
         raise ValueError("external-flash erase block size must be positive")
     partitions = scan_extflash(base_extflash) if base_extflash else []
-    return next_free_offset(
-        partitions, block_size=erase_block_size, stock_model=stock_model
-    )
+    return next_free_offset(partitions, block_size=erase_block_size, stock_model=stock_model)
 
 
 def _write_profile_images(

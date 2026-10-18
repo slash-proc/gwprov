@@ -59,7 +59,10 @@ def scan_extflash(path: str | Path, flash_size: int | None = None) -> list[dict]
             # FAT boot sector / partition start, as in gnw-web-builder's scanner.
             if data[510:512] == b"\x55\xaa" and data[0] in (0xEB, 0xE9):
                 bps = struct.unpack_from("<H", data, 0x0B)[0]
-                sectors = struct.unpack_from("<H", data, 0x13)[0] or struct.unpack_from("<I", data, 0x20)[0]
+                sectors = (
+                    struct.unpack_from("<H", data, 0x13)[0]
+                    or struct.unpack_from("<I", data, 0x20)[0]
+                )
                 if 512 <= bps <= 4096 and sectors:
                     add(offset, bps * sectors, "FAT", "fat")
                     continue
@@ -120,7 +123,11 @@ def next_free_offset(
 ) -> int:
     """Find the 1 MiB-aligned end of reserved partitions, excluding filesystems."""
     reserved_end = max(
-        (part["offset"] + part["size"] for part in partitions if part.get("fs") not in {"frogfs", "littlefs"}),
+        (
+            part["offset"] + part["size"]
+            for part in partitions
+            if part.get("fs") not in {"frogfs", "littlefs"}
+        ),
         default=0,
     )
     model_floor = {"mario": MIB, "zelda": 4 * MIB}.get(stock_model or "", 0)

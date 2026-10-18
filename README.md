@@ -1421,12 +1421,15 @@ Ruff and Black for linting and formatting, and pytest with coverage for tests.
 
 ```bash
 uv sync --group dev
-uv run pre-commit install  # Optional local checks before commits
+make install-hooks         # Runs the full CI matrix before every push
+uv run pre-commit install  # Optional lint/format checks before commits
 uv run pytest --cov --cov-report=term-missing
 make lint
 ```
 
-`make check` runs the lint and format checks plus the test suite. CI runs the
-same commands on pushes and pull requests. Vendored source is excluded from
-Ruff and Black checks. Pre-commit hooks run locally only; the repository does
-not use pre-commit.ci automation.
+`make check` runs lint, format, and tests with coverage in the active Python
+environment. `make ci` runs that same set of checks on every Python version
+used by CI (3.10, 3.12, and 3.14), in isolated temporary environments. The
+installed pre-push hook runs `make ci` and blocks the push if any check fails.
+Vendored source is excluded from Ruff and Black checks. Pre-commit hooks run
+locally only; the repository does not use pre-commit.ci automation.

@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ET
 from bisect import bisect_right
 from pathlib import Path
 
+from elftools.common.exceptions import ELFRelocationError
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 from elftools.dwarf.callframe import FDE, RegisterRule
@@ -591,7 +592,15 @@ class SymbolTable:
         if owner not in self._cfi:
             with owner.open("rb") as stream:
                 image = ELFFile(stream)
-                dwarf = image.get_dwarf_info()
+                try:
+                    dwarf = image.get_dwarf_info()
+                except ELFRelocationError:
+                    # Some firmware ELFs contain DWARF relocations that
+                    # pyelftools does not support (including R_ARM_NONE).
+                    # Stack unwinding is best-effort; use the linked debug
+                    # addresses as stored so status and symbol lookup remain
+                    # available.
+                    dwarf = image.get_dwarf_info(relocate_dwarf_sections=False)
                 entries = []
                 for entry in dwarf.CFI_entries():
                     if isinstance(entry, FDE):

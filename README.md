@@ -1421,7 +1421,6 @@ Ruff and Black for linting and formatting, and pytest with coverage for tests.
 
 ```bash
 uv sync --group dev
-make install-hooks         # Runs the full CI matrix before every push
 uv run pre-commit install  # Optional lint/format checks before commits
 uv run pytest --cov --cov-report=term-missing
 make lint

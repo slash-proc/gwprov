@@ -1,4 +1,4 @@
-.PHONY: test lint format check ci install-hooks
+.PHONY: test lint format check ci
 
 test:
 	uv run pytest --cov --cov-report=term-missing
@@ -26,5 +26,3 @@ ci:
 		UV_PROJECT_ENVIRONMENT="$$project_env" $(MAKE) check; \
 	done
 
-install-hooks:
-	git config core.hooksPath .githooks

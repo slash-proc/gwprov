@@ -2,7 +2,7 @@
 
 `gwprov` is the Python provisioning and control library for Game & Watch Retro-Go images, GWemu, and physical devices. It is intended to be consumed as a Python package and as a Git submodule.
 
-The package includes reusable target, SD-card, timeline, Retro-Go configuration, and build modules, alongside Retro-Go-SD's `REMOTE_INPUT` transport. Retro-Go build behavior is carried over as a compatibility wrapper; the build system itself remains owned by Retro-Go-SD.
+The package includes reusable target, SD-card, timeline, Retro-Go configuration, and build modules. Retro-Go build behavior is carried over as a compatibility wrapper; the build system itself remains owned by Retro-Go-SD.
 
 ## Install
 
@@ -831,8 +831,8 @@ output reports the active phase and per-region progress to stdout; use
 
 ```sh
 gwprov profile dev-local/profiles/retro-go-demo plan
-gwprov profile dev-local/profiles/retro-go-demo apply device:probe:PROBE_ID
-# Or select one OpenOCD adapter explicitly:
+# Use a stable probe ID reported by `device ls`.
+gwprov device ls
 gwprov profile dev-local/profiles/retro-go-demo apply device:probe:PROBE_ID
 # Keep stdout machine-readable when scripting:
 gwprov profile dev-local/profiles/retro-go-demo apply device:probe:PROBE_ID -o json
@@ -871,11 +871,12 @@ the flasher running; it does not boot bank 1:
 gwprov device DEVICE recover
 ```
 
-That command requires a named hardware device. If no flasher is running,
-GWProv starts it and waits for IDLE. If it is already live and idle, GWProv
-attaches and synchronizes the mailbox context counter. An idle but halted or
-terminal-error stub is restarted; a busy or unreadable resident flasher is
-left alone.
+Recovery requires a named device with a supported debug backend: a local probe,
+remote gnwmanager adapter, raw GDB endpoint, or GWemu instance with a GDB
+endpoint. If no flasher is running, GWProv starts it and waits for IDLE. If it
+is already live and idle, GWProv attaches and synchronizes the mailbox context
+counter. An idle but halted or terminal-error stub is restarted; a busy or
+unreadable resident flasher is left alone.
 
 ## Local and remote device sessions
 

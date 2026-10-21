@@ -843,19 +843,66 @@ class GwemuGDBBackend(GDBBackend):
 
     def _register_index(self, name: str) -> int:
         key = name.lower()
-        aliases = {"msp": "sp", "r13": "sp", "r14": "lr", "r15": "pc", "cpsr": "xpsr"}
+        aliases = {"r13": "sp", "r14": "lr", "r15": "pc", "cpsr": "xpsr"}
         key = aliases.get(key, key)
+        if key == "msp" and key not in self.register_numbers and "sp" in self.register_numbers:
+            key = "sp"
         if key not in self.register_numbers:
             if not self.register_numbers:
                 return self._get_reg_idx(key)
             raise ValueError(f"target does not advertise register {name!r}")
         return self.register_numbers[key]
 
+    def _read_cortex_m_special_register(self, name: str) -> int:
+        """Read one unadvertised Cortex-M register through CoreDebug."""
+        if getattr(self, "target_profile", None) != "stm32h7b0":
+            raise ValueError(f"target does not advertise register {name!r}")
+        if self._is_running is not False:
+            raise RuntimeError("Cortex-M special registers require a halted target")
+        # Cortex-M selector 0x14 transfers CONTROL, FAULTMASK, BASEPRI, and
+        # PRIMASK together in DCRDR. CONTROL occupies bits 31:24 and PRIMASK
+        # occupies bits 7:0.
+        selectors = {"msp": 0x11, "psp": 0x12, "control": 0x14, "primask": 0x14}
+        selector = selectors[name]
+        dhcsr = int.from_bytes(self.read_memory(0xE000EDF0, 4), "little")
+        if dhcsr & ((1 << 17) | (1 << 16)) != (1 << 17) | (1 << 16):
+            raise RuntimeError("Cortex-M register transfer is not ready at a debug halt")
+        self.write_memory(0xE000EDF4, selector.to_bytes(4, "little"))
+        deadline = time.monotonic() + 0.1
+        while True:
+            dhcsr = int.from_bytes(self.read_memory(0xE000EDF0, 4), "little")
+            if not dhcsr & (1 << 17):
+                raise RuntimeError("target left debug halt during Cortex-M register transfer")
+            if dhcsr & (1 << 16):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("timed out reading Cortex-M special register")
+            time.sleep(0.001)
+        value = int.from_bytes(self.read_memory(0xE000EDF8, 4), "little")
+        if name == "control":
+            return (value >> 24) & 0xFF
+        if name == "primask":
+            return value & 0xFF
+        return value
+
     def read_register(self, name: str) -> int:
+        key = name.lower()
+        if (
+            key in {"msp", "psp", "control", "primask"}
+            and key not in self.register_numbers
+            and not (key == "msp" and "sp" in self.register_numbers)
+            and getattr(self, "target_profile", None) == "stm32h7b0"
+        ):
+            return self._read_cortex_m_special_register(key)
+        try:
+            index = self._register_index(key)
+        except ValueError:
+            if key in {"msp", "psp", "control", "primask"}:
+                return self._read_cortex_m_special_register(key)
+            raise
         was_running = self._is_running
         if was_running:
             self.halt()
-        index = self._register_index(name)
         command = f"p{index:x}".encode("ascii")
         reply = self._send_command(command)
         if was_running:

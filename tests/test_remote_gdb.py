@@ -587,6 +587,128 @@ def test_remote_gdb_backend_uses_target_xml_and_releases_lease(tmp_path, monkeyp
     backend.close()
 
 
+def test_remote_gdb_prefers_advertised_msp_over_sp():
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend("example.invalid", 3333, daemon_managed=True)
+    backend.register_numbers = {"sp": 13, "msp": 17}
+    backend._is_running = False
+    commands = []
+    backend._send_command = lambda command: commands.append(command) or b"78563412"
+
+    assert backend.read_register("msp") == 0x12345678
+    assert commands == [b"p11"]
+
+
+def test_remote_gdb_uses_advertised_sp_as_generic_msp_alias():
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend("example.invalid", 3333, daemon_managed=True)
+    backend.register_numbers = {"sp": 13}
+    backend._is_running = False
+    commands = []
+    backend._send_command = lambda command: commands.append(command) or b"f0ff0120"
+
+    assert backend.read_register("msp") == 0x2001FFF0
+    assert commands == [b"pd"]
+
+
+@pytest.mark.parametrize(
+    ("name", "selector", "dcrdr", "expected"),
+    [
+        ("msp", 0x11, 0x2001FFF0, 0x2001FFF0),
+        ("psp", 0x12, 0x20010000, 0x20010000),
+        ("control", 0x14, 0x02010001, 0x02),
+        ("primask", 0x14, 0x02010001, 0x01),
+    ],
+)
+def test_remote_gdb_reads_unadvertised_cortex_m_special_register(
+    name, selector, dcrdr, expected
+):
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend(
+        "example.invalid", 3333, daemon_managed=True, target_profile="stm32h7b0"
+    )
+    backend.register_numbers = {"xpsr": 16}
+    backend._is_running = False
+    writes = []
+    backend.write_memory = lambda address, data: writes.append((address, data))
+    values = {0xE000EDF0: (1 << 17) | (1 << 16), 0xE000EDF8: dcrdr}
+    backend.read_memory = lambda address, size: values[address].to_bytes(size, "little")
+
+    assert backend.read_register(name) == expected
+    assert writes == [(0xE000EDF4, selector.to_bytes(4, "little"))]
+
+
+def test_remote_gdb_special_register_requires_halted_known_target():
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend("example.invalid", 3333, daemon_managed=True)
+    backend.register_numbers = {"sp": 13}
+    backend._is_running = False
+    with pytest.raises(ValueError, match="does not advertise"):
+        backend.read_register("psp")
+
+    backend.target_profile = "stm32h7b0"
+    backend._is_running = True
+    with pytest.raises(RuntimeError, match="halted target"):
+        backend.read_register("psp")
+
+
+def test_remote_gdb_special_register_readiness_timeout(monkeypatch):
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend(
+        "example.invalid", 3333, daemon_managed=True, target_profile="stm32h7b0"
+    )
+    backend.register_numbers = {"sp": 13}
+    backend._is_running = False
+    backend.write_memory = lambda address, data: None
+    states = iter(((1 << 17) | (1 << 16), 1 << 17, 1 << 17))
+    backend.read_memory = lambda address, size: (
+        next(states) if address == 0xE000EDF0 else 0
+    ).to_bytes(size, "little")
+    ticks = iter((0.0, 0.0, 0.2))
+    monkeypatch.setattr("gwprov.debug_shell.time.monotonic", lambda: next(ticks))
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        backend.read_register("control")
+
+
+def test_remote_gdb_special_register_rejects_initial_not_ready():
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend(
+        "example.invalid", 3333, daemon_managed=True, target_profile="stm32h7b0"
+    )
+    backend.register_numbers = {"sp": 13}
+    backend._is_running = False
+    writes = []
+    backend.write_memory = lambda address, data: writes.append((address, data))
+    backend.read_memory = lambda address, size: (1 << 17).to_bytes(size, "little")
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        backend.read_register("psp")
+    assert writes == []
+
+
+def test_remote_gdb_special_register_rejects_target_leaving_halt():
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend(
+        "example.invalid", 3333, daemon_managed=True, target_profile="stm32h7b0"
+    )
+    backend.register_numbers = {"sp": 13}
+    backend._is_running = False
+    states = iter(((1 << 17) | (1 << 16), 1 << 16))
+    backend.write_memory = lambda address, data: None
+    backend.read_memory = lambda address, size: next(states).to_bytes(size, "little")
+
+    with pytest.raises(RuntimeError, match="left debug halt"):
+        backend.read_register("psp")
+
+
 def test_raw_gdb_backend_falls_back_when_target_xml_is_unsupported(tmp_path, monkeypatch):
     from gnwmanager.ocdbackend.gdb_backend import GDBError
 

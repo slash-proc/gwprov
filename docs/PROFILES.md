@@ -89,8 +89,11 @@ subdirectories. A release that publishes only one storage variant also supplies
 an unambiguous default. If these clues do not identify one choice, pass
 `--variant flash` or `--variant sd`.
 
-Local Retro-Go builds use the same staging contract as downloaded releases. The storage
-variant is read from `--profile`; without a profile, specify `--variant`:
+Use the source-build workflow only when developing Retro-Go itself, such as extending
+or fixing its source and testing those changes. For ordinary installs, use
+`gwprov retro-go install` to download a published firmware release. Local builds use
+the same staging contract as downloaded releases. The storage variant is read from
+`--profile`; without a profile, specify `--variant`:
 
 ```console
 gwprov retro-go build --profile retro-go-profile --output dev-local/retro-go-build

@@ -1091,6 +1091,7 @@ gwprov retro-go config profile:retro-go-profile
 gwprov retro-go config profile:retro-go-profile --auto-start /roms/gb/Tetris.gb --timeout 0
 gwprov retro-go config profile:retro-go-profile --oc-level 2 --output build/CONFIG
 gwprov profile retro-go-profile media tree /
+# Source-build workflow for Retro-Go development only:
 gwprov retro-go build --profile retro-go-profile --path references/game-and-watch-retro-go-sd \
   --output dev-local/retro-go-build --dry-run
 gwprov media frogfs --retro-go-root references/game-and-watch-retro-go-sd [packer options]
@@ -1108,7 +1109,10 @@ Edit profile and device files with `media add`, `delete`, `ls`, and `tree`. Flas
 stores content in FrogFS and LittleFS; SD Retro-Go keeps content together on the SD card,
 with NOR used as a memory-mapped cache:
 
-`retro-go build` takes the storage variant from `--profile`; use `--variant flash|sd`
+Use `retro-go build` only when developing Retro-Go itself, such as extending or
+fixing its source and testing those changes. For ordinary installs, use
+`retro-go install` to download the published firmware. The source build takes the
+storage variant from `--profile`; use `--variant flash|sd`
 when building without a profile. SD builds run Retro-Go's `make release` and stage its
 `sd_content` output. Flash builds run `make all frogfs_image littlefs_image` and stage the
 two generated filesystem images directly. Both variants include the firmware ELF and a

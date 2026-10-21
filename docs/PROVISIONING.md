@@ -1,9 +1,14 @@
-# Build, stage, and provision Retro-Go content
+# Install and provision Retro-Go
 
 Run these commands from the gwprov checkout. Generated files belong in the ignored
 `dev-local/` directory. Source ROMs, firmware and CD files are read as inputs.
-The commands download released artifacts and execute the published WASM converters
-using Wasmtime's Python bindings; they do not require a Retro-Go source build.
+For a normal installation, use `gwprov retro-go install` to download the published
+Retro-Go firmware release, then create a profile and start it in GWemu or apply it
+to hardware. This path does not build Retro-Go or require its source checkout.
+`gwprov retro-go build` is a separate development workflow for people working on
+Retro-Go itself, such as extending or fixing it and testing those source changes.
+The release install and project commands download released artifacts and execute
+the published WASM converters using Wasmtime's Python bindings.
 SD-card image operations require mtools. On Debian or Ubuntu, install it with
 `sudo apt install mtools`. On macOS, install Python and mtools with Homebrew
 (`brew install python@3.11 mtools`) and create the environment with
@@ -22,27 +27,65 @@ python -m pip install -r requirements.txt
 The final launch also needs `gwemu` on PATH; a wrapper named `gwemu`
 is supported. The package depends on gnwmanager and reuses its bootloader release bindings.
 
-## Download firmware and install projects
+## Install a published Retro-Go release
 
 The default firmware repository is `sylverb/game-and-watch-retro-go-sd`.
+`retro-go install` downloads its published, prebuilt firmware and stages the
+content for `profile create`; it does not invoke the Retro-Go build system.
 `--variant flash` selects the published bank-2 firmware. `--version TAG` can
 pin a firmware or project release; resolved versions and inputs are recorded in
 local metadata. Use a new content root when choosing a different firmware/variant.
 
-### Build Retro-Go and run a local homebrew
-
-From a homebrew project checkout, build the Retro-Go base into a staging directory,
-build the homebrew with its own build instructions, install its GWRG dist bundle into
-the profile, then set Retro-Go to launch it:
+This is the regular install path for either a virtual or physical device:
 
 ```bash
-RETRO_GO=/path/to/game-and-watch-retro-go-sd
+CONTENT=dev-local/content/retro-go-demo
+PROFILE=dev-local/profiles/retro-go-demo
+
+gwprov retro-go install --variant flash --output "$CONTENT"
+# Optional: add project files here before creating the profile.
+gwprov profile create "$PROFILE" --content "$CONTENT"
+
+# Start a GWemu instance:
+gwprov start "profile:$PROFILE"
+
+# Or install on hardware and start Retro-Go from bank 2:
+gwprov device ls
+gwprov profile "$PROFILE" apply device:probe:PROBE_ID --start --bank 2
+```
+
+Use the stable probe ID shown by `gwprov device ls` for the hardware target.
+The GWemu and hardware commands are alternatives; run only the one matching
+where you want to instantiate the profile. To add games or project files, insert
+those install commands at the comment before `profile create`, as shown below.
+
+## Add projects to the release content (optional)
+
+Project releases and assets can be added to the same content root before creating
+the profile. This still uses the published Retro-Go firmware; it does not build
+Retro-Go from source. These commands replace the profile-creation line in the
+base-only example above:
+
+```bash
+CONTENT=dev-local/content/retro-go-demo
+
+gwprov retro-go install --variant flash --output "$CONTENT"
+gwprov project install smw --variant flash --output "$CONTENT" \
+  --input-dir "$HOME/Emulation/Roms/Super Nintendo"
+gwprov profile create dev-local/profiles/retro-go-demo --content "$CONTENT"
+```
+
+### Install a locally built homebrew
+
+Build the homebrew using its own documented build instructions, install its GWRG
+dist bundle into the profile, then set Retro-Go to launch it. The Retro-Go base
+in this example is still the published release:
+
+```bash
 CONTENT="$PWD/build/retro-go-content"
 PROFILE=dev-homebrew
 
-# Use --profile PROFILE instead when an existing profile should choose SD_CARD.
-gwprov retro-go build --variant flash --path "$RETRO_GO" \
-  --output "$CONTENT" --makevar MY_EXPERIMENT=123
+gwprov retro-go install --variant flash --output "$CONTENT"
 
 # Build the homebrew using its documented build command.
 
@@ -57,13 +100,11 @@ devices; `profile:` launches a new GWemu instance from that profile. Starting a
 physical device is unsupported. Use `gwprov device DEVICE reset` to reset
 hardware; `start` does not power-cycle or restart it.
 
-`retro-go build` supplies the firmware, debug ELF, storage artifacts, and local
-manifest. The `--makevar` value is passed to Retro-Go's Makefile. GWProv does not
-infer or run an arbitrary homebrew's build command: prepare the project bundle using
-the GWRG dist manifest and ZIP layout first. `project install` then verifies its
-declared files and installs them into the profile. To run on hardware, apply the
-profile with `gwprov profile PROFILE apply device:DEVICE --start --bank 2` instead
-of starting GWemu.
+GWProv does not infer or run an arbitrary homebrew's build command: prepare the
+project bundle using the GWRG dist manifest and ZIP layout first. `project install`
+then verifies its declared files and installs them into the profile.
+
+## Install project releases (optional)
 
 ```bash
 gwprov retro-go install --variant flash --output dev-local/content/retro-go-demo
@@ -118,14 +159,27 @@ that project-owned path from `.gwprov-projects.json`; unowned `.sfc`, `.smc`,
 `.fig` and `.swc` files remain filtered. SD content keeps the declared path
 directly.
 
-## Assemble and boot
+## Develop Retro-Go itself (optional)
+
+Use `gwprov retro-go build` only when working on Retro-Go source: for example, to
+add or fix Retro-Go behavior and test those changes. It runs the upstream build
+targets and requires a Retro-Go source checkout plus its toolchain and build
+dependencies. For ordinary installations, use `retro-go install` above to get the
+published firmware instead.
 
 ```bash
-gwprov profile create dev-local/profiles/retro-go-demo \
-  --content dev-local/content/retro-go-demo
+gwprov retro-go build --variant flash \
+  --path /path/to/game-and-watch-retro-go-sd \
+  --output dev-local/retro-go-build \
+  --makevar MY_EXPERIMENT=123
 
-gwprov start profile:dev-local/profiles/retro-go-demo
+gwprov profile create dev-local/profiles/retro-go-local \
+  --content dev-local/retro-go-build
 ```
+
+The build stages the firmware, debug ELF, storage artifacts, and local manifest.
+`--makevar` is passed to Retro-Go's Makefile. The resulting profile can be started
+in GWemu or applied to hardware using the commands in the previous section.
 
 ## Inspect and edit device filesystems
 

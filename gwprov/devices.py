@@ -134,6 +134,7 @@ def device_rows(profile: str | None = None, *, refresh: bool = False) -> list[di
                 "gdbPort": adapter["port"],
                 "gdbUrl": remote_url,
                 "remoteGdb": True,
+                "targetProfile": adapter.get("targetProfile"),
                 "status": status,
                 "application": "Unknown",
                 "installed": "Unknown",

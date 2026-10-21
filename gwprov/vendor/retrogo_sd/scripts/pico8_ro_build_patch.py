@@ -16,36 +16,117 @@ import struct
 PICO8_CODE_BASE = 0xBEEF0000
 
 
+def _thumb_mov_immediate(data: bytearray, offset: int, *, top: bool) -> tuple[int, int, int, int]:
+    first, second = struct.unpack_from("<HH", data, offset)
+    opcode = first & 0xFBF0
+    expected = 0xF2C0 if top else 0xF240
+    if opcode != expected:
+        raise ValueError(f"unexpected Thumb MOV{'T' if top else 'W'} opcode at {offset:#x}")
+    immediate = (
+        ((first & 0x000F) << 12)
+        | (((first >> 10) & 1) << 11)
+        | (((second >> 12) & 7) << 8)
+        | (second & 0x00FF)
+    )
+    return immediate, (second >> 8) & 0xF, first, second
+
+
+def _set_thumb_mov_immediate(
+    data: bytearray, offset: int, immediate: int, first: int, second: int
+) -> None:
+    first = (first & ~0x040F) | ((immediate >> 12) & 0x000F) | (((immediate >> 11) & 1) << 10)
+    second = (second & ~0x70FF) | (((immediate >> 8) & 7) << 12) | (immediate & 0x00FF)
+    struct.pack_into("<HH", data, offset, first, second)
+
+
 def patch_mapped_bytes(ro: bytes, target_xip_addr: int, base: int) -> tuple[bytes, int]:
-    """Relocate `base`-range sentinel refs to target_xip_addr. Returns (blob, patch_count).
+    """Relocate mapped XIP references, preferring an exact GWRL site table.
 
-    Only 4-byte-aligned words are considered, and only those whose value (with
-    bit 0 -- the Thumb bit -- masked off for the test) falls inside
-    [base, base + len(ro)), i.e. pointers into the blob itself. The delta is
-    added to the UNMASKED value so a Thumb pointer stays odd.
+    GWRL v2 blobs end in ABS32 offsets, MOVW/MOVT instruction-offset pairs,
+    and a 24-byte header (magic, version, link base, code size, and both site
+    counts). The trailer remains attached so profile rebuilds can reverse a
+    prior relocation and relocate again at the new FrogFS address.
 
-    This is a heuristic: ordinary data that happens to land in that range is
-    rewritten too. It is safe only because the sentinel is chosen far from any
-    plausible data value, which is a requirement on the project, not a property
-    of this function.
+    Blobs without a recognized trailer keep the historic aligned-word scan
+    used by PICO-8 and other existing mapped artifacts.
     """
-    code_size = len(ro)
     data = bytearray(ro)
-    offset_u32 = (target_xip_addr - base) & 0xFFFFFFFF
-    if offset_u32 >= 0x80000000:
-        offset_s32 = offset_u32 - 0x100000000
-    else:
-        offset_s32 = offset_u32
+    header_size = struct.calcsize("<4sIIIII")
+    if len(data) >= header_size:
+        magic, version, link_base, code_size, abs_count, mov_count = struct.unpack_from(
+            "<4sIIIII", data, len(data) - header_size
+        )
+        if magic == b"GWRL":
+            if version != 2:
+                raise ValueError(f"unsupported mapped relocation trailer version {version}")
+            abs_size = abs_count * 4
+            mov_size = mov_count * 8
+            table_start = len(data) - header_size - abs_size - mov_size
+            if table_start < 0 or code_size != table_start:
+                raise ValueError("invalid GWRL relocation trailer size")
+            if not code_size or link_base + code_size > 0x100000000:
+                raise ValueError("invalid GWRL link range")
+            abs_sites = [
+                struct.unpack_from("<I", data, table_start + i * 4)[0]
+                for i in range(abs_count)
+            ]
+            mov_table = table_start + abs_size
+            mov_pairs = [
+                struct.unpack_from("<II", data, mov_table + i * 8)
+                for i in range(mov_count)
+            ]
+            if abs_sites != sorted(set(abs_sites)):
+                raise ValueError("GWRL ABS32 sites must be sorted and unique")
+            if mov_pairs != sorted(set(mov_pairs)):
+                raise ValueError("GWRL MOVW/MOVT sites must be sorted and unique")
+            if any(offset & 3 or offset + 4 > code_size for offset in abs_sites):
+                raise ValueError("GWRL ABS32 site is unaligned or outside code")
+            if any(
+                low & 1 or high & 1 or low + 4 > code_size or high + 4 > code_size or low >= high
+                for low, high in mov_pairs
+            ):
+                raise ValueError("GWRL MOVW/MOVT site is unaligned or outside code")
 
-    patched = 0
-    n = (code_size // 4) * 4
+            delta = (target_xip_addr - base) & 0xFFFFFFFF
+            upper = base + code_size
+            for offset in abs_sites:
+                value = struct.unpack_from("<I", data, offset)[0]
+                masked = value & ~1
+                if not base <= masked < upper:
+                    raise ValueError(
+                        f"GWRL ABS32 at {offset:#x} points outside {base:#010x} range"
+                    )
+                struct.pack_into("<I", data, offset, (value + delta) & 0xFFFFFFFF)
+            for low, high in mov_pairs:
+                low_value, low_reg, low_first, low_second = _thumb_mov_immediate(
+                    data, low, top=False
+                )
+                high_value, high_reg, high_first, high_second = _thumb_mov_immediate(
+                    data, high, top=True
+                )
+                if low_reg != high_reg:
+                    raise ValueError(f"GWRL MOVW/MOVT register mismatch at {low:#x}/{high:#x}")
+                value = (high_value << 16) | low_value
+                masked = value & ~1
+                if not base <= masked < upper:
+                    raise ValueError(
+                        f"GWRL MOVW/MOVT at {low:#x}/{high:#x} points outside {base:#010x} range"
+                    )
+                relocated = (value + delta) & 0xFFFFFFFF
+                _set_thumb_mov_immediate(data, low, relocated & 0xFFFF, low_first, low_second)
+                _set_thumb_mov_immediate(data, high, relocated >> 16, high_first, high_second)
+            return bytes(data), len(abs_sites) + len(mov_pairs)
+
+    # Legacy heuristic for artifacts that do not carry a GWRL relocation table.
+    code_size = len(data)
     upper = base + code_size
-    for i in range(0, n, 4):
-        value = struct.unpack_from("<I", data, i)[0]
+    delta = (target_xip_addr - base) & 0xFFFFFFFF
+    patched = 0
+    for offset in range(0, (code_size // 4) * 4, 4):
+        value = struct.unpack_from("<I", data, offset)[0]
         masked = value & ~1
-        if masked >= base and masked < upper:
-            new_val = (value + offset_s32) & 0xFFFFFFFF
-            struct.pack_into("<I", data, i, new_val)
+        if base <= masked < upper:
+            struct.pack_into("<I", data, offset, (value + delta) & 0xFFFFFFFF)
             patched += 1
     return bytes(data), patched
 

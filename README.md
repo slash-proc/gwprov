@@ -2,7 +2,7 @@
 
 `gwprov` is the Python provisioning and control library for Game & Watch Retro-Go images, GWemu, and physical devices. It is intended to be consumed as a Python package and as a Git submodule.
 
-The initial package brings reusable target, SD-card, timeline, Retro-Go configuration, and build modules from Doug's own `../tinyemu` project into one package, alongside Retro-Go-SD's `REMOTE_INPUT` transport. Retro-Go build behavior is carried over as a compatibility wrapper; the build system itself remains owned by Retro-Go-SD.
+The package includes reusable target, SD-card, timeline, Retro-Go configuration, and build modules, alongside Retro-Go-SD's `REMOTE_INPUT` transport. Retro-Go build behavior is carried over as a compatibility wrapper; the build system itself remains owned by Retro-Go-SD.
 
 ## Install
 
@@ -945,6 +945,7 @@ uses the server's reset-and-halt followed by resume.
 GWProv can expose a named device through the gnwmanager WebSocket protocol:
 
 ```sh
+gwprov serve status
 gwprov serve device:retro-go-vm start
 # Give the URL to Web Builder or another gnwmanager WebSocket client.
 gwprov serve device:retro-go-vm stop
@@ -981,6 +982,13 @@ gwprov device ls
 gwprov debug python test-target
 ```
 
+Set or clear a registered endpoint's target profile in place:
+
+```sh
+gwprov adapters set-target-profile test-target --target-profile stm32h7b0
+gwprov adapters set-target-profile test-target --clear
+```
+
 The daemon polls registered raw GDB endpoints every five seconds and includes
 the observed firmware and execution state in `gwprov ps`. These polls read
 target state without sending halt, continue, reset, or watchdog-freeze writes;
@@ -990,6 +998,46 @@ execution-control writes. A GDB server may have its own connection behavior
 that changes execution state. GWProv's process lease coordinates its own local
 clients; the GDB server controls access for other clients. A raw GDB server
 does not provide GWProv's managed reset and project-autostart workflow.
+
+Watchdog behavior and halt-freeze state are available per device:
+
+```sh
+gwprov device DEVICE watchdog status
+gwprov device DEVICE watchdog freeze enable
+gwprov device DEVICE watchdog freeze disable
+gwprov device DEVICE watchdog runtime enable
+gwprov device DEVICE watchdog runtime disable
+```
+
+On STM32H7B0 hardware, this toggles DBGMCU bits that pause WWDG1/IWDG1 only
+while the CPU is halted. It does not disable a running watchdog; WWDG/IWDG
+cannot be stopped once started without reset. The explicit `runtime` action
+uses a separate capability and reports this limitation without changing
+halt-freeze bits. Raw GDB attach leaves freeze bits unchanged by default.
+Declare a remote target's register map when registering it with
+`--target-profile stm32h7b0`; unknown targets are reported unsupported without
+probing MMIO. The generic `gwprov device DEVICE controls` and `control CONTROL
+status|set` commands use this same extensible target-control registry.
+The Python debugger exposes `dbg.watchdog_status()`,
+`dbg.set_watchdog_freeze(True|False)`, `dbg.enable_watchdog_freeze()`, and
+`dbg.disable_watchdog_freeze()`. GWemu's watchdog devices are register-only
+stubs, so their run-time countdown/reset and debug-freeze behavior are reported
+as not modeled. On physical STM32H7B0, `watchdog status` reports WWDG1's active
+bit; IWDG1 runtime state is unknown because the peripheral exposes no readable
+started bit. A successful target-specific runtime setter must report verified
+effective state after the operation.
+
+A registered raw GDB endpoint can also be re-exported through the gnwmanager
+WebSocket protocol:
+
+```sh
+gwprov serve test-target start --port 8765
+gwprov serve test-target stop
+```
+
+The bridge connects to the raw GDB server only while a WebSocket client is
+attached. It holds a debug-session lease during that connection and lets the
+daemon resume polling after the client disconnects.
 
 The bridge accepts one WebSocket client at a time. While that client owns the
 bridge, the daemon yields its target connection and resumes polling after the
@@ -1125,7 +1173,7 @@ Retro-Go's idle standby timer, which is useful for unattended test runs.
 
 ## Structure and source provenance
 
-- `gwprov.common.target`, `sdcard`, `timeline`, `retrogo_config`, and `retrogo_build` are carried over from Doug's own `../tinyemu/scripts/common` modules.
+- `gwprov.common.target`, `sdcard`, `timeline`, `retrogo_config`, and `retrogo_build` provide target, media, timeline, configuration, and build support.
 - `gwprov.remote_input` is ported from Retro-Go-SD's shared remote-input script. Its bit layout and shadow address must stay in sync with `Core/Inc/gw_buttons.h` in that firmware.
 - GWemu profile parsing follows the `profile.toml` format in qemu-gnw. Large firmware and media files remain external profile data; they are not copied into this repository.
 
@@ -1428,7 +1476,6 @@ make lint
 
 `make check` runs lint, format, and tests with coverage in the active Python
 environment. `make ci` runs that same set of checks on every Python version
-used by CI (3.10, 3.12, and 3.14), in isolated temporary environments. The
-installed pre-push hook runs `make ci` and blocks the push if any check fails.
+used by CI (3.10, 3.12, and 3.14), in isolated temporary environments.
 Vendored source is excluded from Ruff and Black checks. Pre-commit hooks run
 locally only; the repository does not use pre-commit.ci automation.

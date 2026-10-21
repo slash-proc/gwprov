@@ -1,5 +1,5 @@
 import unittest
-from gwprov.debug_shell import DebugSession
+from gwprov.debug_shell import DebugSession, RemoteGDBBackend
 
 
 class WaitStopped(unittest.TestCase):
@@ -45,6 +45,55 @@ class WaitStopped(unittest.TestCase):
         self.assertTrue(result["stopped"])
         self.assertEqual(result["status"], "halted")
         self.assertEqual(result["registers"], {"pc": 0x08001234})
+
+    def test_remote_gdb_breakpoint_stays_halted_with_coherent_stop_pc(self):
+        # RemoteGDBBackend has no PyOCD target object: stop state comes from
+        # DHCSR, while register reads consult the backend's cached run state.
+        backend = RemoteGDBBackend.__new__(RemoteGDBBackend)
+        backend._is_running = True  # stale cache from before the hardware BKPT
+        backend.register_numbers = {
+            **{f"r{i}": i for i in range(13)},
+            "sp": 13,
+            "lr": 14,
+            "pc": 15,
+            "xpsr": 25,
+        }
+        pc = 0x08001235
+        commands = []
+        reads = []
+        control = []
+
+        def read_memory(address, size):
+            reads.append((address, size))
+            return (1 << 17).to_bytes(size, "little")  # DHCSR.S_HALT
+
+        def send(command):
+            commands.append(command)
+            name = next(
+                name
+                for name, index in backend.register_numbers.items()
+                if command == f"p{index:x}".encode("ascii")
+            )
+            value = pc if name == "pc" else 0
+            return value.to_bytes(4, "little").hex().encode("ascii")
+
+        backend.read_memory = read_memory
+        backend._send_command = send
+        backend._decode_hex = lambda reply, command: bytes.fromhex(reply.decode("ascii"))
+        backend.halt = lambda: control.append("halt")
+        backend.resume = lambda: control.append("resume")
+
+        result = DebugSession(backend, "hardware").wait_stopped(timeout=0.01)
+
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["status"], "halted")
+        self.assertEqual(result["registers"]["pc"], pc)
+        self.assertFalse(backend._is_running)
+        self.assertEqual(control, [])
+        self.assertEqual(len(commands), 17)
+        self.assertTrue(all(command.startswith(b"p") for command in commands))
+        self.assertTrue(reads)
+        self.assertTrue(all(item == (0xE000EDF0, 4) for item in reads))
 
 
 if __name__ == "__main__":

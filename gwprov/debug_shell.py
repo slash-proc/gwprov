@@ -904,11 +904,13 @@ class RemoteGDBBackend(GwemuGDBBackend):
         url: str | None = None,
         operation: str = "gwprov debug session",
         daemon_managed: bool = False,
+        target_profile: str | None = None,
     ):
         super().__init__(host=host, port=port)
         from .target_leases import TargetLease
 
         self.endpoint = url or f"gdb://{host}:{port}"
+        self.target_profile = target_profile
         self.daemon_managed = daemon_managed
         self._monitor_pause_token: str | None = None
         self._remote_lease = TargetLease(
@@ -922,7 +924,6 @@ class RemoteGDBBackend(GwemuGDBBackend):
 
     def open(self):
         from gnwmanager.ocdbackend.gdb_backend import GDBError
-        from contextlib import suppress
 
         try:
             if not self.daemon_managed:
@@ -946,8 +947,18 @@ class RemoteGDBBackend(GwemuGDBBackend):
                 self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self._socket.connect((self.host, self.port))
                 self._sock_file = self._socket.makefile("rb", buffering=8192)
-                with suppress(GDBError):
+                try:
                     self._send_command(b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+")
+                except GDBError as error:
+                    # A server may reject qSupported with an RSP error packet;
+                    # in that case we can still try the optional target XML and
+                    # use the standard register layout. Transport failures are
+                    # different: continuing would send qXfer on a dead socket
+                    # and obscure the original disconnect (often as EPIPE).
+                    if "GDB error response:" not in str(error):
+                        raise RuntimeError(
+                            f"remote GDB server disconnected during qSupported negotiation: {error}"
+                        ) from error
                 self._is_running = None
             except Exception as error:
                 cause = error.__cause__
@@ -959,7 +970,9 @@ class RemoteGDBBackend(GwemuGDBBackend):
                 self._load_register_numbers()
             except GDBError as error:
                 if "GDB error response:" not in str(error):
-                    raise
+                    raise RuntimeError(
+                        f"remote GDB server disconnected while reading target.xml: {error}"
+                    ) from error
                 self.register_numbers.clear()
                 self.target_xml_error = str(error)
             except RuntimeError as error:
@@ -993,10 +1006,17 @@ class RemoteGDBBackend(GwemuGDBBackend):
 class DebugSession:
     """Convenience API exposed as ``dbg`` in the interactive Python console."""
 
-    def __init__(self, backend, transport: str, qmp_socket: str | None = None):
+    def __init__(
+        self,
+        backend,
+        transport: str,
+        qmp_socket: str | None = None,
+        target_profile: str | None = None,
+    ):
         self.backend = backend
         self.transport = transport
         self.qmp_socket = qmp_socket
+        self.target_profile = target_profile or getattr(backend, "target_profile", None)
         if transport == "gwemu" and backend is not None:
             backend._control_audit_socket = qmp_socket
         self.symbols = SymbolTable()
@@ -1022,19 +1042,37 @@ class DebugSession:
             return "running" if self.backend._is_running else "halted"
         target = getattr(self.backend, "target", None)
         if target is not None:
-            return target.get_state().name.lower()
+            state = target.get_state().name.lower()
+            self._sync_backend_run_state(state)
+            return state
         # OpenOCD and remote gnwmanager both expose memory reads. DHCSR is a
         # non-invasive Cortex-M execution-state query.
         dhcsr = int.from_bytes(self.backend.read_memory(0xE000EDF0, 4), "little")
         if dhcsr & (1 << 17):
-            return "halted"
-        if dhcsr & (1 << 19):
-            return "lockup"
-        if dhcsr & (1 << 18):
-            return "sleeping"
-        if dhcsr & (1 << 25):
-            return "reset"
-        return "running"
+            state = "halted"
+        elif dhcsr & (1 << 19):
+            state = "lockup"
+        elif dhcsr & (1 << 18):
+            state = "sleeping"
+        elif dhcsr & (1 << 25):
+            state = "reset"
+        else:
+            state = "running"
+        self._sync_backend_run_state(state)
+        return state
+
+    def _sync_backend_run_state(self, state: str) -> None:
+        """Keep register-access decisions aligned with observed hardware state."""
+        if not hasattr(self.backend, "_is_running"):
+            return
+        if state == "halted":
+            self.backend._is_running = False
+        elif state in {"running", "sleeping"}:
+            self.backend._is_running = True
+        else:
+            # Reset and lockup are not safe states in which to issue a
+            # register read that may implicitly halt and resume the target.
+            self.backend._is_running = None
 
     def _target_is_running(self) -> bool:
         # Cortex-M core registers are not readable while the core is sleeping
@@ -1129,29 +1167,51 @@ class DebugSession:
         return self.backend.reset()
 
     def enable_watchdog_freeze(self) -> dict:
-        """Freeze the STM32H7 WWDG1 and IWDG1 counters while the core is halted.
+        """Freeze STM32H7 watchdogs only while the core is halted.
 
-        GW handheld hardware uses these DBGMCU bits so a debugger breakpoint
-        does not let either watchdog reset the device. The bits do not pause
-        watchdogs while firmware is running.
+        This does not disable a running WWDG or IWDG. Runtime watchdog control
+        is not a generic safe debugger operation. Raw remote-GDB sessions are
+        left untouched on attach; callers may opt in explicitly here.
         """
-        if self.transport != "hardware":
-            raise ValueError("watchdog freeze is available only for hardware targets")
-        from .hw_lifecycle import DBGMCU_APB3FZ1, DBGMCU_APB4FZ1, DBG_WWDG1, DBG_IWDG1
+        before = self.watchdog_status()
+        if not before["halt_freeze"]["supported"]:
+            raise ValueError(before["halt_freeze"]["detail"])
+        self.set_watchdog_freeze(True)
+        return {
+            name: {
+                "enabled": True,
+                "already_enabled": before["halt_freeze"][name]["enabled"],
+            }
+            for name in ("WWDG1", "IWDG1")
+        }
 
-        registers = (("WWDG1", DBGMCU_APB3FZ1, DBG_WWDG1), ("IWDG1", DBGMCU_APB4FZ1, DBG_IWDG1))
-        result = {}
-        for name, address, mask in registers:
-            before = self.u32(address)
-            if before == 0xFFFFFFFF:
-                raise RuntimeError(f"cannot read DBGMCU freeze register for {name}")
-            if not before & mask:
-                self.write_u32(address, before | mask)
-            after = self.u32(address)
-            if after == 0xFFFFFFFF or not after & mask:
-                raise RuntimeError(f"DBGMCU watchdog freeze for {name} did not enable")
-            result[name] = {"enabled": True, "already_enabled": bool(before & mask)}
-        return result
+    def disable_watchdog_freeze(self) -> dict:
+        """Clear STM32H7 debug-freeze bits; this does not disable the watchdogs."""
+        return self.set_watchdog_freeze(False)
+
+    def set_watchdog_freeze(self, enabled: bool) -> dict:
+        """Toggle a target-profile freeze control, not runtime watchdog state."""
+        return self.set_control("watchdog", "halt_freeze", enabled)
+
+    def control_status(self, name: str | None = None) -> dict:
+        """Report registered target controls without guessing peripheral maps."""
+        from .target_controls import control_status, controls_status
+
+        if name is None:
+            return controls_status(self, self.target_profile)
+        return control_status(self, name, self.target_profile)
+
+    def set_control(self, name: str, facet: str, enabled: bool) -> dict:
+        """Set a registered target control facet when this backend supports it."""
+        from .target_controls import set_control
+
+        return set_control(self, name, facet, enabled, self.target_profile)
+
+    def watchdog_status(self) -> dict:
+        """Report watchdog controls registered for this target profile."""
+        from .target_controls import watchdog_status
+
+        return watchdog_status(self, self.target_profile)
 
     def step(self):
         """Execute one instruction and leave the target halted."""
@@ -2948,7 +3008,13 @@ def _print_debug_api_help(
 
     print("\nDebug workflow notes")
     if target in {"hardware", "remote-gdb"}:
-        if watchdog_freeze:
+        if target == "remote-gdb":
+            note(
+                "Watchdogs: raw GDB attaches do not freeze watchdogs automatically. For a "
+                "supported hardware GDB target, call dbg.enable_watchdog_freeze() explicitly; "
+                "the bits freeze WWDG1/IWDG1 only while the CPU is halted."
+            )
+        elif watchdog_freeze:
             note(
                 "Watchdogs: GW H7 WWDG1/IWDG1 freeze bits are attempted automatically at attach. "
                 "When enabled, they freeze only while the CPU is halted. For pre-reset watchdog "
@@ -2982,9 +3048,9 @@ def _print_debug_api_help(
         )
     elif target == "remote-gdb":
         note(
-            "Raw GDB attach does not send halt, continue, reset, or watchdog-freeze writes. "
-            "The server itself may change target state on connect; that behavior is server-specific. "
-            "Use dbg.halt() or dbg.resume() when you want to control execution."
+            "Raw GDB attach does not send halt, continue, reset, or watchdog-freeze writes by "
+            "default. The server itself may change target state on connect; that behavior is "
+            "server-specific. Use dbg.halt() or dbg.resume() when you want to control execution."
         )
     if target == "hardware":
         note(
@@ -3033,6 +3099,7 @@ def python_shell(
     programmers: list[str] | None = None,
     remote_urls: list[str] | None = None,
     remote_origins: list[str] | None = None,
+    remote_target_profiles: list[str | None] | None = None,
     remote_gdb_endpoints: list[dict] | None = None,
     qmp_socket: str | None = None,
     debug_config: str | None = None,
@@ -3074,8 +3141,11 @@ def python_shell(
             )
         urls = remote_urls or []
         origins = remote_origins or []
+        target_profiles = remote_target_profiles or []
         if origins and len(origins) != len(urls):
             raise ValueError("provide one --remote-origin for each --remote-url")
+        if target_profiles and len(target_profiles) != len(urls):
+            raise ValueError("provide one target profile for each --remote-url")
         for index, remote_url in enumerate(urls):
             key = f"remote:{index + 1}"
             origin = origins[index] if origins else None
@@ -3085,6 +3155,7 @@ def python_shell(
                 operation="gwprov remote debug session",
                 allow_recovery_marker=True,
                 daemon_proxy=True,
+                target_profile=target_profiles[index] if target_profiles else None,
             )
         for endpoint in remote_gdb_endpoints or []:
             key = f"gdb:{endpoint['name']}"
@@ -3093,6 +3164,7 @@ def python_shell(
                 int(endpoint["port"]),
                 url=str(endpoint["url"]),
                 operation="gwprov remote GDB debug session",
+                target_profile=endpoint.get("targetProfile"),
             )
         if not backends:
             raise ValueError(
@@ -3147,7 +3219,9 @@ def python_shell(
                                 )
                 except Exception as error:
                     print(f"[{key}] installed firmware symbol lookup skipped: {error}")
-            session_target = "hardware" if target == "hardware" else target
+            session_target = (
+                "remote-gdb" if raw_gdb_target else "hardware" if target == "hardware" else target
+            )
             session = DebugSession(
                 backend, session_target, qmp_socket=qmp_socket if target == "gwemu" else None
             )

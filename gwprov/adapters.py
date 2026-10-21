@@ -76,13 +76,15 @@ def list_remote() -> list[dict[str, str | None]]:
             or not isinstance(row.get("url"), str)
         ):
             raise RuntimeError(f"invalid remote adapter entry in {path}")
-        result.append(
-            {
-                "name": row["name"],
-                "url": normalize_remote_url(row["url"]),
-                "origin": row.get("origin") if isinstance(row.get("origin"), str) else None,
-            }
-        )
+        item = {
+            "name": row["name"],
+            "url": normalize_remote_url(row["url"]),
+            "origin": row.get("origin") if isinstance(row.get("origin"), str) else None,
+        }
+        profile = _target_profile(row.get("targetProfile"))
+        if profile:
+            item["targetProfile"] = profile
+        result.append(item)
     return result
 
 
@@ -107,14 +109,16 @@ def list_gdb() -> list[dict[str, str | int]]:
             raise RuntimeError(f"invalid remote GDB entry in {path}")
         url = normalize_gdb_url(row["url"])
         parsed = urlparse(url)
-        result.append(
-            {
-                "name": row["name"],
-                "url": url,
-                "host": parsed.hostname or "",
-                "port": parsed.port or 0,
-            }
-        )
+        item = {
+            "name": row["name"],
+            "url": url,
+            "host": parsed.hostname or "",
+            "port": parsed.port or 0,
+        }
+        profile = _target_profile(row.get("targetProfile"))
+        if profile:
+            item["targetProfile"] = profile
+        result.append(item)
     return result
 
 
@@ -137,7 +141,23 @@ def inventory() -> list[dict]:
             return "busy" if operation_is_busy(owner) else available
         return available
 
-    for probe in enumerate_local_probes():
+    try:
+        local_probes = enumerate_local_probes()
+    except (ImportError, OSError, RuntimeError) as error:
+        # A missing optional USB/PyOCD stack must not hide registered remote
+        # transports; they have no dependency on local probe enumeration.
+        local_probes = []
+        rows.append(
+            {
+                "id": "probe:*",
+                "name": "Local probe discovery",
+                "adapter": "PyOCD / USB",
+                "type": "local discovery",
+                "state": "unknown",
+                "detail": f"Local probes unavailable: {error}",
+            }
+        )
+    for probe in local_probes:
         adapter_type = adapter_for_probe(f"{probe['vendor']} {probe['name']}") or probe["backend"]
         external = external_local_owner(adapter_type)
         owner = lease_owner(f"probe:{probe['id']}") or lease_owner(f"adapter:{adapter_type}")
@@ -175,6 +195,7 @@ def inventory() -> list[dict]:
                 "state": owner_state(owner, "registered"),
                 "url": remote["url"],
                 "origin": remote["origin"],
+                "targetProfile": remote.get("targetProfile"),
                 "detail": detail,
             }
         )
@@ -190,13 +211,20 @@ def inventory() -> list[dict]:
                 "type": "remote GDB",
                 "state": owner_state(owner, "registered"),
                 "url": remote["url"],
+                "targetProfile": remote.get("targetProfile"),
                 "detail": detail,
             }
         )
     return sorted(rows, key=lambda row: (row["type"], row["name"].casefold(), row["id"]))
 
 
-def add_remote(name: str, url: str, *, origin: str | None = None) -> dict[str, str | None]:
+def add_remote(
+    name: str,
+    url: str,
+    *,
+    origin: str | None = None,
+    target_profile: str | None = None,
+) -> dict[str, str | None]:
     name = name.strip()
     _validate_name(name)
     if origin is not None and any(char in origin for char in "\r\n"):
@@ -208,12 +236,18 @@ def add_remote(name: str, url: str, *, origin: str | None = None) -> dict[str, s
         raise ValueError(f"remote adapter name already exists: {name}")
     if any(row["url"] == url for row in rows):
         raise ValueError(f"remote adapter URL is already registered: {url}")
-    rows.append({"name": name, "url": url, "origin": origin})
+    row = {"name": name, "url": url, "origin": origin}
+    profile = _target_profile(target_profile)
+    if profile:
+        row["targetProfile"] = profile
+    rows.append(row)
     _write(rows, gdb_rows)
     return rows[-1]
 
 
-def add_gdb(name: str, url: str) -> dict[str, str | int]:
+def add_gdb(
+    name: str, url: str, *, target_profile: str | None = None
+) -> dict[str, str | int | str | None]:
     name = name.strip()
     _validate_name(name)
     url = normalize_gdb_url(url)
@@ -224,9 +258,50 @@ def add_gdb(name: str, url: str) -> dict[str, str | int]:
     if any(row["url"] == url for row in gdb_rows):
         raise ValueError(f"remote GDB endpoint is already registered: {url}")
     parsed = urlparse(url)
-    adapter = {"name": name, "url": url, "host": parsed.hostname or "", "port": parsed.port or 0}
-    _write(remote_rows, [*gdb_rows, {"name": name, "url": url}])
+    profile = _target_profile(target_profile)
+    adapter = {
+        "name": name,
+        "url": url,
+        "host": parsed.hostname or "",
+        "port": parsed.port or 0,
+    }
+    row = {"name": name, "url": url}
+    if profile:
+        row["targetProfile"] = profile
+        adapter["targetProfile"] = profile
+    _write(remote_rows, [*gdb_rows, row])
     return adapter
+
+
+def _target_profile(value: object) -> str | None:
+    if value is None:
+        return None
+    from .target_controls import registered_target_profiles
+
+    profiles = registered_target_profiles()
+    normalized = value.casefold() if isinstance(value, str) else ""
+    if normalized not in profiles:
+        known = ", ".join(profiles) or "none"
+        raise ValueError(f"target profile must be one of: {known}")
+    return normalized
+
+
+def set_target_profile(name_or_url: str, target_profile: str | None) -> dict[str, str | int | None]:
+    """Update target capability metadata without changing endpoint ownership."""
+    profile = _target_profile(target_profile)
+    remote_rows = list_remote()
+    gdb_rows = list_gdb()
+
+    for rows in (remote_rows, gdb_rows):
+        for row in rows:
+            if row["name"] == name_or_url or row["url"] == name_or_url:
+                if profile is None:
+                    row.pop("targetProfile", None)
+                else:
+                    row["targetProfile"] = profile
+                _write(remote_rows, gdb_rows)
+                return row
+    raise ValueError(f"remote adapter not found: {name_or_url}")
 
 
 def _validate_name(name: str) -> None:

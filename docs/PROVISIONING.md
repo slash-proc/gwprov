@@ -223,6 +223,14 @@ gwprov device ls
 gwprov debug python test-target
 ```
 
+Add or change an endpoint's target capability metadata without replacing its
+registry entry or affecting active ownership:
+
+```bash
+gwprov adapters set-target-profile test-target --target-profile stm32h7b0
+gwprov adapters set-target-profile test-target --clear
+```
+
 The daemon polls registered raw GDB endpoints every five seconds and reports
 observed execution and firmware state in `gwprov ps`. Polls read target state
 without sending halt, continue, reset, or watchdog-freeze writes; shell
@@ -234,11 +242,66 @@ not GWProv's managed reset-and-project-autostart sequence. GWProv coordinates
 its own local clients with a process lease; the GDB server controls access for
 clients on other machines.
 
+Watchdog behavior is inspectable for any listed device:
+
+```bash
+gwprov device DEVICE watchdog status
+gwprov device DEVICE watchdog freeze enable
+gwprov device DEVICE watchdog freeze disable
+gwprov device DEVICE watchdog runtime enable
+gwprov device DEVICE watchdog runtime disable
+```
+
+On STM32H7 hardware, freeze toggles DBGMCU bits that pause WWDG1/IWDG1 only
+while the CPU is halted. This does not disable a running watchdog. The
+`runtime enable|disable` action uses the separate runtime-control capability;
+STM32H7B0 currently reports that capability as not controllable once its
+watchdog is running, and the command fails without changing halt-freeze bits.
+A running FIT is unaffected by halt-freeze. Raw GDB sessions leave freeze bits
+unchanged by default. In `debug python`,
+`dbg.watchdog_status()` reports support and current state, while
+`dbg.set_watchdog_freeze(True|False)` toggles the halt-only behavior. GWemu's
+watchdog countdown/reset behavior is not modeled, so status reports it as not
+modeled and freeze commands are rejected.
+
+The generic `gwprov device DEVICE controls` and `control CONTROL status|set`
+commands use the same capability registry. New target controls belong in that
+registry; unsupported target/backend combinations fail closed without probing
+guessed MMIO addresses.
+
+Remote GDB and gnwmanager adapters do not identify the MCU register map. Declare
+the profile when registering a known STM32H7B0 endpoint before using its freeze
+control:
+
+```bash
+gwprov adapters add rpi400-hw gdb://HOST:PORT --target-profile stm32h7b0
+```
+
+For an endpoint already registered, use `gwprov adapters set-target-profile`
+instead of removing and re-adding it.
+
+Local PyOCD detects the STM32H7B0 profile from its target. For unknown targets,
+`watchdog status` reports the missing capability without probing MMIO; a freeze
+request returns that capability error. New target control profiles belong in
+GWProv's target-control registry, separate from transport selection.
+
+A registered raw GDB device can also be re-exported through the gnwmanager
+WebSocket protocol:
+
+```bash
+gwprov serve test-target start --port 8765
+gwprov serve test-target stop
+```
+
+The bridge connects to the GDB server while a WebSocket client is attached and
+holds a debug-session lease for that period. Polling resumes after disconnect.
+
 To let Web Builder or another gnwmanager WebSocket client connect through
 GWProv, start a local bridge for the explicit device and pass its printed URL
 to that client:
 
 ```bash
+gwprov serve status
 gwprov serve device:retro-go-vm start
 gwprov serve device:retro-go-vm stop
 ```

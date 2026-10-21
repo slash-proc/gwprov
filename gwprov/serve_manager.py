@@ -45,14 +45,40 @@ def _write_registry(rows: dict[str, dict]) -> None:
 
 
 def _worker_alive(row: dict) -> bool:
+    return _worker_state(row) != "stale"
+
+
+def _worker_state(row: dict) -> str:
     pid = row.get("pid")
     if not isinstance(pid, int) or pid <= 1:
-        return False
+        return "stale"
     try:
         process = psutil.Process(pid)
-        return "gwprov.serve_worker" in " ".join(process.cmdline())
-    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-        return False
+        return "serving" if "gwprov.serve_worker" in " ".join(process.cmdline()) else "stale"
+    except psutil.NoSuchProcess:
+        return "stale"
+    except (psutil.AccessDenied, OSError):
+        return "unknown"
+
+
+def status() -> list[dict]:
+    """List registered bridge workers and report their current process state."""
+    rows = _read_registry()
+    return [
+        {
+            "device": device_id,
+            "name": row.get("name") or device_id,
+            "kind": row.get("kind", "unknown"),
+            "state": _worker_state(row),
+            "url": row.get("url"),
+            "bind": row.get("bind"),
+            "port": row.get("port"),
+            "pid": row.get("pid"),
+            "started": row.get("started"),
+            "log": row.get("log"),
+        }
+        for device_id, row in sorted(rows.items())
+    ]
 
 
 def start(
@@ -130,6 +156,19 @@ def start(
             "probeId": str(device["probeId"]),
             "adapter": device.get("adapter"),
         }
+    elif device.get("kind") == "remote-gdb":
+        host = device.get("gdbHost")
+        gdb_port = device.get("gdbPort")
+        if not isinstance(host, str) or not host:
+            raise ValueError("remote GDB device has no host")
+        if not isinstance(gdb_port, int) or not 1 <= gdb_port <= 65535:
+            raise ValueError("remote GDB device has an invalid port")
+        target = {
+            "kind": "remote-gdb",
+            "host": host,
+            "port": gdb_port,
+            "url": device.get("gdbUrl") or f"gdb://{host}:{gdb_port}",
+        }
     else:
         raise ValueError(
             f"serve does not support this device backend: {device.get('backend', 'unknown')}"
@@ -169,6 +208,8 @@ def start(
 
     row = {
         "pid": process.pid,
+        "name": device.get("displayName") or device.get("name") or device_id,
+        "kind": device.get("kind", "unknown"),
         "bind": bind,
         "port": selected_port,
         "url": f"ws://{bind}:{selected_port}/gdb",

@@ -165,6 +165,11 @@ class SelectedPyOCDBackend(OCDBackend):
         probe = self.session.probe
         return getattr(probe, "product_name", None) or "PyOCD probe"
 
+    @property
+    def target_profile(self) -> str | None:
+        """Register-map profile for a target identified by PyOCD."""
+        return "stm32h7b0" if self._target_is_h7b0 else None
+
     def open(self):
         if self._daemon_proxy:
             from .daemon import open_target_session
@@ -400,6 +405,7 @@ class WebSocketBackend(OCDBackend):
         allow_recovery_marker: bool = False,
         daemon_managed: bool = False,
         daemon_proxy: bool = False,
+        target_profile: str | None = None,
     ):
         super().__init__()
         parsed = urlparse(uri)
@@ -414,6 +420,7 @@ class WebSocketBackend(OCDBackend):
         self._backend_name = "gnwmanager remote"
         self.version = (0, 0, 0)
         self._operation = operation
+        self.target_profile = target_profile
         self._daemon_proxy = daemon_proxy and not daemon_managed
         self._daemon_token: str | None = None
         self._daemon_heartbeat_stop = threading.Event()

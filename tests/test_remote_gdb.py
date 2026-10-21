@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -9,6 +10,7 @@ from gwprov.adapters import (
     list_gdb,
     list_remote,
     remove_remote,
+    set_target_profile,
 )
 
 
@@ -44,6 +46,76 @@ def test_remote_gdb_registry_coexists_with_gnwmanager_adapters(tmp_path, monkeyp
     assert remove_remote("test-target")["url"] == "gdb://debug-target.example.invalid:3333"
     assert list_gdb() == []
     assert len(list_remote()) == 1
+
+
+def test_adapter_target_profile_is_explicit_and_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setenv("GWPROV_CONFIG_DIR", str(tmp_path))
+
+    remote = add_remote("h7-manager", "ws://manager.example:8765/gdb", target_profile="stm32h7b0")
+    gdb = add_gdb("h7-gdb", "gdb://debug-target.example.invalid:3333", target_profile="stm32h7b0")
+
+    assert remote["targetProfile"] == "stm32h7b0"
+    assert gdb["targetProfile"] == "stm32h7b0"
+    assert list_remote()[0]["targetProfile"] == "stm32h7b0"
+    assert list_gdb()[0]["targetProfile"] == "stm32h7b0"
+
+    with pytest.raises(ValueError, match="target profile"):
+        add_gdb("unknown", "gdb://other.example:3333", target_profile="unknown-mcu")
+
+
+def test_adapter_target_profile_can_be_updated_without_reregistering(tmp_path, monkeypatch):
+    monkeypatch.setenv("GWPROV_CONFIG_DIR", str(tmp_path))
+    add_gdb("rpi400-hw", "gdb://10.2.3.122:3333")
+
+    updated = set_target_profile("rpi400-hw", "stm32h7b0")
+    assert updated["targetProfile"] == "stm32h7b0"
+    assert list_gdb()[0]["targetProfile"] == "stm32h7b0"
+    assert set_target_profile("rpi400-hw", None)["name"] == "rpi400-hw"
+    assert "targetProfile" not in list_gdb()[0]
+
+
+def test_registered_target_profile_is_accepted_without_adapter_or_cli_changes(
+    tmp_path, monkeypatch
+):
+    import importlib
+
+    from gwprov import target_controls
+    from gwprov.target_controls import register_target_control
+
+    cli = importlib.import_module("gwprov.cli.main")
+
+    monkeypatch.setenv("GWPROV_CONFIG_DIR", str(tmp_path))
+
+    class SyntheticControl:
+        name = "synthetic"
+        facet_names = ("runtime",)
+
+        def status(self, session, target_profile):
+            raise NotImplementedError
+
+        def set(self, session, facet, enabled, target_profile):
+            raise NotImplementedError
+
+    monkeypatch.setitem(target_controls._CONTROL_REGISTRY, "synthetic-mcu", {})
+    register_target_control("synthetic-mcu", SyntheticControl())
+
+    adapter = add_gdb(
+        "synthetic", "gdb://synthetic.example.invalid:3333", target_profile="SYNTHETIC-MCU"
+    )
+    assert adapter["targetProfile"] == "synthetic-mcu"
+
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "adapters",
+            "add",
+            "synthetic-2",
+            "gdb://synthetic-2.example.invalid:3333",
+            "--target-profile",
+            "synthetic-mcu",
+        ]
+    )
+    assert args.target_profile == "synthetic-mcu"
 
 
 @pytest.mark.parametrize(
@@ -85,6 +157,29 @@ def test_remote_gdb_inventory_is_metadata_only(tmp_path, monkeypatch):
     assert row["type"] == "remote GDB"
     assert row["state"] == "registered"
     assert row["url"] == "gdb://debug-target.example.invalid:3333"
+
+
+def test_adapter_inventory_keeps_remote_gdb_when_local_probe_discovery_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("GWPROV_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
+    add_gdb("rpi400-hw", "gdb://10.2.3.122:3333", target_profile="stm32h7b0")
+
+    import gwprov.backends
+
+    monkeypatch.setattr(
+        gwprov.backends,
+        "enumerate_local_probes",
+        lambda: (_ for _ in ()).throw(RuntimeError("PyOCD USB backend unavailable")),
+    )
+
+    rows = inventory()
+
+    remote = next(row for row in rows if row["name"] == "rpi400-hw")
+    local = next(row for row in rows if row["id"] == "probe:*")
+    assert remote["state"] == "registered"
+    assert remote["targetProfile"] == "stm32h7b0"
+    assert local["state"] == "unknown"
+    assert "PyOCD USB backend unavailable" in local["detail"]
 
 
 def test_device_inventory_and_completion_include_raw_gdb_without_connecting(tmp_path, monkeypatch):
@@ -205,6 +300,122 @@ def test_daemon_discovery_registers_remote_gdb_for_heartbeat_polling(tmp_path, m
     assert row["remoteGdb"] is True
 
 
+def test_device_snapshot_reaps_dead_remote_gdb_session_and_resumes_polling(tmp_path, monkeypatch):
+    monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
+
+    from gwprov import daemon
+
+    key = "remote-gdb:gdb://debug-target.example.invalid:3333"
+    service = daemon.Service()
+    service.last_discovery = time.monotonic()
+
+    class Poller:
+        def __init__(self):
+            self.key = key
+            self.finished = 0
+            self.state = {
+                "id": "gdb:debug-target.example.invalid:3333",
+                "kind": "remote-gdb",
+                "name": "test-target",
+                "status": "busy",
+                "busyOwner": {"pid": 3075016, "operation": "gwprov remote GDB debug session"},
+            }
+
+        def snapshot(self):
+            return self.state.copy()
+
+        def invalidate_installed(self):
+            pass
+
+        def operation_finished(self):
+            self.finished += 1
+            self.state.pop("busyOwner", None)
+            self.state.update(status="unknown", detail="Refreshing device state after operation")
+
+    poller = Poller()
+    service.hardware[key] = poller
+    service.leases["abandoned-session"] = {
+        "key": key,
+        "pid": 3075016,
+        "operation": "gwprov remote GDB debug session",
+        "lastHeartbeat": time.monotonic(),
+    }
+    service.hardware_pause_tokens[key] = {
+        "abandoned-session": {
+            "pid": 3075016,
+            "since": time.monotonic(),
+            "expires": time.monotonic() + 60,
+        }
+    }
+    service.hardware_paused.add(key)
+    monkeypatch.setattr(daemon, "_pid_exists", lambda pid: False)
+
+    rows = service.snapshot_devices()["devices"]
+
+    assert service.leases == {}
+    assert service.hardware_pause_tokens == {}
+    assert key not in service.hardware_paused
+    assert poller.finished == 1
+    assert rows[0]["id"] == "gdb:debug-target.example.invalid:3333"
+    assert rows[0]["status"] == "unknown"
+
+
+def test_device_snapshot_keeps_live_remote_gdb_session_paused(tmp_path, monkeypatch):
+    monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
+
+    from gwprov import daemon
+
+    key = "remote-gdb:gdb://debug-target.example.invalid:3333"
+    service = daemon.Service()
+    service.last_discovery = time.monotonic()
+
+    class Poller:
+        def __init__(self):
+            self.key = key
+            self.finished = 0
+            self.state = {
+                "id": "gdb:debug-target.example.invalid:3333",
+                "kind": "remote-gdb",
+                "status": "busy",
+            }
+
+        def snapshot(self):
+            return self.state.copy()
+
+        def invalidate_installed(self):
+            pass
+
+        def operation_finished(self):
+            self.finished += 1
+            self.state["status"] = "unknown"
+
+    poller = Poller()
+    service.hardware[key] = poller
+    service.leases["live-session"] = {
+        "key": key,
+        "pid": 3075016,
+        "operation": "gwprov remote GDB debug session",
+        "lastHeartbeat": time.monotonic(),
+    }
+    service.hardware_pause_tokens[key] = {
+        "live-session": {
+            "pid": 3075016,
+            "since": time.monotonic(),
+            "expires": time.monotonic() + 60,
+        }
+    }
+    service.hardware_paused.add(key)
+    monkeypatch.setattr(daemon, "_pid_exists", lambda pid: True)
+
+    rows = service.snapshot_devices()["devices"]
+
+    assert "live-session" in service.leases
+    assert "live-session" in service.hardware_pause_tokens[key]
+    assert key in service.hardware_paused
+    assert poller.finished == 0
+    assert rows[0]["status"] == "busy"
+
+
 def test_daemon_poller_records_remote_gdb_firmware_and_execution_state(tmp_path, monkeypatch):
     monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
     from gwprov import daemon, debug_shell, hw_lifecycle
@@ -300,6 +511,7 @@ def test_raw_gdb_device_selects_direct_debug_backend(tmp_path, monkeypatch):
         "gdbPort": 3333,
         "application": "Unknown",
         "installed": "Unknown",
+        "targetProfile": "stm32h7b0",
     }
     monkeypatch.setattr("gwprov.devices.device_rows", lambda: [row])
     captured = {}
@@ -318,6 +530,7 @@ def test_raw_gdb_device_selects_direct_debug_backend(tmp_path, monkeypatch):
             "host": "debug-target.example.invalid",
             "port": 3333,
             "url": "gdb://debug-target.example.invalid:3333",
+            "targetProfile": "stm32h7b0",
         }
     ]
 
@@ -422,6 +635,44 @@ def test_raw_gdb_backend_falls_back_when_target_xml_is_unsupported(tmp_path, mon
     backend.close()
 
 
+def test_raw_gdb_backend_stops_after_qsupported_transport_failure(tmp_path, monkeypatch):
+    from gnwmanager.ocdbackend.gdb_backend import GDBError
+
+    class FakeSocket:
+        def settimeout(self, timeout):
+            pass
+
+        def setsockopt(self, *args):
+            pass
+
+        def connect(self, endpoint):
+            pass
+
+        def makefile(self, *args, **kwargs):
+            return self
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
+    monkeypatch.setattr("gwprov.debug_shell.socket.socket", lambda *args: FakeSocket())
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend("debug-target.example.invalid", 3333, daemon_managed=True)
+    commands = []
+
+    def send(command):
+        commands.append(command)
+        raise GDBError("Socket error while writing to the GDB stub: [Errno 32] Broken pipe")
+
+    monkeypatch.setattr(backend, "_send_command", send)
+
+    with pytest.raises(RuntimeError, match="qSupported negotiation.*Broken pipe"):
+        backend.open()
+
+    assert commands == [b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+"]
+
+
 def test_debug_session_uses_gdb_remote_breakpoint_packets():
     from gwprov.debug_shell import DebugSession
 
@@ -441,3 +692,48 @@ def test_debug_session_uses_gdb_remote_breakpoint_packets():
     assert session.clear_bp(0x08001235) == "OK"
     assert backend.commands[-1] == b"z1,8001234,2"
     assert session.breakpoints() == []
+
+
+@pytest.mark.parametrize("transport", ("hardware", "remote-gdb"))
+def test_watchdog_freeze_is_available_for_hardware_gdb_transports(transport):
+    from gwprov.debug_shell import DebugSession
+    from gwprov.hw_lifecycle import DBGMCU_APB3FZ1, DBGMCU_APB4FZ1, DBG_WWDG1, DBG_IWDG1
+
+    class MemoryBackend:
+        def __init__(self):
+            self.memory = {DBGMCU_APB3FZ1: 0, DBGMCU_APB4FZ1: 0}
+            self.writes = []
+
+        def read_memory(self, address, size):
+            return self.memory[address].to_bytes(size, "little")
+
+        def write_memory(self, address, data):
+            value = int.from_bytes(data, "little")
+            self.writes.append((address, value))
+            self.memory[address] = value
+
+    backend = MemoryBackend()
+    session = DebugSession(backend, transport, target_profile="stm32h7b0")
+
+    result = session.enable_watchdog_freeze()
+
+    assert result == {
+        "WWDG1": {"enabled": True, "already_enabled": False},
+        "IWDG1": {"enabled": True, "already_enabled": False},
+    }
+    assert backend.writes == [
+        (DBGMCU_APB3FZ1, DBG_WWDG1),
+        (DBGMCU_APB4FZ1, DBG_IWDG1),
+    ]
+
+
+def test_watchdog_freeze_remains_unavailable_for_gwemu():
+    from gwprov.debug_shell import DebugSession
+
+    class Backend:
+        pass
+
+    session = DebugSession(Backend(), "gwemu")
+
+    with pytest.raises(ValueError, match="does not model"):
+        session.enable_watchdog_freeze()

@@ -183,6 +183,14 @@ def profile_launch_spec(
         ("extflash-image", profile.extflash),
     ]:
         cmd += ["-global", f"gnw-h7b0-soc.{prop}={path}"]
+    config = profile.root / "gwemu.toml"
+    if config.is_file():
+        import tomllib
+
+        settings = tomllib.loads(config.read_text())
+        extflash_chip = settings.get("general", {}).get("extflash_chip")
+        if extflash_chip:
+            cmd += ["-global", f"gnw-h7b0-soc.extflash-chip={extflash_chip}"]
     cmd += [
         "-display",
         "none" if headless else "gwemu",

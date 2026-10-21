@@ -785,6 +785,174 @@ def _device_runtime_control(args) -> int:
     raise ValueError(f"unsupported device action: {args.action}")
 
 
+def _print_watchdog_status(device: str, status: dict, output: str = "text") -> None:
+    report = {"device": device, **status}
+    if output == "json":
+        print(json.dumps(report, indent=2))
+        return
+    print(f"Device: {device}")
+    runtime = status["runtime_control"]
+    print(f"Runtime watchdog control: {runtime['status']} — {runtime['detail']}")
+    for action, state in runtime.get("actions", {}).items():
+        print(f"  runtime {action}: {state['status']} — {state['detail']}")
+    for name, enabled in runtime.get("state", {}).items():
+        value = "unknown" if enabled is None else ("active" if enabled else "inactive")
+        print(f"  runtime {name}: {value}")
+    if runtime.get("state_detail"):
+        print(f"  runtime state detail: {runtime['state_detail']}")
+    freeze = status["halt_freeze"]
+    print(f"Watchdog freeze while halted: {freeze['status']} — {freeze['detail']}")
+    for action, state in freeze.get("actions", {}).items():
+        print(f"  halt-freeze {action}: {state['status']} — {state['detail']}")
+    for name in ("WWDG1", "IWDG1"):
+        state = freeze.get(name)
+        if state is None:
+            continue
+        value = (
+            "unreadable"
+            if state.get("enabled") is None
+            else ("enabled" if state["enabled"] else "disabled")
+        )
+        print(f"  {name}: {value}")
+
+
+def _print_target_control_status(device: str, status: dict, output: str = "text") -> None:
+    """Print one or many registered target controls in a stable CLI format."""
+    report = {"device": device, **status}
+    if output == "json":
+        print(json.dumps(report, indent=2))
+        return
+    if "controls" not in status:
+        if (
+            status.get("name") == "watchdog"
+            and isinstance(status.get("runtime_control"), dict)
+            and isinstance(status.get("halt_freeze"), dict)
+        ):
+            _print_watchdog_status(device, status, output)
+            return
+        controls = {status.get("name", "control"): status}
+    else:
+        controls = status["controls"]
+    print(f"Device: {device}")
+    print(f"Target profile: {status.get('target', 'unknown')}")
+    for name, control in controls.items():
+        print(f"Control: {name} ({control.get('status', 'available')})")
+        facets = control.get("facets", {})
+        for facet_name, facet in facets.items():
+            detail = facet.get("detail", "")
+            print(f"  {facet_name}: {facet.get('status', 'unknown')} — {detail}")
+            for action_name, action in facet.get("actions", {}).items():
+                print(
+                    f"    {action_name}: {action.get('status', 'unknown')} — "
+                    f"{action.get('detail', '')}"
+                )
+            state = facet.get("state")
+            if isinstance(state, dict):
+                for item, enabled in state.items():
+                    value = "unknown" if enabled is None else "enabled" if enabled else "disabled"
+                    print(f"    {item}: {value}")
+            elif isinstance(facet.get("enabled"), bool):
+                value = "enabled" if facet["enabled"] else "disabled"
+                print(f"    state: {value}")
+
+
+def _device_watchdog(args) -> int:
+    row = _resolve_device_selector(args.device)
+    device_id = str(row.get("id", args.device))
+    kind = row.get("kind")
+    if kind == "gwemu":
+        from gwprov.debug_shell import DebugSession
+
+        session = DebugSession(None, "gwemu", target_profile=row.get("targetProfile"))
+        if args.watchdog_action == "status":
+            name = getattr(args, "control_name", "watchdog")
+            _print_target_control_status(device_id, session.control_status(name), args.output)
+            return 0
+        if args.watchdog_action == "list":
+            _print_target_control_status(device_id, session.control_status(), args.output)
+            return 0
+        name = getattr(args, "control_name", "watchdog")
+        facet = getattr(args, "facet", "halt_freeze")
+        session.set_control(name, facet, args.state == "enable")
+        return 0
+
+    backend = None
+    if kind in {"hardware", "remote-gdb"} and (
+        row.get("probeId") or device_id.startswith("probe:")
+    ):
+        from gwprov.backends import SelectedPyOCDBackend
+
+        backend = SelectedPyOCDBackend(
+            row.get("probeId") or device_id.removeprefix("probe:"),
+            operation="gwprov device watchdog",
+        )
+    elif kind in {"hardware", "remote-gdb"} and device_id.startswith("remote:"):
+        from gwprov.backends import WebSocketBackend
+
+        backend = WebSocketBackend(
+            device_id.removeprefix("remote:"),
+            origin=row.get("remoteOrigin"),
+            operation="gwprov device watchdog",
+            target_profile=row.get("targetProfile"),
+        )
+    elif kind in {"hardware", "remote-gdb"} and (
+        row.get("remoteGdb") or device_id.startswith("gdb:")
+    ):
+        from gwprov.debug_shell import RemoteGDBBackend
+
+        host, port = row.get("gdbHost"), row.get("gdbPort")
+        if not host or not port:
+            endpoint = device_id.removeprefix("gdb:")
+            if ":" not in endpoint:
+                raise ValueError(f"device {device_id!r} has no usable GDB endpoint")
+            host, port_text = endpoint.rsplit(":", 1)
+            port = int(port_text)
+        backend = RemoteGDBBackend(
+            str(host),
+            int(port),
+            url=row.get("gdbUrl"),
+            operation="gwprov device watchdog",
+        )
+    from gwprov.debug_shell import DebugSession
+
+    transport = (
+        "remote-gdb"
+        if row.get("remoteGdb") or device_id.startswith("gdb:")
+        else "hardware" if backend is not None else str(kind or "unsupported")
+    )
+    target_profile = row.get("targetProfile")
+    if backend is None:
+        session = DebugSession(None, transport, target_profile=target_profile)
+        if args.watchdog_action == "status":
+            name = getattr(args, "control_name", "watchdog")
+            _print_target_control_status(device_id, session.control_status(name), args.output)
+            return 0
+        if args.watchdog_action == "list":
+            _print_target_control_status(device_id, session.control_status(), args.output)
+            return 0
+        name = getattr(args, "control_name", "watchdog")
+        facet = getattr(args, "facet", "halt_freeze")
+        session.set_control(name, facet, args.state == "enable")
+    try:
+        if backend is not None:
+            backend.open()
+            session = DebugSession(backend, transport, target_profile=target_profile)
+            if args.watchdog_action == "status":
+                name = getattr(args, "control_name", "watchdog")
+                status = session.control_status(name)
+            elif args.watchdog_action == "list":
+                status = session.control_status()
+            else:
+                name = getattr(args, "control_name", "watchdog")
+                facet = getattr(args, "facet", "halt_freeze")
+                status = session.set_control(name, facet, args.state == "enable")
+            _print_target_control_status(device_id, status, args.output)
+            return 0
+    finally:
+        if backend is not None:
+            backend.close()
+
+
 def _device_logs(args) -> int:
     if args.lines < 1:
         raise ValueError("--lines must be positive")
@@ -823,7 +991,9 @@ def _device_screenshot(args) -> int:
         raise ValueError("screenshot currently supports managed GWemu devices")
     from gwprov.gwemu_manager import screenshot_instance
 
-    return screenshot_instance(pid=row.get("pid"), profile=row.get("profile"), output=args.output)
+    pid = row.get("pid")
+    profile = None if pid is not None else row.get("profile")
+    return screenshot_instance(pid=pid, profile=profile, output=args.output)
 
 
 def _device_stop(args) -> int:
@@ -858,6 +1028,47 @@ def _serve_device(args) -> int:
         print(f"Stopped serve session for {display}")
         print(f"  Endpoint: {result['url']}")
     return 0
+
+
+def _serve_status(args) -> int:
+    from gwprov import serve_manager
+
+    if args.device != "status":
+        raise ValueError("usage: gwprov serve status")
+    rows = serve_manager.status()
+    if args.output == "json":
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("No GWProv serve sessions.")
+        return 0
+
+    from rich.table import Table
+
+    table = Table(title=f"GWProv serve sessions ({len(rows)})", title_justify="left", expand=True)
+    table.add_column("NAME", style="bold")
+    table.add_column("DEVICE")
+    table.add_column("STATE", no_wrap=True)
+    table.add_column("WEBSOCKET")
+    table.add_column("PID", justify="right", no_wrap=True)
+    state_styles = {"serving": "green", "stale": "yellow", "unknown": "dim"}
+    for row in rows:
+        state = row["state"]
+        table.add_row(
+            str(row["name"]),
+            str(row["device"]),
+            Text(state.upper(), style=state_styles.get(state, "dim")),
+            str(row.get("url") or "Unknown"),
+            str(row.get("pid") or "Unknown"),
+        )
+    Console().print(table)
+    return 0
+
+
+def _normalize_serve_status_form(argv: list[str] | None) -> list[str] | None:
+    if argv and argv[0] == "serve" and len(argv) >= 2 and argv[1] == "status":
+        return ["serve", "status", "status", *argv[2:]]
+    return argv
 
 
 def _managed_gwemu_profile(args) -> str:
@@ -1300,8 +1511,33 @@ def _device_recover(args) -> int:
             lease_wait=0,
             allow_recovery_marker=True,
         )
+    elif device_id.startswith("gdb:"):
+        from gwprov.debug_shell import RemoteGDBBackend
+
+        host = row.get("gdbHost")
+        port = row.get("gdbPort")
+        if not host or not port:
+            raise ValueError(f"device {row.get('name') or device_id!r} has no usable GDB endpoint")
+        backend = RemoteGDBBackend(
+            host,
+            int(port),
+            url=row.get("gdbUrl"),
+            operation="gwprov recover",
+        )
+    elif device_id.startswith("gwemu:"):
+        from gwprov.debug_shell import GwemuGDBBackend
+
+        port = row.get("gdbPort")
+        if not port:
+            raise ValueError(
+                f"GWemu device {row.get('displayName') or device_id!r} has no GDB endpoint; "
+                "start it with a GDB port to load the recovery stub"
+            )
+        backend = GwemuGDBBackend(host="127.0.0.1", port=int(port))
     else:
-        raise ValueError("recover requires a physical hardware device")
+        raise ValueError(
+            f"device {row.get('displayName') or device_id!r} has no supported debug backend for recovery"
+        )
 
     from gwprov.hw_lifecycle import recover_flasher
 
@@ -1491,12 +1727,16 @@ def _adapters_add(args) -> int:
     if args.url.casefold().startswith("gdb://"):
         if args.origin:
             raise ValueError("--origin applies only to gnwmanager WebSocket endpoints")
-        adapter = add_gdb(args.name, args.url)
+        adapter = add_gdb(args.name, args.url, target_profile=args.target_profile)
     else:
-        adapter = add_remote(args.name, args.url, origin=args.origin)
+        adapter = add_remote(
+            args.name, args.url, origin=args.origin, target_profile=args.target_profile
+        )
     print(f"Added remote adapter {adapter['name']}: {adapter['url']}")
     if adapter.get("origin"):
         print(f"  Origin: {adapter['origin']}")
+    if adapter.get("targetProfile"):
+        print(f"  Target profile: {adapter['targetProfile']}")
     print("Use it with an explicit device target from `gwprov device ls`.")
     return 0
 
@@ -1506,6 +1746,18 @@ def _adapters_remove(args) -> int:
 
     adapter = remove_remote(args.name_or_url)
     print(f"Removed remote adapter {adapter['name']} ({adapter['url']})")
+    return 0
+
+
+def _adapters_set_target_profile(args) -> int:
+    from gwprov.adapters import set_target_profile
+
+    adapter = set_target_profile(args.name_or_url, None if args.clear else args.target_profile)
+    profile = adapter.get("targetProfile")
+    if profile:
+        print(f"Updated target profile for {adapter['name']}: {profile}")
+    else:
+        print(f"Cleared target profile for {adapter['name']}")
     return 0
 
 
@@ -2180,6 +2432,7 @@ def _debug_python(args) -> int:
     programmers = list(args.programmer)
     remote_urls = list(args.remote_url)
     remote_origins = list(args.remote_origin)
+    remote_target_profiles = []
     remote_gdb_endpoints = []
     detected_retro_go = None
     active_row = None
@@ -2231,6 +2484,7 @@ def _debug_python(args) -> int:
             origin = active_row.get("remoteOrigin")
             if origin:
                 remote_origins.append(origin)
+            remote_target_profiles.append(active_row.get("targetProfile"))
         elif active_row.get("remoteGdb"):
             remote_gdb_endpoints.append(
                 {
@@ -2238,6 +2492,7 @@ def _debug_python(args) -> int:
                     "host": active_row["gdbHost"],
                     "port": active_row["gdbPort"],
                     "url": active_row["gdbUrl"],
+                    "targetProfile": active_row.get("targetProfile"),
                 }
             )
         else:
@@ -2343,6 +2598,7 @@ def _debug_python(args) -> int:
         programmers=programmers,
         remote_urls=remote_urls,
         remote_origins=remote_origins,
+        remote_target_profiles=remote_target_profiles,
         remote_gdb_endpoints=remote_gdb_endpoints,
         symbols=symbol_paths,
         qmp_socket=qmp_socket,
@@ -3616,41 +3872,56 @@ def _project_install(args) -> int:
                 mapped_sources=sidecars,
             )
 
+        from pathlib import PurePosixPath
+
         for root, filesystem in partitions:
             if not root.is_dir():
                 continue
-            files = sorted(p for p in root.rglob("*") if p.is_file())
             mapped_paths = set(mapped_sources) if filesystem == "frogfs" else set()
+            files = sorted(
+                (p for p in root.rglob("*") if p.is_file()),
+                key=lambda p: (
+                    p.relative_to(root).as_posix() in mapped_paths,
+                    p.relative_to(root).as_posix().casefold(),
+                ),
+            )
             seeded_mapped = False
             for file_path in files:
                 rel = file_path.relative_to(root).as_posix()
-                is_mapped_file = rel in mapped_paths
-                if is_mapped_file and seeded_mapped:
-                    # The first FrogFS rebuild seeds every mapped payload from
-                    # its retained raw sidecar; do not add those files twice.
+                if rel in mapped_paths:
+                    # The first ordinary FrogFS rebuild seeds mapped payloads
+                    # from their raw sidecars. Never feed XiP files through the
+                    # ordinary file-copy path.
                     continue
                 target = "flash/ext" if filesystem != "fatfs" else "sd"
                 fs_option = filesystem if filesystem != "fatfs" else "fatfs"
                 sidecars = (
-                    [
-                        f"{path}={source}"
-                        for path, source in mapped_sources.items()
-                        if not (is_mapped_file and path == rel)
-                    ]
+                    [f"{path}={source}" for path, source in mapped_sources.items()]
                     if filesystem == "frogfs"
                     else []
                 )
+                parent = PurePosixPath(rel).parent.as_posix()
                 operate(
                     operation="add",
                     target=target,
                     profile=str(profile_root),
                     filesystem=fs_option,
-                    path=rel,
+                    path="" if parent == "." else parent,
                     source=str(file_path),
                     mapped_sources=sidecars,
                 )
                 if filesystem == "frogfs" and mapped_paths:
                     seeded_mapped = True
+            if filesystem == "frogfs" and mapped_paths and not seeded_mapped:
+                # A FrogFS containing only mapped files still needs one rebuild
+                # to place their sidecars at the new filesystem addresses.
+                operate(
+                    operation="rebuild",
+                    target="flash/ext",
+                    profile=str(profile_root),
+                    filesystem="frogfs",
+                    mapped_sources=[f"{path}={source}" for path, source in mapped_sources.items()],
+                )
         # Filesystem operations may update the FrogFS size in provision.json.
         # Merge project provenance after those operations so that layout update survives.
         provision = json.loads(provision_path.read_text()) if provision_path.is_file() else before
@@ -3784,9 +4055,9 @@ _gwprov_complete() {
   elif (( COMP_CWORD == 2 )); then
     case "$command" in
       show) candidates="adapters devices projects profile media sdcard perf performance $(_gwprov_device_targets)" ;;
-      adapters) candidates="list ls add remove rm" ;;
+      adapters) candidates="list ls add remove rm set-target-profile" ;;
       start) candidates="$(_gwprov_device_targets) $(_gwprov_explicit_profile_targets)" ;;
-      serve) candidates="$(_gwprov_device_targets)" ;;
+      serve) candidates="status $(_gwprov_device_targets)" ;;
       device) candidates="ls list $(_gwprov_device_targets)" ;;
       debug) candidates="python" ;;
       project) candidates="list ls versions info install stage-local" ;;
@@ -3804,7 +4075,9 @@ _gwprov_complete() {
     case "$command:$sub" in
       show:*) candidates="--output" ;;
       debug:python) candidates="$(_gwprov_device_targets)" ;;
-      serve:*) candidates="start stop" ;;
+      serve:*)
+        if [[ "$sub" == "status" ]]; then candidates="--output"; else candidates="start stop"; fi
+        ;;
       retro-go:config) candidates="$(_gwprov_resource_targets)" ;;
       profile:*)
         case "$sub" in
@@ -3884,9 +4157,9 @@ _gwprov() {
       if (( CURRENT == 3 )); then
         case $command in
           show) candidates=(adapters devices projects profile media sdcard perf performance ${(@f)$(_gwprov_device_targets)}) ;;
-          adapters) candidates=(list ls add remove rm) ;;
+          adapters) candidates=(list ls add remove rm set-target-profile) ;;
           start) candidates=(${(@f)$(_gwprov_device_targets)} ${(@f)$(_gwprov_explicit_profile_targets)}) ;;
-          serve) candidates=(${(@f)$(_gwprov_device_targets)}) ;;
+          serve) candidates=(status ${(@f)$(_gwprov_device_targets)}) ;;
           device) candidates=(ls list ${(@f)$(_gwprov_device_targets)}) ;;
           debug) candidates=(python) ;;
           project) candidates=(list ls versions info install stage-local) ;;
@@ -3915,7 +4188,7 @@ _gwprov() {
       elif [[ $command == show && CURRENT == 4 ]]; then
         candidates=(--output)
       elif [[ $command == serve && CURRENT == 4 ]]; then
-        candidates=(start stop)
+        if [[ $words[3] == status ]]; then candidates=(--output); else candidates=(start stop); fi
       elif [[ $command == media ]]; then
         if (( CURRENT == 4 )); then
           case $sub in
@@ -4047,6 +4320,9 @@ def _command_tree(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from gwprov.target_controls import registered_target_profiles
+
+    target_profiles = registered_target_profiles()
     parser = GWProvArgumentParser(
         prog="gwprov",
         description="Provision, inspect, and debug Game & Watch Retro-Go systems and GWemu.",
@@ -4126,12 +4402,25 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_add.add_argument(
         "--origin", help="Origin header required by a gnwmanager WebSocket server"
     )
+    adapter_add.add_argument(
+        "--target-profile",
+        choices=target_profiles,
+        help="declare a known target register map for device controls (required for remote targets)",
+    )
     adapter_add.set_defaults(handler=_adapters_add)
     adapter_remove = adapter_commands.add_parser(
         "remove", aliases=("rm",), help="remove a registered remote adapter"
     )
     adapter_remove.add_argument("name_or_url", metavar="NAME_OR_URL")
     adapter_remove.set_defaults(handler=_adapters_remove)
+    adapter_profile = adapter_commands.add_parser(
+        "set-target-profile", help="set target-specific control metadata for a remote adapter"
+    )
+    adapter_profile.add_argument("name_or_url", metavar="NAME_OR_URL")
+    profile_action = adapter_profile.add_mutually_exclusive_group(required=True)
+    profile_action.add_argument("--target-profile", choices=target_profiles)
+    profile_action.add_argument("--clear", action="store_true", help="remove target metadata")
+    adapter_profile.set_defaults(handler=_adapters_set_target_profile)
     device = commands.add_parser(
         "device",
         help="inspect or control one named device",
@@ -4142,7 +4431,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  gwprov device ls\n"
             "  gwprov device retro-go-vm pause\n"
             "  gwprov device device:probe:SERIAL media tree /CONFIG\n"
-            "  gwprov device probe:SERIAL recover"
+            "  gwprov device probe:SERIAL recover\n"
+            "  gwprov device gwemu:PID recover\n"
+            "  gwprov device gdb:HOST:PORT recover\n"
+            "  gwprov device DEVICE watchdog status\n"
+            "  gwprov device DEVICE watchdog freeze enable\n"
+            "  gwprov device DEVICE controls --output json\n"
+            "  gwprov device DEVICE control watchdog set halt_freeze disable"
         ),
     )
     device_commands = device.add_subparsers(dest="device_command", required=True, metavar="ACTION")
@@ -4196,14 +4491,16 @@ def build_parser() -> argparse.ArgumentParser:
     start_profile.set_defaults(handler=_start_profile)
     serve = commands.add_parser(
         "serve",
-        help="expose a device through the gnwmanager WebSocket protocol",
-        usage="gwprov serve DEVICE {start,stop} [OPTIONS]",
+        help="list or manage gnwmanager WebSocket bridges",
+        usage="gwprov serve status | gwprov serve DEVICE {start,stop} [OPTIONS]",
         description=(
-            "Start or stop a gnwmanager WebSocket bridge.\n"
+            "List, start, or stop gnwmanager WebSocket bridges.\n"
             "Default: loopback, with port allocation starting at 8766.\n\n"
             "Examples:\n"
+            "  gwprov serve status\n"
             "  gwprov serve device:gwemu:12345 start\n"
             "  gwprov serve device:probe:SERIAL start --port 8766\n"
+            "  gwprov serve openocd-gdb start --port 8765\n"
             "  gwprov serve device:gwemu:12345 stop"
         ),
     )
@@ -4222,6 +4519,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve_start.set_defaults(handler=_serve_device, action="start")
     serve_stop = serve_actions.add_parser("stop", help="stop the device's WebSocket bridge")
     serve_stop.set_defaults(handler=_serve_device, action="stop")
+    serve_status = serve_actions.add_parser("status", help="list all serve sessions")
+    serve_status.add_argument("--output", choices=("text", "json"), default="text")
+    serve_status.set_defaults(handler=_serve_status)
     stop_device = device_commands.add_parser(
         "stop", help="stop a managed GWemu device", usage="gwprov device DEVICE stop [OPTIONS]"
     )
@@ -4230,7 +4530,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop_device.set_defaults(handler=_device_stop)
     recover = device_commands.add_parser(
         "recover",
-        help="start or synchronize with a hardware recovery flasher",
+        help="start or synchronize with the device recovery flasher",
         usage="gwprov device DEVICE recover",
     )
     recover.add_argument("device", metavar="DEVICE")
@@ -4246,6 +4546,84 @@ def build_parser() -> argparse.ArgumentParser:
         )
         control.add_argument("device", metavar="DEVICE")
         control.set_defaults(handler=_device_runtime_control, action=action)
+    watchdog = device_commands.add_parser(
+        "watchdog",
+        help="inspect watchdog support or toggle hardware halt-freeze bits",
+        usage="gwprov device DEVICE watchdog {status,freeze,runtime} ...",
+        description=(
+            "Status works for every managed device.\n"
+            "Controls use an explicit target profile, not\n"
+            "the transport.\n\n"
+            "STM32H7B0 halt-freeze pauses watchdogs only\n"
+            "while the CPU is halted. It does not disable a\n"
+            "running watchdog or protect a running FIT.\n"
+            "Runtime off is unavailable once started.\n"
+            "GWemu watchdog behavior is not modeled.\n\n"
+            "Remote devices need --target-profile. Unknown\n"
+            "targets are unsupported without probing MMIO."
+        ),
+    )
+    watchdog.add_argument("device", metavar="DEVICE")
+    watchdog_commands = watchdog.add_subparsers(
+        dest="watchdog_action", required=True, metavar="ACTION"
+    )
+    watchdog_status = watchdog_commands.add_parser("status", help="show support and current state")
+    watchdog_status.add_argument("--output", choices=("text", "json"), default="text")
+    watchdog_status.set_defaults(handler=_device_watchdog)
+    watchdog_freeze = watchdog_commands.add_parser(
+        "freeze", help="enable or disable watchdog freeze while the core is halted"
+    )
+    watchdog_freeze.add_argument("state", choices=("enable", "disable"), metavar="STATE")
+    watchdog_freeze.set_defaults(
+        handler=_device_watchdog,
+        watchdog_action="freeze",
+        output="text",
+    )
+    watchdog_runtime = watchdog_commands.add_parser(
+        "runtime",
+        help="request runtime watchdog enable or disable (only on targets that support it)",
+        usage="gwprov device DEVICE watchdog runtime STATE",
+    )
+    watchdog_runtime.add_argument(
+        "state",
+        choices=("enable", "disable"),
+        metavar="STATE",
+        help="choose enable or disable; unsupported target actions fail without writes",
+    )
+    watchdog_runtime.set_defaults(
+        handler=_device_watchdog,
+        watchdog_action="runtime",
+        control_name="watchdog",
+        facet="runtime",
+        output="text",
+    )
+    controls = device_commands.add_parser(
+        "controls",
+        help="show target controls and which actions this device supports",
+        usage="gwprov device DEVICE controls [--output text|json]",
+    )
+    controls.add_argument("device", metavar="DEVICE")
+    controls.add_argument("--output", choices=("text", "json"), default="text")
+    controls.set_defaults(handler=_device_watchdog, watchdog_action="list")
+    control = device_commands.add_parser(
+        "control",
+        help="set one registered target control using its named capability facet",
+        usage="gwprov device DEVICE control CONTROL {status,set} ...",
+    )
+    control.add_argument("device", metavar="DEVICE")
+    control.add_argument("control_name", metavar="CONTROL")
+    control_actions = control.add_subparsers(
+        dest="watchdog_action", required=True, metavar="ACTION"
+    )
+    control_status = control_actions.add_parser(
+        "status", help="show control capabilities and state"
+    )
+    control_status.add_argument("--output", choices=("text", "json"), default="text")
+    control_status.set_defaults(handler=_device_watchdog)
+    control_set = control_actions.add_parser("set", help="enable or disable one control facet")
+    control_set.add_argument("facet", metavar="FACET")
+    control_set.add_argument("state", choices=("enable", "disable"), metavar="STATE")
+    control_set.set_defaults(handler=_device_watchdog, watchdog_action="set", output="text")
     logs = device_commands.add_parser(
         "logs",
         help="show or follow a managed device's runtime log",
@@ -5424,6 +5802,9 @@ def _normalize_device_object_form(argv: list[str] | None) -> list[str] | None:
         "halt",
         "resume",
         "reset",
+        "watchdog",
+        "controls",
+        "control",
         "logs",
         "screenshot",
         "duplicate",
@@ -5501,6 +5882,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = _normalize_profile_object_form(argv)
         argv = _normalize_device_object_form(argv)
         argv = _normalize_media_blob_form(argv)
+        argv = _normalize_serve_status_form(argv)
         args, forwarded = parser.parse_known_args(argv)
         args.forwarded = forwarded
         if forwarded and args.command not in {"media", "ofw"}:

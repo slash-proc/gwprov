@@ -54,6 +54,15 @@ def _backend(target: dict):
             lease_wait=0,
             daemon_proxy=True,
         )
+    if target.get("kind") == "remote-gdb":
+        from .debug_shell import RemoteGDBBackend
+
+        return RemoteGDBBackend(
+            str(target["host"]),
+            int(target["port"]),
+            url=str(target.get("url") or f"gdb://{target['host']}:{target['port']}"),
+            operation="gwprov remote GDB debug session",
+        )
     raise ValueError(f"unsupported serve target kind {target.get('kind')!r}")
 
 
@@ -62,7 +71,7 @@ async def _serve(target: dict, bind: str, port: int) -> None:
         from gnwmanager.server import serve_backend
     except ImportError as error:
         raise RuntimeError('WebSocket serving requires `pip install "gwprov[remote]"`') from error
-    backend_name = "gdb" if target.get("kind") == "gwemu" else "pyocd"
+    backend_name = "pyocd" if target.get("kind") == "hardware" else "gdb"
     await serve_backend(lambda: _backend(target), bind=bind, port=port, backend_name=backend_name)
 
 

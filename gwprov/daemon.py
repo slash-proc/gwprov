@@ -192,6 +192,7 @@ class HardwarePoller:
             "backend": "Remote GDB" if self.is_remote_gdb else probe.get("backend", "pyocd"),
             "name": probe.get("name", "STM32"),
             "probeId": probe.get("id"),
+            "targetProfile": probe.get("targetProfile"),
             "vendor": probe.get("vendor", ""),
             "status": "unknown",
             "application": "Unknown",
@@ -989,6 +990,14 @@ class Service:
 
     def snapshot_devices(self, *, refresh: bool = False) -> dict:
         """Serve cached state without waiting on unrelated target operations."""
+        # The snapshot request is handled outside the normal request lock so it
+        # stays responsive while an unrelated VM operation is running. Still
+        # reconcile dead lease owners here: the passive poll loop intentionally
+        # does not take that lock, and an abandoned target-pause token would
+        # otherwise leave a remote adapter permanently unpolled after its
+        # debugger client exits.
+        with self.lock:
+            self._reap()
         if not self.last_discovery or refresh:
             # The first inventory request after lazy startup waits for the
             # daemon's initial adapter discovery and state poll. Discovery is

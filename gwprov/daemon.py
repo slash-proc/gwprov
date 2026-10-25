@@ -658,6 +658,7 @@ class Service:
                     "process-binary-inode",
                     "timing-experimental-m7",
                     "timing-pacing",
+                    "guest-profile-recording",
                 ],
             }
         if operation in {"daemon-drain", "daemon-force-drain"}:
@@ -1065,6 +1066,9 @@ class Service:
                 audio=audio,
                 timeline=message.get("timeline"),
                 record_timeline=message.get("record_timeline"),
+                record_profile=message.get("record_profile"),
+                profile_interval_ms=message.get("profile_interval_ms"),
+                profile_symbols=message.get("profile_symbols"),
                 gdb_port=gdb_port,
                 qmp_stdio=True,
                 start_halted=bool(message.get("start_halted", False)),
@@ -1083,6 +1087,9 @@ class Service:
                 audio=audio,
                 timeline=message.get("timeline"),
                 record_timeline=message.get("record_timeline"),
+                record_profile=message.get("record_profile"),
+                profile_interval_ms=message.get("profile_interval_ms"),
+                profile_symbols=message.get("profile_symbols"),
                 gdb_port=gdb_port,
                 icount=message.get("icount"),
                 keep_temp=bool(message.get("keep_temp", False)),
@@ -1859,6 +1866,19 @@ def require_timing_support(timing_mode, pacing=None):
         )
 
 
+def require_profile_recording_support(
+    record_profile, profile_interval_ms=None, profile_symbols=None
+):
+    if record_profile is None and profile_interval_ms is None and not profile_symbols:
+        return
+    capabilities = request({"op": "ping"}, timeout=1.0).get("capabilities", [])
+    if "guest-profile-recording" not in capabilities:
+        raise RuntimeError(
+            "running GWProv daemon does not support --record-profile; finish active "
+            "VM/hardware operations and let the idle daemon exit before retrying"
+        )
+
+
 def start_instance(
     profile: str,
     *,
@@ -1867,6 +1887,9 @@ def start_instance(
     headless: bool = False,
     timeline: str | None = None,
     record_timeline: str | None = None,
+    record_profile: str | None = None,
+    profile_interval_ms: int | None = None,
+    profile_symbols: list[str] | None = None,
     start_halted: bool = False,
     shared_sd_root: str | None = None,
     timing_mode: str = "default",
@@ -1875,9 +1898,18 @@ def start_instance(
     rtc_epoch: int | None = None,
     gwemu_bin: str | None = None,
 ) -> dict:
+    from .timeline_launch import validate_profile_recording
+
+    resolved_record, _, resolved_symbols = validate_profile_recording(
+        record_profile, profile_interval_ms, profile_symbols
+    )
+    if resolved_record is not None:
+        record_profile = str(resolved_record)
+        profile_symbols = [str(path) for path in resolved_symbols]
     ensure_running()
     require_binary_override_support(gwemu_bin)
     require_timing_support(timing_mode, pacing)
+    require_profile_recording_support(record_profile, profile_interval_ms, profile_symbols)
     return request(
         {
             "op": "start-vm",
@@ -1887,6 +1919,9 @@ def start_instance(
             "headless": headless,
             "timeline": timeline,
             "record_timeline": record_timeline,
+            "record_profile": record_profile,
+            "profile_interval_ms": profile_interval_ms,
+            "profile_symbols": profile_symbols,
             "start_halted": start_halted,
             "shared_sd_root": shared_sd_root,
             "timing_mode": timing_mode,
@@ -1907,6 +1942,9 @@ def start_image(
     headless: bool = False,
     timeline: str | None = None,
     record_timeline: str | None = None,
+    record_profile: str | None = None,
+    profile_interval_ms: int | None = None,
+    profile_symbols: list[str] | None = None,
     icount: int | None = None,
     keep_temp: bool = False,
     timing_mode: str = "default",
@@ -1914,9 +1952,18 @@ def start_image(
     rtc_epoch: int | None = None,
     gwemu_bin: str | None = None,
 ) -> dict:
+    from .timeline_launch import validate_profile_recording
+
+    resolved_record, _, resolved_symbols = validate_profile_recording(
+        record_profile, profile_interval_ms, profile_symbols
+    )
+    if resolved_record is not None:
+        record_profile = str(resolved_record)
+        profile_symbols = [str(path) for path in resolved_symbols]
     ensure_running()
     require_binary_override_support(gwemu_bin)
     require_timing_support(timing_mode, pacing)
+    require_profile_recording_support(record_profile, profile_interval_ms, profile_symbols)
     return request(
         {
             "op": "start-vm",
@@ -1926,6 +1973,9 @@ def start_image(
             "headless": headless,
             "timeline": timeline,
             "record_timeline": record_timeline,
+            "record_profile": record_profile,
+            "profile_interval_ms": profile_interval_ms,
+            "profile_symbols": profile_symbols,
             "icount": icount,
             "keep_temp": keep_temp,
             "timing_mode": timing_mode,

@@ -22,6 +22,16 @@ RawDescriptionRichHelpFormatter.help_markup = False
 RawDescriptionRichHelpFormatter.text_markup = False
 
 
+def _profile_interval_ms(value: str) -> int:
+    try:
+        interval = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 60000") from exc
+    if not 1 <= interval <= 60000:
+        raise argparse.ArgumentTypeError("must be from 1 to 60000")
+    return interval
+
+
 class GWProvArgumentParser(argparse.ArgumentParser):
     """Use the same terminal-aware help style at every command level."""
 
@@ -1117,6 +1127,9 @@ def _start_profile(args) -> int:
             or args.headless
             or args.timeline
             or args.record_timeline
+            or args.record_profile
+            or args.profile_interval_ms is not None
+            or args.profile_symbols
             or args.timing_mode != "default"
             or args.icount is not None
             or args.pacing is not None
@@ -1144,6 +1157,9 @@ def _start_profile(args) -> int:
         headless=args.headless,
         timeline=args.timeline,
         record_timeline=args.record_timeline,
+        record_profile=args.record_profile,
+        profile_interval_ms=args.profile_interval_ms,
+        profile_symbols=args.profile_symbols,
         timing_mode=args.timing_mode,
         icount=args.icount,
         pacing=args.pacing,
@@ -4467,6 +4483,18 @@ def build_parser() -> argparse.ArgumentParser:
     start_profile.add_argument("--headless", action="store_true")
     start_profile.add_argument("--timeline")
     start_profile.add_argument("--record-timeline")
+    start_profile.add_argument(
+        "--record-profile", metavar="PATH",
+        help="record GWemu guest timeline samples as JSONL (works headless; requires a profiling-capable daemon)",
+    )
+    start_profile.add_argument(
+        "--profile-interval-ms", type=_profile_interval_ms, metavar="N",
+        help="sample interval in milliseconds, 1–60000 (default: 100; requires --record-profile)",
+    )
+    start_profile.add_argument(
+        "--profile-symbols", action="append", metavar="MANIFEST",
+        help="symbol manifest to load for recording; repeatable and requires --record-profile",
+    )
     start_profile.add_argument(
         "--timing-mode", choices=("default", "baseline", "experimental-m7"), default="default"
     )

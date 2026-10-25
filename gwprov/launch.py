@@ -72,6 +72,9 @@ def image_launch_spec(
     audio: bool = False,
     timeline: str | None = None,
     record_timeline: str | None = None,
+    record_profile: str | None = None,
+    profile_interval_ms: int | None = None,
+    profile_symbols: list[str] | None = None,
     gdb_port: int | None = None,
     icount: int | None = None,
     timing_mode: str = "default",
@@ -131,7 +134,14 @@ def image_launch_spec(
             timing_mode=timing_mode, icount=icount, pacing=pacing, rtc_epoch=rtc_epoch
         )
         env = dict(os.environ)
-        from .timeline_launch import configure_timeline
+        from .timeline_launch import configure_profile_recording, configure_timeline
+
+        configure_profile_recording(
+            env,
+            record_profile=record_profile,
+            profile_interval_ms=profile_interval_ms,
+            profile_symbols=profile_symbols,
+        )
 
         configure_timeline(
             env, timeline=timeline, record_timeline=record_timeline, headless=headless
@@ -156,6 +166,9 @@ def profile_launch_spec(
     audio: bool = False,
     timeline: str | None = None,
     record_timeline: str | None = None,
+    record_profile: str | None = None,
+    profile_interval_ms: int | None = None,
+    profile_symbols: list[str] | None = None,
     gdb_port: int | None = None,
     qmp_socket: str | None = None,
     qmp_stdio: bool = False,
@@ -223,8 +236,14 @@ def profile_launch_spec(
     env = dict(os.environ)
     env["XDG_DATA_HOME"] = str(profile.root / "runtime")
     env["XDG_CONFIG_HOME"] = str(profile.root / "runtime/config")
-    from .timeline_launch import configure_timeline
+    from .timeline_launch import configure_profile_recording, configure_timeline
 
+    configure_profile_recording(
+        env,
+        record_profile=record_profile,
+        profile_interval_ms=profile_interval_ms,
+        profile_symbols=profile_symbols,
+    )
     configure_timeline(env, timeline=timeline, record_timeline=record_timeline, headless=headless)
     return cmd, profile.root, env, profile.root / "gwemu.log"
 

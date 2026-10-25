@@ -170,6 +170,9 @@ def _profile_region(profile_name: str, target: str):
     metadata_path = profile.root / "provision.json"
     metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
     layout = metadata.get("layout", {})
+    firmware = metadata.get("firmware", {})
+    if not isinstance(firmware, dict):
+        firmware = {}
     lfs_size = int(layout.get("littlefsBytes", 0))
     ext_size = int(layout.get("extflashBytes", profile.extflash.stat().st_size))
     frog_offset = int(layout.get("frogfsOffset", -1))
@@ -193,7 +196,7 @@ def _profile_region(profile_name: str, target: str):
             "lfs_offset": lfs_offset,
             "lfs_size": lfs_size,
             "ext_size": ext_size,
-            "block_size": int(metadata.get("firmware", {}).get("littlefsBlockSize", 4096)),
+            "block_size": int(firmware.get("littlefsBlockSize", 4096)),
         },
     )
 

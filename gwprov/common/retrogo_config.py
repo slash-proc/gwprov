@@ -47,6 +47,9 @@ STARTUP_FILE_LEN = 256
 BROWSE_SUBPATH_LEN = 96
 RESERVED_APP_LEN = 32
 CONFIG_SIZE = 416  # asserted below
+AUTOSTART_CFG_MARKER = 0xA5
+AUTOSTART_MODE_OFF = 0
+AUTOSTART_MODE_ON = 2
 
 
 def rom_path(dirname, filename):
@@ -75,10 +78,22 @@ def build(
     cursor=0,
     browse_subpath="",
     debug_clock_always_on=0,
+    reserved_app=b"",
+    autostart_mode=None,
 ):
     """Return the packed /CONFIG bytes, CRC included."""
     if len(startup_file) >= STARTUP_FILE_LEN:
         raise ValueError("startup_file too long")
+
+    reserved = bytearray(reserved_app)
+    if len(reserved) > RESERVED_APP_LEN:
+        raise ValueError("reserved_app too long")
+    reserved.extend(bytes(RESERVED_APP_LEN - len(reserved)))
+    if autostart_mode is not None:
+        if not 0 <= autostart_mode <= 6:
+            raise ValueError("autostart_mode must be between 0 and 6")
+        reserved[0] = AUTOSTART_CFG_MARKER
+        reserved[1] = autostart_mode
 
     blob = struct.pack(
         "<I"  # magic
@@ -113,7 +128,7 @@ def build(
         browse_subpath.encode(),
         debug_clock_always_on,
         welcome_prompt,
-        b"",
+        bytes(reserved),
         0,
     )
     if len(blob) != CONFIG_SIZE:
@@ -152,6 +167,7 @@ def build_from_values(values: dict, **overrides) -> bytes:
         "debug_clock_always_on": int(bool(values.get("debug_clock_always_on", False))),
         "start_action": values.get("start_action", START_ACTION_RESUME),
         "welcome_prompt": values.get("welcome_prompt", 1),
+        "reserved_app": bytes.fromhex(values.get("reserved_app_hex", "")),
     }
     current.update({key: value for key, value in overrides.items() if value is not None})
     return build(**current)

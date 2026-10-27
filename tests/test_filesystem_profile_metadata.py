@@ -18,7 +18,11 @@ class ProfileRegionMetadata(unittest.TestCase):
         self.assertEqual(self._region_for_firmware({"littlefsBlockSize": 8192}), 8192)
 
     def _region_for_firmware(self, firmware):
-        root = Path(tempfile.mkdtemp(prefix="profile-region-", dir=os.environ.get("TMPDIR", Path(__file__).parent)))
+        root = Path(
+            tempfile.mkdtemp(
+                prefix="profile-region-", dir=os.environ.get("TMPDIR", Path(__file__).parent)
+            )
+        )
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         (root / "extflash.bin").write_bytes(bytes(16 * 1024))
         (root / "profile.toml").write_text(

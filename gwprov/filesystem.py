@@ -14,6 +14,8 @@ import tempfile
 import zlib
 from pathlib import Path, PurePosixPath
 
+from .mapped_relocations import project_relocation_tables
+
 
 def _safe_name(value: str) -> str:
     normalized = value.replace("\\", "/").lstrip("/")
@@ -267,7 +269,7 @@ def _read_frogfs(image: Path, offset: int, destination: Path) -> None:
             path.write_bytes(data)
 
 
-def _mapped_artifacts(profile_root: Path) -> list[tuple[str, int]]:
+def _mapped_artifacts(profile_root: Path) -> list[tuple[str, int | None]]:
     """Read mapped FrogFS payload declarations from generic profile metadata."""
     metadata_path = profile_root / "provision.json"
     if not metadata_path.is_file():
@@ -282,16 +284,23 @@ def _mapped_artifacts(profile_root: Path) -> list[tuple[str, int]]:
         if not isinstance(project, dict):
             continue
         for item in project.get("mapped", []):
-            if not isinstance(item, dict) or "path" not in item or "relocBase" not in item:
-                raise ValueError("mapped FrogFS declarations require path and relocBase")
+            if not isinstance(item, dict) or "path" not in item:
+                raise ValueError("mapped FrogFS declarations require a path")
             path = _safe_name(item["path"])
             parts = PurePosixPath(path).parts
             if not parts or parts[0] not in {"cores", "homebrews"} or ".." in parts:
                 raise ValueError(f"invalid mapped FrogFS path: {path!r}")
-            base = item["relocBase"]
-            base = int(base, 0) if isinstance(base, str) else base
-            if not isinstance(base, int) or not 0 <= base <= 0xFFFFFFFF:
-                raise ValueError(f"invalid mapped FrogFS relocation base for {path}")
+            raw_base = item.get("relocBase")
+            base = None
+            if raw_base is not None:
+                if isinstance(raw_base, bool):
+                    raise ValueError(f"invalid mapped FrogFS relocation base for {path}")
+                try:
+                    base = int(raw_base, 0) if isinstance(raw_base, str) else int(raw_base)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid mapped FrogFS relocation base for {path}") from exc
+                if not 0 <= base <= 0xFFFFFFFF:
+                    raise ValueError(f"invalid mapped FrogFS relocation base for {path}")
             if path in seen:
                 raise ValueError(f"duplicate mapped FrogFS path: {path}")
             seen.add(path)
@@ -368,7 +377,8 @@ def _build_frogfs(
     output: Path,
     work: Path,
     *,
-    mapped_artifacts: list[tuple[str, int]] | None = None,
+    mapped_artifacts: list[tuple[str, int | None]] | None = None,
+    exact_relocations: dict | None = None,
     contiguous_paths: list[str] | None = None,
     extflash_base: int = 0x90000000,
     extflash_offset: int = 0,
@@ -422,6 +432,8 @@ def _build_frogfs(
         from frogfs_pico8_ro import patch_frogfs_mapped_inplace
 
         for logical_path, reloc_base in mapped_artifacts:
+            if reloc_base is None or logical_path in (exact_relocations or {}):
+                continue
             if not patch_frogfs_mapped_inplace(
                 output,
                 logical_path=logical_path,
@@ -430,6 +442,17 @@ def _build_frogfs(
                 extflash_offset=extflash_offset,
             ):
                 raise ValueError(f"could not relocate mapped FrogFS payload: {logical_path}")
+
+    if exact_relocations:
+        from .mapped_relocations import patch_frogfs_exact
+
+        patch_frogfs_exact(
+            output,
+            mapped_artifacts=mapped_artifacts,
+            tables=exact_relocations,
+            extflash_offset=extflash_offset,
+            extflash_base=extflash_base,
+        )
 
 
 def _mount_littlefs(image: Path, offset: int, size: int, block_size: int):
@@ -833,6 +856,7 @@ def operate(
                 built,
                 work,
                 mapped_artifacts=mapped_artifacts,
+                exact_relocations=project_relocation_tables(metadata.get("projects", {})),
                 contiguous_paths=contiguous_paths,
                 extflash_offset=offset,
             )

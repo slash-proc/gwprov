@@ -19,7 +19,16 @@ VERSIONS_SCHEMA = 1
 MANIFEST_SCHEMA = 1
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_PUBLISHED_BYTES = 512 * 1024 * 1024
+MAX_INPUT_RANGE_BYTES = 256 * 1024 * 1024
+DEFAULT_WASM_FUEL = 500_000_000_000
+MAX_WASM_FUEL = 10_000_000_000_000
 DEFAULT_CATALOG_REPO = "sylverb/game-and-watch-retro-go-sd"
+
+
+def _validate_wasm_fuel(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= MAX_WASM_FUEL:
+        raise ValueError(f"WASM fuel must be between 1 and {MAX_WASM_FUEL}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -295,9 +304,22 @@ def _target_dir(target: dict[str, Any], role: str, system: str | None = None) ->
     raise ValueError(f"unknown install role {role!r}")
 
 
+def _range_input_enabled(tool: dict[str, Any]) -> bool:
+    processor = tool.get("processor", {})
+    extensions = processor.get("extensions", {}) if isinstance(processor, dict) else None
+    if extensions is None:
+        extensions = {}
+    if not isinstance(extensions, dict) or any(
+        name != "range-input" or version != 1 for name, version in extensions.items()
+    ):
+        raise ValueError(f"unsupported processor extensions {extensions!r}")
+    return extensions.get("range-input") == 1
+
+
 def _input_files(
     tool: dict[str, Any], file_specs: list[str], dir_specs: list[str], *, require_slots: bool
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    range_input = _range_input_enabled(tool)
     slots: dict[str, list[Path]] = {}
     for spec in file_specs:
         if "=" not in spec:
@@ -362,16 +384,34 @@ def _input_files(
                 raise ValueError(f"input file does not exist: {path}")
             extensions = spec.get("extensions", [])
             max_bytes = int(spec.get("maxBytes", 0))
-            name, data = read_input(
-                path, extensions=set(extensions), max_bytes=max_bytes or 512 * 1024 * 1024
+            stream_source = range_input and spec.get("unmatched") != "passthrough" and (
+                path.suffix.casefold() != ".zip" or ".zip" in {e.casefold() for e in extensions}
             )
+            if stream_source:
+                size = path.stat().st_size
+                if max_bytes and size > max_bytes:
+                    raise ValueError(f"{path.name}: {size} bytes exceeds maxBytes={max_bytes}")
+                name = path.name
+                if extensions and Path(name).suffix.casefold() not in {e.casefold() for e in extensions}:
+                    raise ValueError(f"{name}: expected extension from {', '.join(sorted(extensions))}")
+                digest = hashlib.sha1()
+                with path.open("rb") as source:
+                    while chunk := source.read(8 * 1024 * 1024):
+                        digest.update(chunk)
+                data = None
+                sha1 = digest.hexdigest()
+            else:
+                name, data = read_input(
+                    path, extensions=set(extensions), max_bytes=max_bytes or 512 * 1024 * 1024
+                )
+                size = len(data)
+                if max_bytes and size > max_bytes:
+                    raise ValueError(f"{name}: {size} bytes exceeds maxBytes={max_bytes}")
+                sha1 = hashlib.sha1(data).hexdigest()
             name = _plain_name(name)
-            if max_bytes and len(data) > max_bytes:
-                raise ValueError(f"{name}: {len(data)} bytes exceeds maxBytes={max_bytes}")
-            sha1 = hashlib.sha1(data).hexdigest()
             variants = spec.get("variants", [])
             variant = next((v for v in variants if str(v.get("sha1", "")).lower() == sha1), None)
-            if variant and variant.get("bytes") is not None and len(data) != int(variant["bytes"]):
+            if variant and variant.get("bytes") is not None and size != int(variant["bytes"]):
                 raise ValueError(
                     f"{name}: size does not match recognised variant {variant.get('id', '')!r}"
                 )
@@ -383,14 +423,27 @@ def _input_files(
                 warnings.append(
                     f"{name}: unrecognised input accepted by slot {slot!r} (strict=false)"
                 )
-            prepared.append({"slot": slot, "filename": name, "bytes": data, "variant": variant})
+            prepared.append({
+                "slot": slot,
+                "filename": name,
+                "bytes": data,
+                "path": path if data is None else None,
+                "size": size,
+                "sha1": sha1,
+                "variant": variant,
+            })
     # A tool may declare one required file globally but mark its input slots optional only when uses is optional.
     return prepared, warnings
 
 
 def _run_wasm(
-    wasm: bytes, tool: dict[str, Any], inputs: list[dict[str, Any]]
+    wasm: bytes,
+    tool: dict[str, Any],
+    inputs: list[dict[str, Any]],
+    *,
+    fuel: int = DEFAULT_WASM_FUEL,
 ) -> list[dict[str, Any]]:
+    fuel = _validate_wasm_fuel(fuel)
     try:
         import wasmtime
     except ImportError as exc:
@@ -400,6 +453,7 @@ def _run_wasm(
     processor = tool.get("processor", {})
     if processor.get("type") != "wasm" or processor.get("version") != 1:
         raise ValueError(f"unsupported processor {processor!r}")
+    range_input = _range_input_enabled(tool)
     binary = tool.get("binary", {})
     if (
         len(wasm) != binary.get("bytes")
@@ -413,6 +467,7 @@ def _run_wasm(
     module = wasmtime.Module(engine, wasm)
     if module.imports:
         raise ValueError("converter WASM imports are not allowed")
+    range_input = _range_input_enabled(tool)
     abi_signatures = {
         "abi_version": (0, 1),
         "alloc": (1, 1),
@@ -435,6 +490,17 @@ def _run_wasm(
         "warnings_ptr": (0, 1),
         "warnings_len": (0, 1),
     }
+    range_signatures = {
+        "input_stream_add": (2, 1),
+        "input_request_index": (0, 1),
+        "input_request_offset_lo": (0, 1),
+        "input_request_offset_hi": (0, 1),
+        "input_request_len": (0, 1),
+        "input_request_buffer_ptr": (0, 1),
+        "input_supply": (2, 1),
+    }
+    if range_input:
+        abi_signatures.update(range_signatures)
     exported = {e.name: e for e in module.exports}
     required_names = set(abi_signatures) | {"memory"}
     if not required_names <= set(exported):
@@ -466,7 +532,7 @@ def _run_wasm(
         if any(str(v) != "i32" for v in (*ftype.params, *ftype.results)):
             raise ValueError(f"converter export {name!r} must use i32 values")
     store = wasmtime.Store(engine)
-    store.set_fuel(100_000_000_000)
+    store.set_fuel(fuel)
     instance = wasmtime.Instance(store, module, [])
     exports = instance.exports(store)
     names = {e.name for e in module.exports}
@@ -502,6 +568,10 @@ def _run_wasm(
     def u32(value: int) -> int:
         return value & 0xFFFFFFFF
 
+    def i32(value: int) -> int:
+        value &= 0xFFFFFFFF
+        return value if value < 0x80000000 else value - 0x100000000
+
     def read(ptr: int, length: int, cap: int) -> bytes:
         ptr, length = u32(ptr), u32(length)
         if length > cap or ptr + length > memory.data_len(store):
@@ -518,15 +588,28 @@ def _run_wasm(
         raise ValueError(f"converter failed ({u32(code)}): {message}".rstrip())
 
     exports["input_clear"](store)
+    input_sources: dict[int, tuple[Path, int] | None] = {}
     for item in inputs:
-        payload = item["bytes"]
+        payload = item.get("bytes")
+        if payload is None:
+            if not range_input or item.get("path") is None:
+                raise ValueError("converter input has no in-memory bytes or range source")
+            size = int(item["size"])
+            index = u32(exports["input_stream_add"](store, i32(size), i32(size >> 32)))
+            if index in input_sources:
+                raise ValueError("converter reused an input source index")
+            input_sources[index] = (Path(item["path"]), size)
+            continue
         ptr = u32(exports["alloc"](store, len(payload)))
         if ptr == 0 and payload:
             raise ValueError(f"converter could not allocate input {item['filename']}")
         if ptr + len(payload) > memory.data_len(store):
             raise ValueError("converter allocated input outside its memory")
         memory.write(store, payload, ptr)
-        exports["input_add"](store, ptr, len(payload))
+        index = u32(exports["input_add"](store, ptr, len(payload)))
+        if index in input_sources:
+            raise ValueError("converter reused an input source index")
+        input_sources[index] = None
     code = u32(exports["run_begin"](store, 0))
     if code:
         fail(code)
@@ -534,6 +617,33 @@ def _run_wasm(
         code = u32(exports["run_step"](store))
         if code == 0:
             break
+        if code == 2 and range_input:
+            index = u32(exports["input_request_index"](store))
+            offset = (u32(exports["input_request_offset_hi"](store)) << 32) | u32(
+                exports["input_request_offset_lo"](store)
+            )
+            length = u32(exports["input_request_len"](store))
+            ptr = u32(exports["input_request_buffer_ptr"](store))
+            source_info = input_sources.get(index)
+            if source_info is None:
+                raise ValueError("converter requested a range from an unknown or non-streamed input")
+            source_path, source_size = source_info
+            if length == 0 or length > MAX_INPUT_RANGE_BYTES:
+                raise ValueError(f"converter requested an invalid input range length: {length}")
+            if offset > source_size or length > source_size - offset:
+                raise ValueError("converter requested an input range beyond end of file")
+            if ptr + length > memory.data_len(store):
+                raise ValueError("converter requested an input range outside its memory")
+            with source_path.open("rb") as source:
+                source.seek(offset)
+                payload = source.read(length)
+            if len(payload) != length:
+                raise ValueError("short read while servicing converter input range")
+            memory.write(store, payload, ptr)
+            response = u32(exports["input_supply"](store, length, 1))
+            if response:
+                fail(response)
+            continue
         if code != 1:
             fail(code)
     else:
@@ -593,7 +703,9 @@ def install_project(
     game_files: list[str] | None = None,
     game_dirs: list[str] | None = None,
     bundle_path: str | Path | None = None,
+    wasm_fuel: int = DEFAULT_WASM_FUEL,
 ) -> dict[str, Any]:
+    wasm_fuel = _validate_wasm_fuel(wasm_fuel)
     if variant not in {None, "flash", "sd"}:
         raise ValueError("variant must be 'flash' or 'sd'")
     if firmware_files and bios_files or firmware_dirs and bios_dirs:
@@ -718,6 +830,20 @@ def install_project(
             raise ValueError(f"SHA-256 mismatch for {filename}")
         return data
 
+    from ..mapped_relocations import mapped_declaration
+
+    # Reject unsupported methods and malformed tables before fetching files or
+    # executing a converter. Actual pointer ranges are checked after placement.
+    selected_outputs = [
+        spec for use in target.get("uses", [])
+        for tool in resolved.manifest.get("tools", []) if tool["id"] == use["tool"]
+        for spec in tool.get("outputs", []) if spec["id"] in use.get("outputs", [])
+    ]
+    for spec in [*target.get("artifacts", []), *selected_outputs]:
+        declaration = mapped_declaration(spec, spec.get("filename", ""), source_size=spec.get("bytes", spec.get("maxBytes")))
+        if declaration and spec in selected_outputs and (kind != "homebrew" or not spec.get("filename")):
+            raise ValueError("mapped converter outputs require a fixed-name homebrew output")
+
     for artifact in target.get("artifacts", []):
         filename = _plain_name(artifact.get("filename", ""))
         data = fetch_asset(artifact)
@@ -729,21 +855,9 @@ def install_project(
             mapped=is_mapped,
         )
         if is_mapped:
-            raw_base = artifact.get("relocBase")
-            try:
-                reloc_base = int(raw_base, 0) if isinstance(raw_base, str) else int(raw_base)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"mapped artifact {filename} needs an integer relocBase") from exc
-            if not 0 <= reloc_base <= 0xFFFFFFFF:
-                raise ValueError(
-                    f"mapped artifact {filename} relocBase is outside the 32-bit address space"
-                )
-            mapped_artifacts.append(
-                {
-                    "path": (_target_dir(target, "artifact") / filename).as_posix(),
-                    "relocBase": reloc_base,
-                }
-            )
+            mapped_artifacts.append(mapped_declaration(
+                artifact, (_target_dir(target, "artifact") / filename).as_posix(), source_size=len(data)
+            ))
     symbol_specs = target.get("symbols", [])
     if not isinstance(symbol_specs, list):
         raise ValueError("target symbols must be a list")
@@ -980,7 +1094,7 @@ def install_project(
                 "tool": tool_id,
                 "slot": item["slot"],
                 "filename": item["filename"],
-                "sha1": hashlib.sha1(item["bytes"]).hexdigest(),
+                "sha1": item["sha1"],
                 "variant": (item.get("variant") or {}).get("id"),
             }
             for item in prepared
@@ -1009,7 +1123,7 @@ def install_project(
         outputs: list[tuple[dict[str, Any], bytes, dict[str, Any]]] = []
         produced_ids: set[str] = set()
         for group in groups:
-            for converted in _run_wasm(wasm, tool, group):
+            for converted in _run_wasm(wasm, tool, group, fuel=wasm_fuel):
                 produced_ids.add(converted["output_id"])
                 input_item = group[0] if group else {"filename": "output", "variant": None}
                 spec = next(o for o in tool.get("outputs", []) if o["id"] == converted["output_id"])
@@ -1068,7 +1182,10 @@ def install_project(
                 # The manifest and known input variant name the same game. Keep the shipped,
                 # release-verified bytes as the single install item.
                 continue
-            add(output_path, data, f"converter:{tool_id}/{input_item['filename']}")
+            declaration = mapped_declaration(spec, output_path.as_posix(), source_size=len(data))
+            add(output_path, data, f"converter:{tool_id}/{input_item['filename']}", mapped=declaration is not None)
+            if declaration is not None:
+                mapped_artifacts.append(declaration)
 
     # When a recognized variant resolves to the same filename as a shipped game, keep the
     # release-verified shipped bytes and represent the game only once in the staging plan.

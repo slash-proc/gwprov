@@ -96,7 +96,7 @@ def _ready_flasher(backend, gnw, *, yes: bool = False):
         start_gnwmanager_verified,
     )
 
-    state = inspect_target_mode(backend)
+    state = inspect_target_mode(backend, verify_flash_vtor_mailbox=True)
     if state["stubDetected"]:
         if not state["stubAlive"]:
             raise RuntimeError(

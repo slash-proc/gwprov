@@ -198,7 +198,10 @@ def profile_launch_spec(
         cmd += ["-global", f"gnw-h7b0-soc.{prop}={path}"]
     config = profile.root / "gwemu.toml"
     if config.is_file():
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
 
         settings = tomllib.loads(config.read_text())
         extflash_chip = settings.get("general", {}).get("extflash_chip")

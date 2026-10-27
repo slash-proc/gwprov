@@ -685,7 +685,7 @@ def apply_deployment(
         )
 
         gnw = GnW(backend)
-        mode = inspect_target_mode(backend)
+        mode = inspect_target_mode(backend, verify_flash_vtor_mailbox=True)
         if mode["stubDetected"] and mode["stubAlive"]:
             report("phase", message="Attaching to gnwmanager RAM programmer")
             mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
@@ -811,7 +811,7 @@ def apply_deployment(
             # This branch intentionally leaves the RAM service running. It may
             # retain a flash VTOR, so use the builder's mailbox + running-core
             # liveness check for this explicit post-write verification.
-            state = inspect_target_mode(backend)
+            state = inspect_target_mode(backend, verify_flash_vtor_mailbox=True)
             if not state["stubDetected"] or not state["stubAlive"]:
                 raise RuntimeError(
                     "deployment wrote the selected regions, but the RAM flasher is no "

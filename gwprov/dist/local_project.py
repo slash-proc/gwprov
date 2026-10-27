@@ -115,16 +115,26 @@ def stage_local_project(manifest_path: str | Path, *, output: str | Path) -> dic
                 )
             relative = _safe_relpath("/".join(mapped_path))
             base = map_info.get("relocBase")
-            if isinstance(base, str):
-                try:
-                    base_value = int(base, 0)
-                except ValueError as exc:
-                    raise ValueError("mapped relocBase must be an integer") from exc
-            elif isinstance(base, int):
-                base_value = base
-            else:
-                raise ValueError("mapped artifact needs relocBase")
-            mapped.append({"path": relative.as_posix(), "relocBase": base_value})
+            mapped_entry = {"path": relative.as_posix()}
+            if base is not None:
+                if isinstance(base, bool):
+                    raise ValueError("mapped relocBase must be an integer")
+                if isinstance(base, str):
+                    try:
+                        base_value = int(base, 0)
+                    except ValueError as exc:
+                        raise ValueError("mapped relocBase must be an integer") from exc
+                elif isinstance(base, int):
+                    base_value = base
+                else:
+                    raise ValueError("mapped relocBase must be an integer")
+                if not 0 <= base_value <= 0xFFFFFFFF:
+                    raise ValueError("mapped relocBase is outside the 32-bit address space")
+                mapped_entry["relocBase"] = base_value
+            if "relocations" in map_info:
+                from ..mapped_relocations import validate_exact_relocations
+                mapped_entry["relocations"] = validate_exact_relocations(map_info["relocations"], source_size=len(data))
+            mapped.append(mapped_entry)
         planned.append((destination, data, metadata))
 
     symbol_entries = target.get("symbols", [])

@@ -26,6 +26,19 @@ from elftools.elf.sections import SymbolTableSection
 from elftools.dwarf.callframe import FDE, RegisterRule
 from gnwmanager.ocdbackend.gdb_backend import GDBBackend
 
+# Cortex-M CoreDebug DHCSR single-step support for explicitly profiled targets.
+_CORTEX_M_DHCSR = 0xE000EDF0
+_CORTEX_M_DHCSR_KEY = 0xA05F0000
+_CORTEX_M_C_DEBUGEN = 1 << 0
+_CORTEX_M_C_HALT = 1 << 1
+_CORTEX_M_C_STEP = 1 << 2
+_CORTEX_M_C_MASKINTS = 1 << 3
+_CORTEX_M_C_SNAPSTALL = 1 << 5
+_CORTEX_M_DHCSR_CONTROL_MASK = 0x0F | _CORTEX_M_C_SNAPSTALL
+_CORTEX_M_S_REGRDY = 1 << 16
+_CORTEX_M_S_HALT = 1 << 17
+_CORTEX_M_STEP_TIMEOUT_S = 0.1
+
 
 class SymbolTable:
     """Resolve local ELF/map symbols and translate mapped section addresses."""
@@ -484,21 +497,14 @@ class SymbolTable:
 
     def code_context(self, address: int, radius: int = 4) -> dict:
         """Return nearby disassembly for a sampled PC when a loaded ELF covers it."""
-        owner = None
-        for path in reversed(self.sources):
-            for section, (base, size) in self._sections[path].items():
-                delta = self._section_deltas.get((path, section), 0)
-                if base + delta <= (address & ~1) < base + delta + size:
-                    owner = path
-                    break
-            if owner:
-                break
-        if owner is None:
+        location = self.locate(address)
+        if location is None:
             return {
                 "address": address,
                 "available": False,
                 "reason": "PC is outside loaded ELF sections",
             }
+        owner = Path(location["elf"])
         symbol = self.nearest(address, elf=owner)
         if not symbol:
             return {
@@ -534,11 +540,15 @@ class SymbolTable:
                 "elf": str(owner),
                 "reason": "objdump returned no instructions",
             }
-        index = min(range(len(instructions)), key=lambda i: abs(instructions[i][0] - link_pc))
+        link_pc = location["link_address"]
+        preceding = [i for i, (pc, _) in enumerate(instructions) if pc <= link_pc]
+        index = preceding[-1] if preceding else 0
         selected = instructions[max(0, index - radius) : index + radius + 1]
         return {
             "address": address,
             "link_address": link_pc,
+            "section": location["section"],
+            "section_offset": location["section_offset"],
             "symbol": symbol,
             "elf": str(owner),
             "instructions": [line for _, line in selected],
@@ -553,6 +563,66 @@ class SymbolTable:
         else:
             owner = Path(elf).expanduser().resolve()
         return dict(self._sections[owner])
+
+    def locate(self, address: int, elf: str | Path | None = None) -> dict | None:
+        """Describe the loaded ELF section containing a runtime address."""
+        owner_info = self._owner_for_pc(address, elf)
+        if owner_info is None:
+            return None
+        owner, link_address = owner_info
+        runtime_address = address & ~1
+        for section, (link_base, size) in self._sections[owner].items():
+            delta = self._section_deltas.get((owner, section), 0)
+            runtime_base = link_base + delta
+            if runtime_base <= runtime_address < runtime_base + size:
+                return {
+                    "address": address,
+                    "link_address": link_address,
+                    "elf": str(owner),
+                    "section": section,
+                    "section_offset": runtime_address - runtime_base,
+                    "link_section_base": link_base,
+                    "runtime_section_base": runtime_base,
+                    "section_size": size,
+                    "rebased": delta != 0,
+                }
+        return None
+
+    def rebase_xip_sections_from_log(
+        self, log_text: str, elf: str | Path | None = None
+    ) -> dict[str, int]:
+        """Infer loaded XIP section bases from Retro-Go's asset-loader log lines.
+
+        The firmware does not expose runtime-base symbols for every project
+        sidecar. Its loader already logs ``code XIP ... @ 0x...`` and
+        ``raw assets ... @ 0x...``; pairing those markers with the uniquely
+        named .xip_* ELF sections makes live PCs resolvable without asking the
+        caller to manually translate link-time and runtime addresses.
+        """
+        selected = Path(elf).expanduser().resolve() if elf is not None else None
+        markers = {}
+        pattern = re.compile(
+            r"\b(?:(?:raw)\s+)?(code|assets)(?:\s+XIP)?\s+\d+\s+bytes\s+@\s*(0x[0-9a-f]+)",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(log_text):
+            markers[match.group(1).lower()] = int(match.group(2), 16)
+
+        rebased = {}
+        owners = [selected] if selected is not None else list(reversed(self.sources))
+        for kind, runtime_base in markers.items():
+            candidates = [
+                (owner, section)
+                for owner in owners
+                for section in self._sections.get(owner, {})
+                if section.startswith(".xip_") and section.endswith(f"_{kind}")
+            ]
+            if len(candidates) != 1:
+                continue
+            owner, section = candidates[0]
+            self.rebase(section, runtime_base, owner)
+            rebased[f"{owner}:{section}"] = runtime_base
+        return rebased
 
     def nearest(
         self, address: int, elf: str | Path | None = None, max_distance: int | None = None
@@ -853,42 +923,105 @@ class GwemuGDBBackend(GDBBackend):
             raise ValueError(f"target does not advertise register {name!r}")
         return self.register_numbers[key]
 
-    def _read_cortex_m_special_register(self, name: str) -> int:
-        """Read one unadvertised Cortex-M register through CoreDebug."""
+    def _cortex_m_special_register_transfer(
+        self, selector: int, *, write: bool = False
+    ) -> int | None:
+        """Transfer one special-register selector through CoreDebug DCRDR."""
         if getattr(self, "target_profile", None) != "stm32h7b0":
-            raise ValueError(f"target does not advertise register {name!r}")
+            raise ValueError("Cortex-M special-register fallback requires a known target profile")
         if self._is_running is not False:
             raise RuntimeError("Cortex-M special registers require a halted target")
-        # Cortex-M selector 0x14 transfers CONTROL, FAULTMASK, BASEPRI, and
-        # PRIMASK together in DCRDR. CONTROL occupies bits 31:24 and PRIMASK
-        # occupies bits 7:0.
-        selectors = {"msp": 0x11, "psp": 0x12, "control": 0x14, "primask": 0x14}
-        selector = selectors[name]
-        dhcsr = int.from_bytes(self.read_memory(0xE000EDF0, 4), "little")
-        if dhcsr & ((1 << 17) | (1 << 16)) != (1 << 17) | (1 << 16):
+        dhcsr_addr, dcrsr_addr, dcrdr_addr = 0xE000EDF0, 0xE000EDF4, 0xE000EDF8
+        dhcsr = int.from_bytes(self.read_memory(dhcsr_addr, 4), "little")
+        required = (1 << 17) | (1 << 16)
+        if dhcsr & required != required:
             raise RuntimeError("Cortex-M register transfer is not ready at a debug halt")
-        self.write_memory(0xE000EDF4, selector.to_bytes(4, "little"))
+        request = selector | ((1 << 16) if write else 0)
+        self.write_memory(dcrsr_addr, request.to_bytes(4, "little"))
         deadline = time.monotonic() + 0.1
         while True:
-            dhcsr = int.from_bytes(self.read_memory(0xE000EDF0, 4), "little")
+            dhcsr = int.from_bytes(self.read_memory(dhcsr_addr, 4), "little")
             if not dhcsr & (1 << 17):
                 raise RuntimeError("target left debug halt during Cortex-M register transfer")
             if dhcsr & (1 << 16):
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError("timed out reading Cortex-M special register")
+                operation = "writing" if write else "reading"
+                raise RuntimeError(f"timed out {operation} Cortex-M special register")
             time.sleep(0.001)
-        value = int.from_bytes(self.read_memory(0xE000EDF8, 4), "little")
-        if name == "control":
-            return (value >> 24) & 0xFF
-        if name == "primask":
-            return value & 0xFF
+        if write:
+            return None
+        return int.from_bytes(self.read_memory(dcrdr_addr, 4), "little")
+
+    def _read_cortex_m_special_register(self, name: str) -> int:
+        """Read an unadvertised Cortex-M register through CoreDebug."""
+        selectors = {
+            "msp": 0x11,
+            "psp": 0x12,
+            "control": 0x14,
+            "faultmask": 0x14,
+            "basepri": 0x14,
+            "primask": 0x14,
+        }
+        selector = selectors.get(name)
+        if selector is None or getattr(self, "target_profile", None) != "stm32h7b0":
+            raise ValueError(f"target does not advertise register {name!r}")
+        value = self._cortex_m_special_register_transfer(selector)
+        fields = {
+            "control": (24, 0xFF),
+            "faultmask": (16, 0x01),
+            "basepri": (8, 0xFF),
+            "primask": (0, 0xFF),
+        }
+        if name in fields:
+            shift, mask = fields[name]
+            return (value >> shift) & mask
         return value
+
+    def _write_cortex_m_special_register(self, name: str, value: int):
+        """Write an unadvertised Cortex-M register through CoreDebug."""
+        selectors = {
+            "msp": 0x11,
+            "psp": 0x12,
+            "control": 0x14,
+            "faultmask": 0x14,
+            "basepri": 0x14,
+            "primask": 0x14,
+        }
+        selector = selectors.get(name)
+        if selector is None or getattr(self, "target_profile", None) != "stm32h7b0":
+            raise ValueError(f"target does not advertise register {name!r}")
+        if self._is_running is not False:
+            raise RuntimeError("Cortex-M special registers require a halted target")
+        dhcsr = int.from_bytes(self.read_memory(0xE000EDF0, 4), "little")
+        required = (1 << 17) | (1 << 16)
+        if dhcsr & required != required:
+            raise RuntimeError("Cortex-M register transfer is not ready at a debug halt")
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError("Cortex-M register value must fit uint32")
+        fields = {
+            "control": (24, 0xFF),
+            "faultmask": (16, 0x01),
+            "basepri": (8, 0xFF),
+            "primask": (0, 0xFF),
+        }
+        if name in fields:
+            shift, mask = fields[name]
+            packed = self._cortex_m_special_register_transfer(0x14)
+            expected = value & mask
+            value = (packed & ~(mask << shift)) | (expected << shift)
+        else:
+            expected = value
+        self.write_memory(0xE000EDF8, value.to_bytes(4, "little"))
+        self._cortex_m_special_register_transfer(selector, write=True)
+        actual = self._read_cortex_m_special_register(name)
+        if actual != expected:
+            raise RuntimeError(f"Cortex-M special register {name!r} write readback differs")
 
     def read_register(self, name: str) -> int:
         key = name.lower()
         if (
-            key in {"msp", "psp", "control", "primask"}
+            key in {"msp", "psp", "control", "faultmask", "basepri", "primask"}
             and key not in self.register_numbers
             and not (key == "msp" and "sp" in self.register_numbers)
             and getattr(self, "target_profile", None) == "stm32h7b0"
@@ -897,7 +1030,7 @@ class GwemuGDBBackend(GDBBackend):
         try:
             index = self._register_index(key)
         except ValueError:
-            if key in {"msp", "psp", "control", "primask"}:
+            if key in {"msp", "psp", "control", "faultmask", "basepri", "primask"}:
                 return self._read_cortex_m_special_register(key)
             raise
         was_running = self._is_running
@@ -928,10 +1061,19 @@ class GwemuGDBBackend(GDBBackend):
                 self.resume()
 
     def write_register(self, name: str, value: int):
+        key = name.lower()
+        special = {"msp", "psp", "control", "faultmask", "basepri", "primask"}
+        advertised = key in self.register_numbers or (
+            key == "msp" and "sp" in self.register_numbers
+        )
+        if key in special and not advertised:
+            if getattr(self, "target_profile", None) == "stm32h7b0":
+                return self._write_cortex_m_special_register(key, value)
+            raise ValueError(f"target does not advertise register {key!r}")
         was_running = self._is_running
         if was_running:
             self.halt()
-        index = self._register_index(name)
+        index = self._register_index(key)
         command = f"P{index:x}={value.to_bytes(4, 'little').hex()}".encode("ascii")
         reply = self._send_command(command)
         if was_running:
@@ -969,9 +1111,242 @@ class RemoteGDBBackend(GwemuGDBBackend):
         )
         self.target_xml_error: str | None = None
 
-    def open(self):
+    def _transport_remaining(self):
+        deadline = getattr(self, "_transport_deadline", None)
+        if deadline is None:
+            return 5.0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("remote GDB transport reconnect deadline exceeded")
+        return remaining
+
+    def _read(self, count):
+        if getattr(self, "_transport_deadline", None) is None:
+            return super()._read(count)
+        self._socket.settimeout(self._transport_remaining())
+        data = super()._read(count)
+        self._transport_remaining()
+        return data
+
+    def _write(self, data):
+        if getattr(self, "_transport_deadline", None) is None:
+            return super()._write(data)
+        self._socket.settimeout(self._transport_remaining())
+        super()._write(data)
+        self._transport_remaining()
+
+    def _close_transport(self):
+        """Discard local transport descriptors without surrendering ownership."""
+        stream, self._sock_file = getattr(self, "_sock_file", None), None
+        sock, self._socket = self._socket, None
+        self._is_running = None
+        try:
+            if stream is not None:
+                stream.close()
+        finally:
+            if sock is not None:
+                sock.close()
+
+    def _open_transport(self, address):
         from gnwmanager.ocdbackend.gdb_backend import GDBError
 
+        self.register_numbers.clear()
+        self.target_xml_error = None
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.settimeout(self._transport_remaining())
+        self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._socket.connect(address)
+        self._transport_remaining()
+        self._sock_file = self._socket.makefile("rb", buffering=8192)
+        try:
+            self._send_command(b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+")
+        except GDBError as error:
+            if "GDB error response:" not in str(error):
+                raise RuntimeError(
+                    f"remote GDB server disconnected during qSupported negotiation: {error}"
+                ) from error
+        self._is_running = None
+        try:
+            self._load_register_numbers()
+        except GDBError as error:
+            if "GDB error response:" not in str(error):
+                raise RuntimeError(
+                    f"remote GDB server disconnected while reading target.xml: {error}"
+                ) from error
+            self.register_numbers.clear()
+            self.target_xml_error = str(error)
+        except RuntimeError as error:
+            if not str(error).startswith("target did not provide GDB feature"):
+                raise
+            self.register_numbers.clear()
+            self.target_xml_error = str(error)
+        self._transport_remaining()
+
+    def _read_cortex_m_dhcsr(self) -> int:
+        return int.from_bytes(self.read_memory(_CORTEX_M_DHCSR, 4), "little")
+
+    def _write_cortex_m_dhcsr(self, controls: int) -> None:
+        self.write_memory(
+            _CORTEX_M_DHCSR,
+            (_CORTEX_M_DHCSR_KEY | (controls & _CORTEX_M_DHCSR_CONTROL_MASK)).to_bytes(4, "little"),
+        )
+
+    def _wait_cortex_m_halted(self, timeout: float, evidence: list[dict], phase: str) -> int:
+        deadline = time.monotonic() + timeout
+        while True:
+            value = self._read_cortex_m_dhcsr()
+            evidence.append({"phase": phase, "dhcsr": value})
+            if value & _CORTEX_M_S_HALT:
+                self._is_running = False
+                return value
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for Cortex-M DHCSR.S_HALT during {phase}; "
+                    f"DHCSR=0x{value:08x}"
+                )
+            time.sleep(0.001)
+
+    def _restore_cortex_m_debug_controls(self, controls: int, evidence: list[dict]) -> int:
+        self._write_cortex_m_dhcsr(controls)
+        value = self._read_cortex_m_dhcsr()
+        evidence.append({"phase": "restore_controls", "dhcsr": value})
+        if not value & _CORTEX_M_S_HALT:
+            self._is_running = None
+            raise RuntimeError(
+                f"Cortex-M target left debug halt while restoring DHCSR controls; "
+                f"DHCSR=0x{value:08x}"
+            )
+        if value & _CORTEX_M_DHCSR_CONTROL_MASK != controls:
+            self._is_running = False
+            raise RuntimeError(
+                f"Cortex-M DHCSR control restoration differs; "
+                f"expected=0x{controls:02x}, actual=0x{value & _CORTEX_M_DHCSR_CONTROL_MASK:02x}"
+            )
+        self._is_running = False
+        return value
+
+    def _single_step_cortex_m(self) -> bytes:
+        """Step one instruction through CoreDebug, retaining honest halt state."""
+        from .qmp import record_control_request
+
+        record_control_request(getattr(self, "_control_audit_socket", None), "gdb", "step")
+        if self._is_running is not False:
+            raise RuntimeError("Cortex-M DHCSR single-step requires a known halted target")
+        before = self._read_cortex_m_dhcsr()
+        required = _CORTEX_M_C_DEBUGEN | _CORTEX_M_C_HALT | _CORTEX_M_S_HALT | _CORTEX_M_S_REGRDY
+        if before & required != required:
+            raise RuntimeError(
+                "Cortex-M DHCSR single-step requires C_DEBUGEN, C_HALT, S_HALT, "
+                f"and S_REGRDY; DHCSR=0x{before:08x}"
+            )
+        saved_controls = before & _CORTEX_M_DHCSR_CONTROL_MASK
+        if saved_controls & _CORTEX_M_C_STEP:
+            raise RuntimeError(f"Cortex-M DHCSR already has C_STEP set; DHCSR=0x{before:08x}")
+        evidence = [{"phase": "initial", "dhcsr": before}]
+        masked_controls = saved_controls | _CORTEX_M_C_HALT | _CORTEX_M_C_MASKINTS
+        step_controls = (
+            saved_controls | _CORTEX_M_C_DEBUGEN | _CORTEX_M_C_STEP | _CORTEX_M_C_MASKINTS
+        ) & ~_CORTEX_M_C_HALT
+        try:
+            # Mask interrupts under a confirmed halt, then issue exactly one
+            # C_STEP write with C_HALT clear. Never infer failure from an
+            # unchanged PC: self-branches are valid one-instruction steps.
+            self._write_cortex_m_dhcsr(masked_controls)
+            masked = self._read_cortex_m_dhcsr()
+            evidence.append({"phase": "mask_interrupts", "dhcsr": masked})
+            if (
+                not masked & _CORTEX_M_S_HALT
+                or masked & _CORTEX_M_DHCSR_CONTROL_MASK != masked_controls
+            ):
+                raise RuntimeError(
+                    f"failed to mask interrupts at a Cortex-M halt; DHCSR=0x{masked:08x}"
+                )
+            self._write_cortex_m_dhcsr(step_controls)
+            self._wait_cortex_m_halted(_CORTEX_M_STEP_TIMEOUT_S, evidence, "single_step")
+        except Exception as step_error:
+            # A timeout is not a completed step. Try once to regain halt, then
+            # restore every writable low control bit (including SNAPSTALL).
+            try:
+                current = self._read_cortex_m_dhcsr()
+                if not current & _CORTEX_M_S_HALT:
+                    halt_controls = (
+                        saved_controls
+                        | _CORTEX_M_C_DEBUGEN
+                        | _CORTEX_M_C_HALT
+                        | _CORTEX_M_C_MASKINTS
+                    )
+                    self._write_cortex_m_dhcsr(halt_controls)
+                    self._wait_cortex_m_halted(_CORTEX_M_STEP_TIMEOUT_S, evidence, "timeout_rehalt")
+                else:
+                    self._is_running = False
+                self._restore_cortex_m_debug_controls(saved_controls, evidence)
+            except Exception as cleanup_error:
+                if not any(
+                    row["phase"] in ("single_step", "timeout_rehalt")
+                    and row["dhcsr"] & _CORTEX_M_S_HALT
+                    for row in evidence
+                ):
+                    self._is_running = None
+                raise RuntimeError(
+                    "Cortex-M DHCSR single-step failed and cleanup could not be "
+                    f"verified: {step_error}; cleanup: {cleanup_error}; "
+                    f"DHCSR evidence={evidence!r}"
+                ) from step_error
+            raise RuntimeError(
+                "Cortex-M DHCSR single-step failed; debug controls restored: "
+                f"{step_error}; DHCSR evidence={evidence!r}"
+            ) from step_error
+
+        try:
+            self._restore_cortex_m_debug_controls(saved_controls, evidence)
+        except Exception as restore_error:
+            raise RuntimeError(
+                "Cortex-M DHCSR single-step halted, but control restoration failed: "
+                f"{restore_error}; DHCSR evidence={evidence!r}"
+            ) from restore_error
+        return b"S05"
+
+    def single_step(self):
+        if getattr(self, "target_profile", None) == "stm32h7b0":
+            return self._single_step_cortex_m()
+        return super().single_step()
+
+    def reconnect_transport(self, timeout=5.0):
+        """Replace a failed RSP stream while retaining the current device lease.
+
+        This only connects and negotiates capabilities/register descriptions;
+        it does not halt, resume, reset or write target state. The caller must
+        independently establish target state after reconnecting. Failure closes
+        the fresh transport and leaves execution state unknown, while retaining
+        ownership until the normal session close().
+        """
+        timeout = float(timeout)
+        if not 0 < timeout < float("inf"):
+            raise ValueError("transport reconnect timeout must be finite and positive")
+        if self._remote_lease.fd is None or (
+            not self.daemon_managed and self._monitor_pause_token is None
+        ):
+            raise RuntimeError("transport reconnect requires an owned remote GDB session")
+        if self._socket is None:
+            raise RuntimeError("transport reconnect requires the existing peer socket")
+        # A numeric peer from the existing socket avoids unbounded DNS lookup.
+        # getpeername() is local and sends no data over the poisoned RSP stream.
+        self._transport_deadline = time.monotonic() + timeout
+        try:
+            address = self._socket.getpeername()
+            self._close_transport()
+            self._open_transport(address)
+            self._socket.settimeout(5.0)
+            return self
+        except BaseException:
+            self.register_numbers.clear()
+            self.target_xml_error = None
+            self._close_transport()
+            raise
+        finally:
+            self._transport_deadline = None
+
+    def open(self):
         try:
             if not self.daemon_managed:
                 self._monitor_pause_token = f"remote-gdb-{os.getpid()}-{uuid.uuid4().hex}"
@@ -984,49 +1359,8 @@ class RemoteGDBBackend(GwemuGDBBackend):
                     30.0,
                 )
             self._remote_lease.acquire()
-            # The generic GDBBackend.open() sends `c` after qSupported because
-            # QEMU's stub used to stop the VM on connect. A raw remote server
-            # may be attached to live hardware, so connect and negotiate only;
-            # never change execution state as an implicit attach side effect.
-            try:
-                self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._socket.settimeout(5.0)
-                self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self._socket.connect((self.host, self.port))
-                self._sock_file = self._socket.makefile("rb", buffering=8192)
-                try:
-                    self._send_command(b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+")
-                except GDBError as error:
-                    # A server may reject qSupported with an RSP error packet;
-                    # in that case we can still try the optional target XML and
-                    # use the standard register layout. Transport failures are
-                    # different: continuing would send qXfer on a dead socket
-                    # and obscure the original disconnect (often as EPIPE).
-                    if "GDB error response:" not in str(error):
-                        raise RuntimeError(
-                            f"remote GDB server disconnected during qSupported negotiation: {error}"
-                        ) from error
-                self._is_running = None
-            except Exception as error:
-                cause = error.__cause__
-                detail = str(cause) if isinstance(cause, OSError) else str(error)
-                raise RuntimeError(
-                    f"could not connect to remote GDB server at {self.endpoint}: {detail}"
-                ) from error
-            try:
-                self._load_register_numbers()
-            except GDBError as error:
-                if "GDB error response:" not in str(error):
-                    raise RuntimeError(
-                        f"remote GDB server disconnected while reading target.xml: {error}"
-                    ) from error
-                self.register_numbers.clear()
-                self.target_xml_error = str(error)
-            except RuntimeError as error:
-                if not str(error).startswith("target did not provide GDB feature"):
-                    raise
-                self.register_numbers.clear()
-                self.target_xml_error = str(error)
+            # Direct hardware attach must not implicitly resume the target.
+            self._open_transport((self.host, self.port))
             return self
         except Exception:
             self.close()
@@ -1855,6 +2189,14 @@ class DebugSession:
     def write_u32(self, address: int, value: int):
         """Write one little-endian 32-bit value to target memory."""
         return self.write(address, value.to_bytes(4, "little"))
+
+    def flash_bank1(self, image_path: str | Path, *, timeout: float = 120) -> dict:
+        """Program and verify Bank1 through the already-running RAM recovery stub."""
+        if not isinstance(self.backend, RemoteGDBBackend):
+            raise RuntimeError("Bank1 programming requires a direct remote-GDB session")
+        from .ram_flash import program_bank1_with_recovery_stub
+
+        return program_bank1_with_recovery_stub(self, image_path, timeout=timeout)
 
     def configure(self, path) -> dict:
         """Load the shared local port description and apply initialized mappings."""
@@ -2718,6 +3060,8 @@ class DebugSession:
     def resolve_project_address(self, address: int, elf: str | Path | None = None) -> dict:
         """Resolve an address using only the selected project's ELF sections."""
         owner = self._project_elf(elf)
+        if self.symbols.locate(address, owner) is None:
+            self._auto_rebase_xip_from_log(owner)
         for section, (base, size) in self.symbols._sections.get(owner, {}).items():
             delta = self.symbols._section_deltas.get((owner, section), 0)
             if base + delta <= (address & ~1) < base + delta + size:
@@ -2762,13 +3106,78 @@ class DebugSession:
         """Return structured nm-style symbol rows from loaded ELFs."""
         return self.symbols.nm(query, elf)
 
+    def sections(self, elf: str | Path | None = None) -> list[dict]:
+        """Return readelf-style section metadata, including runtime rebases."""
+        if elf is None:
+            if not self.symbols.sources:
+                return []
+            owner = self.symbols.sources[-1]
+        else:
+            owner = Path(elf).expanduser().resolve()
+        if owner not in self.symbols._sections:
+            raise ValueError(f"ELF is not loaded: {owner}")
+        return [
+            {
+                "name": name,
+                "link_address": base,
+                "runtime_address": base + self.symbols._section_deltas.get((owner, name), 0),
+                "size": size,
+                "rebased": self.symbols._section_deltas.get((owner, name), 0) != 0,
+                "elf": str(owner),
+            }
+            for name, (base, size) in self.symbols._sections[owner].items()
+        ]
+
+    def _auto_rebase_xip_from_log(self, elf: str | Path | None = None) -> dict[str, int]:
+        """Apply XIP bases emitted by the running Retro-Go asset loader."""
+        try:
+            log_text = self.read_log()
+        except (RuntimeError, OSError, ValueError):
+            return {}
+        return self.symbols.rebase_xip_sections_from_log(log_text, elf)
+
+    def resolve(self, address: int, elf: str | Path | None = None, radius: int = 4) -> dict:
+        """Resolve a runtime address through ELF sections, symbols and source.
+
+        Rebasing is automatic for XIP sections when Retro-Go's current log
+        contains the loader's runtime-base markers. The result combines the
+        useful parts of readelf, addr2line, nm and nearby objdump output.
+        """
+        location = self.symbols.locate(address, elf)
+        rebased = {}
+        if location is None:
+            rebased = self._auto_rebase_xip_from_log(elf)
+            location = self.symbols.locate(address, elf)
+        if location is None:
+            return {
+                "address": address,
+                "available": False,
+                "reason": "address is outside loaded ELF sections",
+                "xip_rebased_from_log": rebased,
+            }
+        owner = location["elf"]
+        location["available"] = True
+        location["xip_rebased_from_log"] = rebased
+        location["symbol"] = self.symbols.nearest(address, elf=owner)
+        location["source"] = self.symbols.source_location(address, elf=owner)
+        location["code"] = self.symbols.code_context(address, radius=radius)
+        return location
+
     def disasm(self, symbol: str, elf: str | Path | None = None) -> str:
         """Return objdump disassembly for a loaded function symbol."""
         return self.symbols.disassemble(symbol, elf)
 
     def addr2line(self, address: int) -> dict:
-        """Resolve a runtime address to source lines in the loaded ELFs."""
+        """Resolve a runtime address, auto-rebasing logged XIP sections first."""
+        if self.symbols.locate(address) is None:
+            self._auto_rebase_xip_from_log()
         return self.symbols.source_location(address)
+
+    def code_context(self, address: int, radius: int = 4) -> dict:
+        """Return source and nearby instructions for a runtime address."""
+        if self.symbols.locate(address) is None:
+            self._auto_rebase_xip_from_log()
+        return self.symbols.code_context(address, radius=radius)
 
     def rebase_from_pointer(self, section: str, pointer_symbol: str) -> int:
         """Read a target-side base pointer and rebase that ELF section to it."""
@@ -3151,6 +3560,7 @@ def python_shell(
     qmp_socket: str | None = None,
     debug_config: str | None = None,
     retro_go_version: str | None = None,
+    profile_symbols: bool = True,
     start_paused: bool = False,
     attach_only: bool = False,
     autostart_timeout: float | None = None,
@@ -3225,7 +3635,7 @@ def python_shell(
             backend.open()
             session_symbols = list(symbols or [])
             session_version = retro_go_version
-            if target == "hardware":
+            if target == "hardware" and profile_symbols:
                 try:
                     from .hw_lifecycle import identify_runtime
                     import re

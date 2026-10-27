@@ -54,10 +54,12 @@ gwprov device ls
 gwprov profile "$PROFILE" apply device:probe:PROBE_ID --start --bank 2
 ```
 
-Use the stable probe ID shown by `gwprov device ls` for the hardware target.
-The GWemu and hardware commands are alternatives; run only the one matching
-where you want to instantiate the profile. To add games or project files, insert
-those install commands at the comment before `profile create`, as shown below.
+Use the stable probe ID shown by `gwprov device ls` for a local probe. A
+registered raw GDB target name is also accepted; profile apply temporarily
+re-exports it through a loopback-only gnwmanager WebSocket bridge. The GWemu and
+hardware commands are alternatives; run only the one matching where you want to
+instantiate the profile. To add games or project files, insert those install
+commands at the comment before `profile create`, as shown below.
 
 ## Add projects to the release content (optional)
 
@@ -95,10 +97,30 @@ gwprov retro-go config profile:"$PROFILE" --auto-start /homebrews/my-app.bin
 gwprov start "profile:$PROFILE"
 ```
 
+Setting a non-empty autostart path on a bundled-SD profile pre-caches the
+selected file in virtual extflash and writes the matching Retro-Go
+`/data/flashcachedata.bin` index on the SD image. For SMG, it also streams and
+relocates `smg_assets.xip` and `smg_code.xip` from the installed project bundle,
+using relocation tables in the project's ELF symbols. The index records all
+three paths at their final runtime addresses, so GWemu starts without copying
+the 31 MiB asset sidecar on first boot. Flash-only profiles store `/CONFIG` in
+LittleFS and can autostart files installed in FrogFS directly; they do not use
+the bundled-SD flash-cache index.
+
+The cache begins at the aligned `reservedOffset` from the CRC-valid GWLB layout
+record in bank 2. GWProv requires that record's extflash size to match the
+profile and checks the whole cache payload fits before writing. It clears the
+old cache index before updating virtual NOR, then commits the new index after
+all streamed files are written. Other autostart files continue to seed as a
+single file. Each selected path must exist on the profile's SD image.
+
 `gwprov start` accepts a device name or `profile:NAME`. Bare names resolve as
 devices; `profile:` launches a new GWemu instance from that profile. Starting a
 physical device is unsupported. Use `gwprov device DEVICE reset` to reset
-hardware; `start` does not power-cycle or restart it.
+hardware; `start` does not power-cycle or restart it. For a fresh patched dual-boot
+profile, `gwprov start profile:NAME --boot-bank 2` holds the VM at reset, seeds
+TAMP.BKP0R with the bootloader's `BOOT` magic, verifies the write, then resumes into
+bank 2. Bank 1 remains the default.
 
 GWProv does not infer or run an arbitrary homebrew's build command: prepare the
 project bundle using the GWRG dist manifest and ZIP layout first. `project install`
@@ -205,13 +227,16 @@ layout. Hardware inspection takes a target lease and fails while another session
 owns the probe. The command does not write flash or halt the target.
 
 Before a hardware flow loads gnwmanager's RAM service, GWProv reads VTOR,
-mailbox status at `0x24025800`, and DHCSR. Recovery Mode requires VTOR to
-point into the RAM service; `IDLE` plus a
-running core then confirms that it is live and idle. The mailbox can retain a
-stale `IDLE` value while application firmware runs, so it cannot identify the
-stub by itself. A resident stub blocks an implicit reset/load by flows that
-need to start the service. `gwprov profile PROFILE apply device:DEVICE` can attach to an already-running idle
-stub.
+mailbox status at `0x24025800`, and DHCSR. `IDLE` plus a running core confirms
+an idle service when VTOR points into the RAM image. A flash VTOR makes that
+mailbox only a candidate: lifecycle operations briefly sample PC and accept the
+service only when PC is inside the packaged gnwmanager image. If PC is in
+application flash, the IDLE word is stale and recovery starts a fresh RAM
+service. Passive status reads never halt the target. If the PC sample cannot
+be verified, GWProv fails closed and leaves the target untouched. A resident
+stub blocks an implicit reset/load by flows that need to start the service.
+`gwprov profile PROFILE apply device:DEVICE` can attach to an already-running
+idle stub.
 `gwprov device DEVICE recover` starts the RAM flasher when absent, or attaches and
 synchronizes its context counter when already live and idle. It restarts an
 idle but halted or terminal-error stub; it refuses a busy or unreadable
@@ -233,8 +258,11 @@ starting an unverified image.
 
 Applying a profile names both resources: `gwprov profile PROFILE apply device:DEVICE`.
 For hardware it deploys the profile's flash regions and leaves the RAM flasher
-running. Pass `--start` to start bank 1 afterward, or add `--bank 2` to start
-bank 2. For GWemu, use `gwprov start profile:PROFILE` to create a managed instance.
+running. Registered raw GDB targets use a temporary loopback-only gnwmanager
+WebSocket bridge for the same deployment flow; GWProv stops that bridge when the
+operation finishes. Pass `--start` to start bank 1 afterward, or add `--bank 2`
+to start bank 2. For GWemu, use `gwprov start profile:PROFILE` to create a
+managed instance.
 
 ```sh
 gwprov retro-go config device:probe:PROBE_ID

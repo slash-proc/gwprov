@@ -385,7 +385,7 @@ def main(argv=None):
         for spec in args.mapped_artifact:
             try:
                 src, destrel, base_s = spec.rsplit(":", 2)
-                base = int(base_s, 0)
+                base = int(base_s, 0) if base_s else None
             except ValueError:
                 print(f"frogfs: bad --mapped-artifact {spec!r}; want SRC:DESTREL:BASE",
                       file=sys.stderr)
@@ -513,6 +513,8 @@ def main(argv=None):
         import frogfs_pico8_ro  # noqa: E402
 
         for logical, base in mapped_artifacts:
+            if base is None:
+                continue
             if not frogfs_pico8_ro.patch_frogfs_mapped_inplace(
                 output,
                 logical_path=logical,

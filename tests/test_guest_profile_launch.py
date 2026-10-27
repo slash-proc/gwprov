@@ -12,7 +12,11 @@ from gwprov.launch import image_launch_spec, profile_launch_spec
 
 class GuestProfileLaunch(unittest.TestCase):
     def setUp(self):
-        self.scratch = Path(tempfile.mkdtemp(prefix="profile-launch-", dir=os.environ.get("TMPDIR", Path(__file__).parent)))
+        self.scratch = Path(
+            tempfile.mkdtemp(
+                prefix="profile-launch-", dir=os.environ.get("TMPDIR", Path(__file__).parent)
+            )
+        )
         self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
         for name in ("bank1.bin", "bank2.bin", "extflash.bin"):
             (self.scratch / name).write_bytes(b"image")
@@ -88,11 +92,13 @@ class GuestProfileLaunch(unittest.TestCase):
         from gwprov import daemon
 
         calls = []
+
         def request(message, **kwargs):
             calls.append(message)
             if message["op"] == "ping":
                 return {"capabilities": ["guest-profile-recording"]}
             return {"instance": {"pid": 123}}
+
         with (
             patch.object(daemon, "ensure_running"),
             patch.object(daemon, "request", side_effect=request),

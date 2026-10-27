@@ -9,6 +9,13 @@ from pathlib import Path
 from elftools.elf.elffile import ELFFile
 
 
+def _dwarf_info(image):
+    # emit-relocs retains relocation records in linked executables. Their
+    # DWARF is already relocated; applying those records again can corrupt
+    # addresses or reject ARM R_ARM_NONE records. Only ET_REL needs this pass.
+    return image.get_dwarf_info(relocate_dwarf_sections=image.header["e_type"] == "ET_REL")
+
+
 def _name(die):
     attr = die.attributes.get("DW_AT_name")
     return attr.value.decode(errors="replace") if attr else None
@@ -93,7 +100,7 @@ def _cu_names(path: str, mtime_ns: int):
     """Cache primitive CU offsets only; retain no DIE or closed ELF stream."""
     result = {}
     with Path(path).open("rb") as stream:
-        dwarf = ELFFile(stream).get_dwarf_info()
+        dwarf = _dwarf_info(ELFFile(stream))
         for cu in dwarf.iter_CUs():
             name = Path(_name(cu.get_top_DIE()) or "").name
             result.setdefault(name, []).append(cu.cu_offset)
@@ -153,7 +160,7 @@ def _variable_index(path, identity):
         image = ELFFile(stream)
         if not image.has_dwarf_info():
             raise ValueError(f"ELF has no DWARF types: {path}")
-        dwarf = image.get_dwarf_info()
+        dwarf = _dwarf_info(image)
         for cu in dwarf.iter_CUs():
             source = Path(_name(cu.get_top_DIE()) or "").name
             for die in cu.get_top_DIE().iter_children():
@@ -223,7 +230,7 @@ def _variable_layout(path: str, mtime_ns, symbol: str, source_hint=None, symbol_
         image = ELFFile(stream)
         if not image.has_dwarf_info():
             raise ValueError(f"ELF has no DWARF types: {path}")
-        dwarf = image.get_dwarf_info()
+        dwarf = _dwarf_info(image)
         variable = _indexed_variable(dwarf, path, mtime_ns, symbol, source_hint, symbol_address)
         if variable is not None:
             return {
@@ -316,7 +323,7 @@ def _path_layouts(
         image = ELFFile(stream)
         if not image.has_dwarf_info():
             raise ValueError(f"ELF has no DWARF types: {path}")
-        dwarf = image.get_dwarf_info()
+        dwarf = _dwarf_info(image)
         variable = _indexed_variable(dwarf, path, mtime_ns, symbol, source_hint, symbol_address)
         if variable is None:
             raise KeyError(f"no DWARF variable type for {symbol!r} in {path}")

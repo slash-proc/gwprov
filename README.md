@@ -850,10 +850,17 @@ selected with `--remote-url ws[s]://host:port/gdb`; `--remote-origin` supplies i
 allowed origin when configured. SD deployment is an overlay and does not delete
 files omitted from the profile.
 
-Before starting that RAM programmer, GWProv passively checks the stock ITCM
+Before starting that RAM programmer, GWProv checks the stock ITCM
 fingerprint, the RDP option byte, VTOR, the gnwmanager mailbox, and DHCSR. An
-`IDLE` mailbox with a running core confirms the live stub; VTOR is recorded as
-evidence but can still point into a flash bank while the stub is attached. A
+`IDLE` mailbox with a running core confirms the live stub when VTOR points into
+its RAM image. If VTOR points into flash, lifecycle operations briefly sample
+PC and accept the service only when PC falls inside the packaged gnwmanager
+image; passive status reads do not halt the target. A stale `IDLE` mailbox with
+an application PC is treated as application firmware. Stale `ERASE`, `PROGRAM`, and `HASH` words can also survive a reset. Explicit
+recovery checks two live PCs in internal flash, unlocked protection state,
+unchanged VTOR/mailbox values, and idle flash controllers before treating those
+words as stale. A live RAM service or uncertain evidence is left untouched;
+passive polling never halts the target for this check. A
 stale `IDLE` mailbox with a halted core does not count as a live stub. Locked
 devices do not get internal-flash scans; unlocked devices can be scanned to
 identify installed banks independently from the runtime selected by VTOR.
@@ -1175,6 +1182,15 @@ gwprov retro-go config profile:PROFILE --rom gb Tetris.gb --format json
 
 `--output FILE` saves the resulting 416-byte CONFIG blob. `--timeout 0` disables
 Retro-Go's idle standby timer, which is useful for unattended test runs.
+When `--auto-start` or `--rom` sets a non-empty startup path on a bundled-SD
+profile, GWProv seeds that file into virtual extflash and writes
+`/data/flashcachedata.bin` with Retro-Go's matching cache index. For SMG it
+also streams and relocates both XIP sidecars from the installed project bundle,
+so the game starts without first copying its large asset sidecar. Cache writes
+start at the aligned, CRC-validated `reservedOffset` in the bank-2 GWLB layout
+record and are checked against the declared extflash size. Files must exist on
+the profile's SD image; physical-device configuration remains a CONFIG
+deployment operation.
 
 ## Structure and source provenance
 
@@ -1205,6 +1221,16 @@ checked against the declared extension, size, SHA-1 variants, `strict`, `allowMu
 `maxCount` rules before a converter runs. Converter execution requires `pip install -e '.[dist]'`;
 WASM runs are import-free, memory-bounded, fuel-limited, and outputs are checked against the
 manifest.
+
+`gwprov project install --wasm-fuel UNITS` can raise the compute budget for one install
+(default 500 billion; maximum 10 trillion). Use it only for a trusted bundle: fuel limits
+WASM compute, not elapsed time or memory, and a larger value lets that converter run longer.
+
+For `processor.extensions: {"range-input": 1}`, GWProv hashes local input files in bounded
+chunks and registers their 64-bit sizes with the converter. While stepping the module, it services
+validated offset/length requests by seeking the original file and copying only that range into
+WASM memory. Each request is capped at 256 MiB. Tools without the extension retain the original
+whole-file v1 path; unsupported extension versions are rejected before conversion.
 
 Core firmware files can be supplied as `--firmware ID=FILE` or found by declared filename with
 `--firmware-dir DIR`. `--bios` and `--bios-dir` are accepted CLI aliases, and manifests may use

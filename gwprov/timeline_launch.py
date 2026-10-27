@@ -9,16 +9,10 @@ def validate_profile_recording(record_profile=None, profile_interval_ms=None, pr
     symbols = list(profile_symbols or ())
     if record_profile is None:
         if profile_interval_ms is not None or symbols:
-            raise ValueError(
-                "--profile-interval-ms and --profile-symbols require --record-profile"
-            )
+            raise ValueError("--profile-interval-ms and --profile-symbols require --record-profile")
         return None, None, []
     interval = 100 if profile_interval_ms is None else profile_interval_ms
-    if (
-        isinstance(interval, bool)
-        or not isinstance(interval, int)
-        or not 1 <= interval <= 60000
-    ):
+    if isinstance(interval, bool) or not isinstance(interval, int) or not 1 <= interval <= 60000:
         raise ValueError("--profile-interval-ms must be an integer from 1 to 60000")
     path = Path(record_profile).expanduser().resolve()
     if path.exists() and path.is_dir():

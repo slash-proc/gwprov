@@ -1134,6 +1134,7 @@ def _start_profile(args) -> int:
             or args.icount is not None
             or args.pacing is not None
             or args.rtc_epoch is not None
+            or args.boot_bank != 1
             or args.gwemu_bin
         ):
             raise ValueError("GWemu launch options apply only when TARGET is profile:NAME")
@@ -1160,6 +1161,7 @@ def _start_profile(args) -> int:
         record_profile=args.record_profile,
         profile_interval_ms=args.profile_interval_ms,
         profile_symbols=args.profile_symbols,
+        start_halted=args.boot_bank == 2,
         timing_mode=args.timing_mode,
         icount=args.icount,
         pacing=args.pacing,
@@ -1171,6 +1173,52 @@ def _start_profile(args) -> int:
     if row is None:
         raise RuntimeError("GWemu started but did not appear in managed inventory")
     device_id = f"gwemu:{row['pid']}"
+    if args.boot_bank == 2:
+        from gwprov.debug_shell import RemoteGDBBackend
+        from gwprov.gwemu_manager import stop_instance
+
+        bkp0r = 0x58004500
+        boot_magic = 0x544F4F42
+        import time
+
+        backend = None
+        try:
+            for attempt in range(100):
+                backend = RemoteGDBBackend(
+                    "127.0.0.1",
+                    int(row["gdbPort"]),
+                    operation="gwprov start bank 2",
+                    daemon_managed=True,
+                )
+                try:
+                    backend.open()
+                    break
+                except Exception:
+                    backend.close()
+                    backend = None
+                    if attempt == 99:
+                        raise
+                    time.sleep(0.05)
+            if backend is None:
+                raise RuntimeError("GWemu GDB endpoint did not become available")
+            backend.write_memory(bkp0r, boot_magic.to_bytes(4, "little"))
+            observed = int.from_bytes(backend.read_memory(bkp0r, 4), "little")
+            if observed != boot_magic:
+                raise RuntimeError(
+                    f"TAMP.BKP0R readback mismatch: expected 0x{boot_magic:08X}, "
+                    f"got 0x{observed:08X}"
+                )
+            backend.resume()
+        except Exception:
+            try:
+                stop_instance(pid=row["pid"])
+            except Exception:
+                pass
+            raise
+        finally:
+            if backend is not None:
+                backend.close()
+        print("Seeded TAMP.BKP0R with BOOT and resumed the VM into its bank-2 boot path.")
     if args.name:
         from gwprov.device_assignments import set_assignment
 
@@ -1422,7 +1470,44 @@ def _retro_go_config(args) -> int:
         raise ValueError("--timeout must be nonnegative")
     if "cpu_oc_level" in mutations and not 0 <= mutations["cpu_oc_level"] <= 3:
         raise ValueError("--oc-level must be between 0 and 3")
-    new_blob = build_from_values(values, **mutations)
+
+    cache = None
+    if profile_name and not device_id and "startup_file" in mutations and mutations["startup_file"]:
+        profile = DeviceProfile.load(profile_name)
+        if profile.sd_mode == "bundled":
+            from gwprov.retrogo_cache import prepare_profile_autostart_cache
+
+            cache = prepare_profile_autostart_cache(profile_name, mutations["startup_file"])
+            # FAT itself is case-insensitive, but Retro-Go's autostart lookup uses
+            # strcmp against the spelling returned by its directory scan.
+            mutations["startup_file"] = cache["path"]
+        elif profile.sd_mode != "none":
+            raise ValueError(f"autostart is unsupported for profile SD mode {profile.sd_mode!r}")
+        # Flash-only profiles store their files in FrogFS, so CONFIG can point
+        # directly at the installed path without building an SD flash-cache index.
+
+    autostart_mode = None
+    if "startup_file" in mutations:
+        from gwprov.common.retrogo_config import AUTOSTART_MODE_OFF, AUTOSTART_MODE_ON
+
+        autostart_mode = AUTOSTART_MODE_ON if mutations["startup_file"] else AUTOSTART_MODE_OFF
+    new_blob = build_from_values(values, autostart_mode=autostart_mode, **mutations)
+
+    if cache is not None:
+        cached_files = cache.get(
+            "files", [{"path": cache["path"], "bytes": cache["bytes"], "address": cache["address"]}]
+        )
+        print(
+            f"Pre-cached {len(cached_files)} autostart/XIP file(s) "
+            f"({cache['bytes']} bytes total):",
+            file=sys.stderr,
+        )
+        for item in cached_files:
+            print(
+                f"  {item['path']} ({item['bytes']} bytes) " f"at extflash 0x{item['address']:08X}",
+                file=sys.stderr,
+            )
+
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1453,10 +1538,9 @@ def _retro_go_config(args) -> int:
                 target=config_target,
                 profile=profile_name,
                 filesystem="fatfs" if config_target == "sd" else "littlefs",
-                # FAT image additions treat path as a destination directory and
-                # preserve the source basename. LittleFS treats it as the exact
-                # destination file path.
-                path="/" if config_target == "sd" else "CONFIG",
+                # Media additions treat path as a destination directory and
+                # preserve the source basename. CONFIG belongs at the filesystem root.
+                path="/",
                 source=str(temp_path),
             )
     if device_id:
@@ -2286,13 +2370,19 @@ def _deploy_apply(args) -> int:
     probe_id, programmer, remote_url = args.probe_id, args.programmer, args.remote_url
     remote_origin = args.remote_origin
     explicit_device = getattr(args, "device", None)
+    remote_gdb_device = None
     if explicit_device and any((probe_id, programmer, remote_url)):
         raise ValueError("use DEVICE or an explicit adapter option, not both")
     if explicit_device:
         row = _resolve_device_selector(explicit_device)
-        if row.get("kind") != "hardware":
-            raise ValueError("deployment requires a physical hardware device")
-        if row.get("probeId"):
+        if row.get("kind") == "remote-gdb":
+            # The registered endpoint is a raw GDB server. Expose it briefly
+            # through gnwmanager's WebSocket protocol so deployment uses the
+            # same RAM-flasher path as other remote hardware targets.
+            remote_gdb_device = row
+        elif row.get("kind") != "hardware":
+            raise ValueError("deployment requires a hardware or remote GDB device")
+        elif row.get("probeId"):
             probe_id = row["probeId"]
         elif row["id"].startswith("remote:"):
             remote_url = row["id"].removeprefix("remote:")
@@ -2319,7 +2409,25 @@ def _deploy_apply(args) -> int:
         writes=deployment_write_summary(args.profile, plan),
     )
     callback, finish = _deployment_progress_display(args.output)
+    bridge_device_id = None
     try:
+        if remote_gdb_device is not None:
+            from gwprov import serve_manager
+
+            existing_bridge = next(
+                (
+                    row
+                    for row in serve_manager.status()
+                    if row.get("device") == remote_gdb_device["id"] and row.get("state") != "stale"
+                ),
+                None,
+            )
+            if existing_bridge is not None:
+                remote_url = f"ws://127.0.0.1:{existing_bridge['port']}/gdb"
+            else:
+                bridge = serve_manager.start(remote_gdb_device)
+                bridge_device_id = bridge["device"]
+                remote_url = bridge["url"]
         result = apply_deployment(
             args.profile,
             probe_id=probe_id,
@@ -2332,6 +2440,13 @@ def _deploy_apply(args) -> int:
             progress=callback,
         )
     finally:
+        if bridge_device_id is not None:
+            try:
+                from gwprov import serve_manager
+
+                serve_manager.stop(bridge_device_id)
+            except Exception as error:
+                print(f"Warning: could not stop temporary GDB bridge: {error}", file=sys.stderr)
         if finish:
             finish()
     if args.output in {"json", "yaml"}:
@@ -2520,7 +2635,7 @@ def _debug_python(args) -> int:
         )
         if match:
             detected_retro_go = match.group(1)
-            if not profile:
+            if not profile and not args.no_profile_symbols:
                 # Use symbols already present in a managed profile for the exact
                 # scanned firmware version. Never substitute symbols from another
                 # Retro-Go release when there is no exact match.
@@ -2553,7 +2668,7 @@ def _debug_python(args) -> int:
                 gdb_port = vm.get("gdbPort")
         if qmp_socket is None and profile is None:
             raise ValueError("selected GWemu device has no QMP endpoint or managed profile")
-    if profile:
+    if profile and not args.no_profile_symbols:
         from gwprov.profiles import DeviceProfile
 
         profile_root = DeviceProfile.load(profile).root
@@ -2591,12 +2706,22 @@ def _debug_python(args) -> int:
                 raise ValueError(
                     "profile has multiple GWemu instances; select a QMP handle explicitly"
                 )
-    elif active_row and active_row.get("assignedProfile"):
+    elif not args.no_profile_symbols and active_row and active_row.get("assignedProfile"):
         from gwprov.profiles import DeviceProfile
 
-        assigned_root = DeviceProfile.load(active_row["assignedProfile"]).root
-        project_root = assigned_root / "debug" / "projects"
-        if project_root.is_dir():
+        try:
+            assigned_root = DeviceProfile.load(active_row["assignedProfile"]).root
+        except FileNotFoundError:
+            if not args.attach_only:
+                raise
+            print(
+                "Assigned profile is unavailable; continuing attach-only without its symbols: "
+                f"{active_row['assignedProfile']}",
+                file=sys.stderr,
+            )
+            assigned_root = None
+        project_root = assigned_root / "debug" / "projects" if assigned_root else None
+        if project_root is not None and project_root.is_dir():
             for path in sorted(project_root.rglob("*.elf")):
                 if str(path) not in symbol_paths:
                     symbol_paths.append(str(path))
@@ -2619,7 +2744,8 @@ def _debug_python(args) -> int:
         symbols=symbol_paths,
         qmp_socket=qmp_socket,
         debug_config=args.debug_config,
-        retro_go_version=detected_retro_go,
+        retro_go_version=None if args.no_profile_symbols else detected_retro_go,
+        profile_symbols=not args.no_profile_symbols,
         start_paused=args.paused,
         attach_only=args.attach_only,
         autostart_timeout=args.autostart_timeout,
@@ -3420,14 +3546,22 @@ def _retain_profile_mapped_sources(
                     offset = int(layout.get("frogfsOffset", -1))
                     size = int(layout.get("frogfsBytes", 0))
                     raw_base = mapped.get("relocBase")
-                    try:
-                        reloc_base = (
-                            int(raw_base, 0) if isinstance(raw_base, str) else int(raw_base)
-                        )
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(
-                            f"mapped XiP path {relative} has no valid relocBase"
-                        ) from exc
+                    reloc_base = None
+                    if raw_base is not None:
+                        try:
+                            if isinstance(raw_base, bool):
+                                raise ValueError
+                            reloc_base = (
+                                int(raw_base, 0) if isinstance(raw_base, str) else int(raw_base)
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                f"mapped XiP path {relative} has an invalid relocBase"
+                            ) from exc
+                        if not 0 <= reloc_base <= 0xFFFFFFFF:
+                            raise ValueError(
+                                f"mapped XiP path {relative} relocBase is outside 32-bit range"
+                            )
                     if offset < 0 or size <= 0 or not profile.extflash.is_file():
                         raise ValueError(
                             f"profile has no readable FrogFS image for mapped XiP path {relative}"
@@ -3447,7 +3581,14 @@ def _retain_profile_mapped_sources(
                     payload_offset, payload_size = found
                     target_address = 0x90000000 + offset + payload_offset
                     relocated = image[payload_offset : payload_offset + payload_size]
-                    raw, _count = patch_mapped_bytes(relocated, reloc_base, target_address)
+                    if "relocations" in mapped:
+                        raise ValueError(
+                            f"exact-relocated XiP {relative} has no preserved raw source; reinstall its project bundle"
+                        )
+                    if reloc_base is None:
+                        raw = relocated
+                    else:
+                        raw, _count = patch_mapped_bytes(relocated, reloc_base, target_address)
                 import hashlib
 
                 identity = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
@@ -3550,6 +3691,7 @@ def _project_install(args) -> int:
         firmware_dirs=args.firmware_dir,
         game_files=args.game,
         game_dirs=args.game_dir,
+        wasm_fuel=args.wasm_fuel,
         bundle_path=bundle_path,
         dry_run=args.dry_run,
     )
@@ -3657,7 +3799,11 @@ def _project_install(args) -> int:
                 if isinstance(layout, dict) and layout.get("frogfsOffset") is not None:
                     frogfs_offset = int(layout["frogfsOffset"])
             for item in result["mappedArtifacts"]:
-                base = item["relocBase"]
+                base = item.get("relocBase")
+                if base is None:
+                    item["placement"] = "mapped without host relocation"
+                    item["relocation"] = {"method": "none; the artifact has no relocBase"}
+                    continue
                 if isinstance(base, str):
                     base = int(base, 0)
                 item["relocBase"] = base
@@ -3749,7 +3895,11 @@ def _project_install(args) -> int:
                     files.add_row(*row)
                 console.print(files)
             for mapped in result.get("mappedArtifacts", []):
-                if variant == "flash":
+                if "relocBase" not in mapped:
+                    console.print(
+                        f"[cyan]Mapped XiP:[/] {mapped['path']} is stored without host relocation."
+                    )
+                elif variant == "flash":
                     console.print(
                         f"[cyan]Mapped XiP:[/] {mapped['path']} is relocated from "
                         f"0x{mapped['relocBase']:08X} to its FrogFS address in extflash."
@@ -4336,6 +4486,8 @@ def _command_tree(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from gwprov.dist.project import DEFAULT_WASM_FUEL, MAX_WASM_FUEL
+
     from gwprov.target_controls import registered_target_profiles
 
     target_profiles = registered_target_profiles()
@@ -4484,16 +4636,28 @@ def build_parser() -> argparse.ArgumentParser:
     start_profile.add_argument("--timeline")
     start_profile.add_argument("--record-timeline")
     start_profile.add_argument(
-        "--record-profile", metavar="PATH",
+        "--record-profile",
+        metavar="PATH",
         help="record GWemu guest timeline samples as JSONL (works headless; requires a profiling-capable daemon)",
     )
     start_profile.add_argument(
-        "--profile-interval-ms", type=_profile_interval_ms, metavar="N",
+        "--profile-interval-ms",
+        type=_profile_interval_ms,
+        metavar="N",
         help="sample interval in milliseconds, 1–60000 (default: 100; requires --record-profile)",
     )
     start_profile.add_argument(
-        "--profile-symbols", action="append", metavar="MANIFEST",
+        "--profile-symbols",
+        action="append",
+        metavar="MANIFEST",
         help="symbol manifest to load for recording; repeatable and requires --record-profile",
+    )
+    start_profile.add_argument(
+        "--boot-bank",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="select startup bank; bank 2 seeds the dual-boot loader magic in TAMP.BKP0R",
     )
     start_profile.add_argument(
         "--timing-mode", choices=("default", "baseline", "experimental-m7"), default="default"
@@ -4781,8 +4945,14 @@ def build_parser() -> argparse.ArgumentParser:
     python_debug.add_argument(
         "--debug-config", help="local ELF/map, relocation and counter descriptor"
     )
-    python_debug.add_argument(
+    profile_symbols = python_debug.add_mutually_exclusive_group()
+    profile_symbols.add_argument(
         "--profile", help="select a symbol profile when it is not inferred from the selected device"
+    )
+    profile_symbols.add_argument(
+        "--no-profile-symbols",
+        action="store_true",
+        help="skip automatic profile symbols; explicit --symbols still apply",
     )
     python_debug.add_argument(
         "--symbols",
@@ -4881,6 +5051,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="SLOT=DIR|DIR",
         help="non-recursive converter input directory; use DIR for one-slot converters or SLOT=DIR otherwise",
+    )
+    install.add_argument(
+        "--wasm-fuel",
+        type=int,
+        default=DEFAULT_WASM_FUEL,
+        metavar="UNITS",
+        help=(
+            "fuel budget per WASM conversion run "
+            f"(default: {DEFAULT_WASM_FUEL}; maximum: {MAX_WASM_FUEL})"
+        ),
     )
     install.add_argument(
         "--firmware",
@@ -5080,7 +5260,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auto_start = config.add_mutually_exclusive_group()
     auto_start.add_argument(
-        "--auto-start", metavar="FILE_PATH", help="launch this Retro-Go file at boot"
+        "--auto-start",
+        metavar="FILE_PATH",
+        help="launch this Retro-Go file at boot (pre-caches it for bundled-SD profiles)",
     )
     auto_start.add_argument(
         "--no-auto-start",
@@ -5091,7 +5273,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--rom",
         nargs=2,
         metavar=("CORE", "FILENAME"),
-        help="set auto-start from a core and filename, for example --rom gb Tetris.gb",
+        help="set auto-start from a core and filename; bundled-SD profiles are pre-cached",
     )
     config.add_argument(
         "--timeout",
@@ -5728,11 +5910,18 @@ def build_parser() -> argparse.ArgumentParser:
     profile_apply = profile_commands.add_parser(
         "apply",
         help="write this profile to a named hardware device",
-        description="Apply one profile directly to one physical device.",
+        description=(
+            "Apply a profile to hardware. Registered raw GDB targets use a temporary "
+            "loopback gnwmanager bridge."
+        ),
         usage="gwprov profile PROFILE apply device:DEVICE [OPTIONS]",
     )
     profile_apply.add_argument("profile_name", metavar="PROFILE")
-    profile_apply.add_argument("device", metavar="DEVICE", help="hardware device name or stable ID")
+    profile_apply.add_argument(
+        "device",
+        metavar="DEVICE",
+        help="hardware or registered raw GDB device name or stable ID",
+    )
     profile_apply.add_argument(
         "--region",
         action="append",

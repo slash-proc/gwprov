@@ -406,14 +406,24 @@ def create_profile(
                 or path.is_absolute()
             ):
                 raise ValueError(f"invalid mapped artifact path: {path}")
-            base = item["relocBase"]
+            base = item.get("relocBase")
             if isinstance(base, str):
                 base = int(base, 0)
-            if not isinstance(base, int):
-                raise ValueError("mapped artifact has no relocation base")
-            frog_args.extend(["--mapped-artifact", f"{frogfs_tree / path}:{path}:{base}"])
+            if base is not None and (type(base) is not int or not 0 <= base <= 0xFFFFFFFF):
+                raise ValueError("mapped artifact has an invalid relocation base")
+            # An empty base still requests contiguous storage, with no scan.
+            base_arg = "" if base is None or "relocations" in item else str(base)
+            frog_args.extend(["--mapped-artifact", f"{frogfs_tree / path}:{path}:{base_arg}"])
         if gen_frogfs_image.main(frog_args):
             raise ValueError("FrogFS build failed")
+        from .mapped_relocations import patch_frogfs_exact, project_relocation_tables
+
+        patch_frogfs_exact(
+            work / "frogfs.bin",
+            mapped_artifacts=[(item["path"], item.get("relocBase")) for item in mapped],
+            tables=project_relocation_tables(projects),
+            extflash_offset=frogfs_offset,
+        )
         littlefs_tree.mkdir(parents=True, exist_ok=True)
         (littlefs_tree / "data").mkdir(exist_ok=True)
         lfs_args = [

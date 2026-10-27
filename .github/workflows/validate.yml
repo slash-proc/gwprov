@@ -23,7 +23,7 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
       - name: Install project and development tools
-        run: uv sync --locked --group dev
+        run: uv sync --locked --group dev --extra dist
       - name: Check formatting and lint
         run: make lint
       - name: Run tests with coverage

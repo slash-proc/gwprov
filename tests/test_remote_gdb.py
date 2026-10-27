@@ -355,6 +355,7 @@ def test_device_snapshot_reaps_dead_remote_gdb_session_and_resumes_polling(tmp_p
     assert service.leases == {}
     assert service.hardware_pause_tokens == {}
     assert key not in service.hardware_paused
+    assert poller.monitor_paused is False
     assert poller.finished == 1
     assert rows[0]["id"] == "gdb:debug-target.example.invalid:3333"
     assert rows[0]["status"] == "unknown"
@@ -622,9 +623,7 @@ def test_remote_gdb_uses_advertised_sp_as_generic_msp_alias():
         ("primask", 0x14, 0x02010001, 0x01),
     ],
 )
-def test_remote_gdb_reads_unadvertised_cortex_m_special_register(
-    name, selector, dcrdr, expected
-):
+def test_remote_gdb_reads_unadvertised_cortex_m_special_register(name, selector, dcrdr, expected):
     from gwprov.debug_shell import RemoteGDBBackend
 
     backend = RemoteGDBBackend(
@@ -639,6 +638,85 @@ def test_remote_gdb_reads_unadvertised_cortex_m_special_register(
 
     assert backend.read_register(name) == expected
     assert writes == [(0xE000EDF4, selector.to_bytes(4, "little"))]
+
+
+@pytest.mark.parametrize(
+    ("name", "initial", "requested", "expected", "selector"),
+    [
+        ("msp", 0, 0x2001FEF4, 0x2001FEF4, 0x11),
+        ("psp", 0, 0x20010004, 0x20010004, 0x12),
+        ("control", 0x02010001, 0x03, 0x03010001, 0x14),
+        ("faultmask", 0x02000001, 0x01, 0x02010001, 0x14),
+        ("basepri", 0x02010001, 0x80, 0x02018001, 0x14),
+        ("primask", 0x02010001, 0x00, 0x02010000, 0x14),
+    ],
+)
+def test_remote_gdb_writes_unadvertised_cortex_m_special_register(
+    name, initial, requested, expected, selector
+):
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend(
+        "example.invalid", 3333, daemon_managed=True, target_profile="stm32h7b0"
+    )
+    backend.register_numbers = {"xpsr": 16}
+    backend._is_running = False
+    special_registers = {0x11: 0x2001FFF0, 0x12: 0x20010000, 0x14: initial}
+    dcrdr = [0]
+    writes = []
+
+    def read_memory(address, size):
+        if address == 0xE000EDF0:
+            return ((1 << 17) | (1 << 16)).to_bytes(size, "little")
+        if address == 0xE000EDF8:
+            return dcrdr[0].to_bytes(size, "little")
+        raise AssertionError(f"unexpected register read: {address:#x}")
+
+    def write_memory(address, data):
+        value = int.from_bytes(data, "little")
+        writes.append((address, value))
+        if address == 0xE000EDF8:
+            dcrdr[0] = value
+        elif address == 0xE000EDF4:
+            selector_value = value & 0x1F
+            if value & (1 << 16):
+                special_registers[selector_value] = dcrdr[0]
+            else:
+                dcrdr[0] = special_registers[selector_value]
+        else:
+            raise AssertionError(f"unexpected register write: {address:#x}")
+
+    backend.read_memory = read_memory
+    backend.write_memory = write_memory
+    backend.write_register(name, requested)
+    if name in ("msp", "psp"):
+        assert (0xE000EDF8, requested) in writes
+    else:
+        assert (0xE000EDF8, expected) in writes
+    assert (0xE000EDF4, (1 << 16) | selector) in writes
+    if name in ("msp", "psp"):
+        expected_register = requested
+    else:
+        shift = {"control": 24, "faultmask": 16, "basepri": 8, "primask": 0}[name]
+        mask = {"control": 0xFF, "faultmask": 1, "basepri": 0xFF, "primask": 0xFF}[name]
+        expected_register = (expected >> shift) & mask
+    assert backend.read_register(name) == expected_register
+
+
+@pytest.mark.parametrize("target_state", [None, True])
+def test_remote_gdb_special_register_write_requires_halted_known_target(target_state):
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend("example.invalid", 3333, daemon_managed=True)
+    backend.register_numbers = {"sp": 13}
+    backend._is_running = False if target_state is None else target_state
+    if target_state is not None:
+        backend.target_profile = "stm32h7b0"
+        with pytest.raises(RuntimeError, match="halted target"):
+            backend.write_register("psp", 0x20010000)
+    else:
+        with pytest.raises(ValueError, match="does not advertise"):
+            backend.write_register("psp", 0x20010000)
 
 
 def test_remote_gdb_special_register_requires_halted_known_target():
@@ -859,3 +937,267 @@ def test_watchdog_freeze_remains_unavailable_for_gwemu():
 
     with pytest.raises(ValueError, match="does not model"):
         session.enable_watchdog_freeze()
+
+
+def test_remote_gdb_monitor_handoff_blocks_stale_poll_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("GWPROV_LEASE_DIR", str(tmp_path / "leases"))
+
+    from gwprov import daemon
+
+    key = "remote-gdb:gdb://debug-target.example.invalid:3333"
+    poller = daemon.HardwarePoller(
+        {
+            "key": key,
+            "id": "gdb:debug-target.example.invalid:3333",
+            "name": "test target",
+            "remoteGdb": True,
+            "host": "debug-target.example.invalid",
+            "port": 3333,
+            "url": "gdb://debug-target.example.invalid:3333",
+        }
+    )
+    service = daemon.Service()
+    service.hardware[key] = poller
+
+    result = service.dispatch(
+        {
+            "op": "target-pause",
+            "key": key,
+            "pauseToken": "foreground-owner",
+            "pid": 12345,
+            "waitSeconds": 30,
+        }
+    )
+
+    assert result == {"paused": True}
+    assert key in service.hardware_paused
+    assert poller.monitor_paused is True
+
+    # Simulate _poll_hardware using its previously copied unpaused snapshot.
+    # The poller's own locked entry guard must prevent reopening the backend.
+    poller.poll()
+    assert poller.backend is None
+
+    service.dispatch({"op": "target-resume", "key": key, "pauseToken": "foreground-owner"})
+    assert poller.monitor_paused is False
+
+
+def test_pause_device_monitor_rejects_daemon_refusal(monkeypatch):
+    from gwprov import daemon
+
+    monkeypatch.setattr(daemon, "request", lambda *args, **kwargs: {"paused": False})
+
+    with pytest.raises(RuntimeError, match="refused to pause the monitor"):
+        daemon.pause_device_monitor("remote-gdb:target", "handoff-token", 12345, 30)
+
+
+class ReconnectSocket:
+    """In-memory RSP peer; a poisoned old reader must never be consulted."""
+
+    def __init__(self, data=b"", *, poisoned=False, connect_error=None, peer_error=None):
+        import io
+
+        self.reader = io.BytesIO(data)
+        self.poisoned = poisoned
+        self.connect_error = connect_error
+        self.peer_error = peer_error
+        self.sent = []
+        self.timeouts = []
+        self.closed = False
+        self.peer = ("192.0.2.8", 3333)
+
+    def getpeername(self):
+        if self.peer_error:
+            raise self.peer_error
+        return self.peer
+
+    def settimeout(self, timeout):
+        assert not self.closed
+        self.timeouts.append(timeout)
+
+    def setsockopt(self, *args):
+        pass
+
+    def connect(self, address):
+        self.connected_to = address
+        if self.connect_error:
+            raise self.connect_error
+
+    def makefile(self, *args, **kwargs):
+        return self
+
+    def read(self, count):
+        assert not self.poisoned, "read reused poisoned buffered stream"
+        return self.reader.read(count)
+
+    def sendall(self, data):
+        assert not self.poisoned, "write reused poisoned stream"
+        self.sent.append(data)
+
+    def close(self):
+        self.closed = True
+
+
+def reconnect_owned_backend(monkeypatch, fresh):
+    from types import SimpleNamespace
+
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend("unresolvable.example.invalid", 3333)
+    old = ReconnectSocket(poisoned=True)
+    backend._socket = old
+    backend._sock_file = old
+    backend._monitor_pause_token = "retained-monitor-pause"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("reconnect surrendered or reacquired session ownership")
+
+    backend._remote_lease = SimpleNamespace(fd=123, acquire=forbidden, release=forbidden)
+    monkeypatch.setattr("gwprov.daemon.pause_device_monitor", forbidden)
+    monkeypatch.setattr("gwprov.daemon.resume_device_monitor", forbidden)
+    monkeypatch.setattr("gwprov.debug_shell.socket.socket", lambda *args: fresh)
+    return backend, old
+
+
+def reconnect_reply(payload):
+    return b"+$" + payload + b"#" + f"{sum(payload) % 256:02x}".encode()
+
+
+def test_reconnect_transport_retains_ownership_and_negotiates_fresh_stream(monkeypatch):
+    xml = b'<target><feature><reg name="pc" regnum="15"/></feature></target>'
+    fresh = ReconnectSocket(reconnect_reply(b"OK") + reconnect_reply(b"l" + xml))
+    backend, old = reconnect_owned_backend(monkeypatch, fresh)
+    lease = backend._remote_lease
+    backend.register_numbers = {"stale": 88}
+    backend.target_xml_error = "stale failure"
+
+    assert backend.reconnect_transport() is backend
+    assert old.closed
+    assert old.sent == []
+    assert backend._remote_lease is lease
+    assert lease.fd == 123
+    assert backend._monitor_pause_token == "retained-monitor-pause"
+    assert fresh.connected_to == old.peer
+    assert backend.register_numbers == {"pc": 15}
+    assert backend.target_xml_error is None
+    assert backend._is_running is None
+    assert backend._transport_deadline is None
+    commands = [packet.split(b"#")[0][1:] for packet in fresh.sent if packet.startswith(b"$")]
+    assert commands == [
+        b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+",
+        b"qXfer:features:read:target.xml:0,fff",
+    ]
+    assert fresh.timeouts[-1] == 5.0
+
+
+def test_reconnect_transport_connect_failure_closes_fresh_socket_retains_lease(monkeypatch):
+    fresh = ReconnectSocket(connect_error=ConnectionRefusedError("refused"))
+    backend, old = reconnect_owned_backend(monkeypatch, fresh)
+    backend.register_numbers = {"stale": 88}
+    with pytest.raises(ConnectionRefusedError, match="refused"):
+        backend.reconnect_transport()
+    assert old.closed and fresh.closed
+    assert backend._socket is None and backend._sock_file is None
+    assert backend._is_running is None
+    assert backend._remote_lease.fd == 123
+    assert backend._monitor_pause_token == "retained-monitor-pause"
+    assert backend.register_numbers == {}
+    assert backend._transport_deadline is None
+
+
+def test_reconnect_transport_negotiation_timeout_stops_before_target_xml(monkeypatch):
+    fresh = ReconnectSocket()
+    backend, old = reconnect_owned_backend(monkeypatch, fresh)
+    commands = []
+
+    def send(command):
+        commands.append(command)
+        raise TimeoutError("partial RSP packet timeout")
+
+    monkeypatch.setattr(backend, "_send_command", send)
+    with pytest.raises(TimeoutError, match="partial RSP"):
+        backend.reconnect_transport()
+    assert len(commands) == 1 and commands[0].startswith(b"qSupported:")
+    assert old.closed and fresh.closed
+    assert backend._socket is None
+    assert backend._is_running is None
+    assert backend._remote_lease.fd == 123
+
+
+def test_reconnect_transport_deadline_bounds_connect_reads_and_writes(monkeypatch):
+    fresh = ReconnectSocket()
+    backend, old = reconnect_owned_backend(monkeypatch, fresh)
+    clock = [10.0]
+    monkeypatch.setattr("gwprov.debug_shell.time.monotonic", lambda: clock[0])
+    recorded = []
+
+    def send(command):
+        clock[0] = 11.0
+        backend._write(b"handshake")
+        recorded.append(fresh.timeouts[-1])
+        clock[0] = 12.0
+        fresh.reader.write(b"X")
+        fresh.reader.seek(0)
+        assert backend._read(1) == b"X"
+        recorded.append(fresh.timeouts[-1])
+        clock[0] = 15.0
+        # Expiration prevents any later write, including retransmission.
+        backend._write(b"must-not-send")
+
+    monkeypatch.setattr(backend, "_send_command", send)
+    with pytest.raises(TimeoutError, match="deadline exceeded"):
+        backend.reconnect_transport(timeout=5.0)
+    assert fresh.timeouts[0] == 5.0
+    assert recorded == [4.0, 3.0]
+    assert fresh.sent == [b"handshake"]
+    assert old.closed and fresh.closed
+    assert backend._remote_lease.fd == 123
+
+
+def test_reconnect_transport_rejects_unowned_session_and_invalid_budget(monkeypatch):
+    backend, old = reconnect_owned_backend(monkeypatch, ReconnectSocket())
+    for timeout in (0, -1, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            backend.reconnect_transport(timeout=timeout)
+        assert not old.closed
+    backend._remote_lease.fd = None
+    with pytest.raises(RuntimeError, match="owned remote GDB session"):
+        backend.reconnect_transport()
+    assert not old.closed
+    backend._remote_lease.fd = 123
+    backend._monitor_pause_token = None
+    with pytest.raises(RuntimeError, match="owned remote GDB session"):
+        backend.reconnect_transport()
+    assert not old.closed
+
+
+def test_remote_gdb_preserves_caller_socket_timeout_outside_reconnect(monkeypatch):
+    from gwprov.debug_shell import RemoteGDBBackend
+
+    backend = RemoteGDBBackend("127.0.0.1", 3333, daemon_managed=True)
+    transport = ReconnectSocket(b"X")
+    backend._socket = transport
+    backend._sock_file = transport
+    transport.settimeout(0.125)
+
+    assert backend._read(1) == b"X"
+    backend._write(b"ordinary command")
+
+    assert transport.timeouts[-1] == 0.125
+    assert transport.sent == [b"ordinary command"]
+
+
+def test_reconnect_peer_lookup_failure_discards_old_stream_and_retains_lease(monkeypatch):
+    fresh = ReconnectSocket()
+    backend, old = reconnect_owned_backend(monkeypatch, fresh)
+    old.peer_error = OSError("peer unavailable")
+
+    with pytest.raises(OSError, match="peer unavailable"):
+        backend.reconnect_transport()
+
+    assert old.closed
+    assert backend._socket is None and backend._sock_file is None
+    assert backend._is_running is None
+    assert backend._remote_lease.fd == 123
+    assert backend._monitor_pause_token == "retained-monitor-pause"
+    assert fresh.sent == []

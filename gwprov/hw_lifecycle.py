@@ -86,8 +86,13 @@ class TargetModeError(RuntimeError):
     """The target is in a service mode that must not be replaced implicitly."""
 
 
-def inspect_target_mode(backend) -> dict:
-    """Passively classify the recovery service using web-builder's live checks."""
+def inspect_target_mode(backend, *, verify_flash_vtor_mailbox: bool = False) -> dict:
+    """Classify the recovery service, optionally verifying a flash-VTOR mailbox.
+
+    A stale IDLE word survives watchdog resets, so it is not proof of a live
+    service when VTOR points into flash. Callers about to attach/reset may opt
+    into a brief PC snapshot; passive callers never halt the target.
+    """
     vtor = int(backend.read_uint32(VTOR)) & 0xFFFFFFFF
     dhcsr = int(backend.read_uint32(DHCSR)) & 0xFFFFFFFF
     status = int(backend.read_uint32(MAILBOX_STATUS)) & 0xFFFFFFFF
@@ -99,12 +104,59 @@ def inspect_target_mode(backend) -> dict:
     stub_resident = RAM_STUB_START <= vtor < RAM_STUB_END
     halted = bool(dhcsr & S_HALT)
     mailbox_alive = status == STATUS_IDLE and not halted
-    # Match web-builder's isStubAlive() exactly: IDLE plus a running core.
-    # Keep this service signal separate from application identity, which is
-    # classified from VTOR for unlocked targets.
+    mailbox_idle_candidate = mailbox_alive and not stub_resident
+    # An idle mailbox is authoritative only with the RAM service VTOR. If a
+    # watchdog reset left the old IDLE word behind, inspect the PC only for
+    # lifecycle callers that explicitly intend to attach or replace the stub.
     service_state = _classify_gnwmanager_state(
         status=status, halted=halted, mailbox_alive=mailbox_alive
     )
+    pc = None
+    pc_verification = None
+    busy_candidate = status in GNWMANAGER_ACTIVE_STATUSES and not stub_resident
+    stale_busy = False
+    if mailbox_idle_candidate or (busy_candidate and verify_flash_vtor_mailbox):
+        if verify_flash_vtor_mailbox:
+            try:
+                from .ram_recovery import _ram_flasher_image
+
+                image = _ram_flasher_image()
+                pc, _ = _read_pc_snapshot(backend, halted)
+                pc_address = pc & ~1
+                pc_verification = (
+                    GNWMANAGER_FIRMWARE_ADDR <= pc_address < GNWMANAGER_FIRMWARE_ADDR + len(image)
+                )
+                if busy_candidate and pc_verification is False:
+                    # An interrupted write can leave ERASE/PROGRAM/HASH in SRAM
+                    # after reboot into flash. Do not infer staleness from one
+                    # PC outside the stub: require unlocked flash execution on
+                    # two snapshots and idle controllers, with stable metadata.
+                    flash_pc = VTOR_BANK1_START <= pc_address < VTOR_BANK_END
+                    flash_vtor = VTOR_BANK1_START <= vtor < VTOR_BANK_END
+                    if locked is False and flash_pc and flash_vtor and not halted:
+                        pc2, _ = _read_pc_snapshot(backend, False)
+                        sr1 = int(backend.read_uint32(0x52002010)) & 0xFFFFFFFF
+                        sr2 = int(backend.read_uint32(0x52002110)) & 0xFFFFFFFF
+                        stale_busy = (
+                            VTOR_BANK1_START <= (pc2 & ~1) < VTOR_BANK_END
+                            and sr1 != 0xFFFFFFFF
+                            and sr2 != 0xFFFFFFFF
+                            and not ((sr1 | sr2) & 7)  # BSY, WBNE, QW
+                            and int(backend.read_uint32(VTOR)) == vtor
+                            and int(backend.read_uint32(MAILBOX_STATUS)) == status
+                        )
+                    if not stale_busy:
+                        pc_verification = None
+            except Exception:
+                # Unknown is not proof of staleness: preserve the protective
+                # resident-service classification and refuse implicit reset.
+                pc_verification = None
+            if pc_verification is False:
+                service_state = None
+            elif pc_verification is None:
+                service_state = "unverified"
+        else:
+            service_state = None
     alive = service_state == "idle"
     detected = stub_resident or service_state is not None
     return {
@@ -118,6 +170,10 @@ def inspect_target_mode(backend) -> dict:
         "dhcsr": dhcsr,
         "status": status,
         "halted": halted,
+        "mailboxIdleCandidate": mailbox_idle_candidate,
+        "mailboxPc": pc,
+        "mailboxPcVerified": pc_verification,
+        "staleBusyMailbox": stale_busy,
     }
 
 
@@ -709,7 +765,7 @@ def assert_application_mode(backend, *, operation: str) -> dict:
     ``GnW.start_gnwmanager()``, which resets the device and overwrites the
     running RAM image.
     """
-    state = inspect_target_mode(backend)
+    state = inspect_target_mode(backend, verify_flash_vtor_mailbox=True)
     if state["stubDetected"]:
         mark_backend_recovery_required(backend, "gnwmanager RAM programmer")
         state_label = (
@@ -927,11 +983,11 @@ def recover_flasher(backend, gnw=None) -> dict:
 
         gnw = GnW(backend)
 
-    state = inspect_target_mode(backend)
+    state = inspect_target_mode(backend, verify_flash_vtor_mailbox=True)
     if state["stubAlive"]:
         mark_backend_recovery_required(backend, "synchronizing gnwmanager RAM flasher")
         counter = attach_to_idle_gnwmanager(backend, gnw)
-        state = inspect_target_mode(backend)
+        state = inspect_target_mode(backend, verify_flash_vtor_mailbox=True)
         if not state["stubAlive"]:
             raise TargetModeError(
                 "Recovery could not confirm the RAM flasher remained live and idle "
@@ -954,14 +1010,14 @@ def recover_flasher(backend, gnw=None) -> dict:
         assert_application_mode(backend, operation="start the recovery flasher")
     mark_backend_recovery_required(backend, "starting recovery flasher")
     start_gnwmanager_verified(backend, gnw)
-    state = inspect_target_mode(backend)
+    state = inspect_target_mode(backend, verify_flash_vtor_mailbox=True)
     if not state["stubAlive"]:
         raise TargetModeError(
             "Recovery failed: gnwmanager did not reach live IDLE after startup "
             f"(VTOR 0x{state['vtor']:08x}, status 0x{state['status']:08x})."
         )
     counter = attach_to_idle_gnwmanager(backend, gnw)
-    state = inspect_target_mode(backend)
+    state = inspect_target_mode(backend, verify_flash_vtor_mailbox=True)
     if not state["stubAlive"]:
         raise TargetModeError(
             "Recovery could not confirm the RAM flasher remained live and idle "

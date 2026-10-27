@@ -139,7 +139,7 @@ def test_apply_deployment_writes_exact_regions_then_starts_bank1(tmp_path, monke
         "vtor": 0x08000000,
         "status": 0,
     }
-    monkeypatch.setattr(hw_lifecycle, "inspect_target_mode", lambda _backend: app_state)
+    monkeypatch.setattr(hw_lifecycle, "inspect_target_mode", lambda _backend, **_kwargs: app_state)
     monkeypatch.setattr(
         hw_lifecycle, "assert_application_mode", lambda *_args, **_kwargs: app_state
     )

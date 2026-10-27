@@ -22,7 +22,7 @@ ci:
 		echo "=== CI checks: Python $$python_version ==="; \
 		uv python install "$$python_version"; \
 		project_env="$$work_dir/venv-$$python_version"; \
-		UV_PROJECT_ENVIRONMENT="$$project_env" uv sync --locked --group dev --python "$$python_version"; \
+		UV_PROJECT_ENVIRONMENT="$$project_env" uv sync --locked --group dev --extra dist --python "$$python_version"; \
 		UV_PROJECT_ENVIRONMENT="$$project_env" $(MAKE) check; \
 	done
 

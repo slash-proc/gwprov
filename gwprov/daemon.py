@@ -224,9 +224,16 @@ class HardwarePoller:
         # observation visible until the external process exits; target reads
         # are intentionally suspended during the handoff.
         self.external_owner: dict | None = None
+        # Set before handoff waits for this poller's lock. A poll that was
+        # already selected from a stale service-level snapshot will then either
+        # finish before handoff closes its backend or observe this flag before
+        # opening a replacement connection.
+        self.monitor_paused = False
 
     def poll(self, *, force: bool = False) -> None:
         with self.lock:
+            if self.monitor_paused:
+                return
             if self.release_for_external_session():
                 return
             # A foreground CLI owns the interface while its process-shared
@@ -780,7 +787,7 @@ class Service:
                             f"remote:{probe['url']}" if probe.get("url") else f"probe:{probe['id']}"
                         )
                         if key not in self.hardware:
-                            self.hardware[key] = HardwarePoller(probe)
+                            self.hardware[key] = self._new_hardware_poller(key, probe)
                             added.append(self.hardware[key])
                 # On daemon start (or when an adapter is newly attached), do
                 # the first observation before returning the initial ps view.
@@ -820,7 +827,7 @@ class Service:
                 # the verified RAM stub before this session's lease suppresses
                 # that transition. A debug attach must never be the operation
                 # that discovers it needs to initialize the service.
-                poller = self.hardware.setdefault(key, HardwarePoller(probe))
+                poller = self.hardware.setdefault(key, self._new_hardware_poller(key, probe))
                 poller.poll()
                 if poller.backend is None:
                     raise RuntimeError(poller.state.get("detail", "target connection failed"))
@@ -926,8 +933,12 @@ class Service:
                     self.hardware_paused.add(key)
                     poller = self.hardware.get(key)
                     if poller:
+                        # Publish the pause before taking the poller lock. If
+                        # the passive loop had copied an unpaused snapshot, its
+                        # eventual poll() entry must still see this handoff.
+                        poller.monitor_paused = True
                         poller.handoff()
-                return {"paused": isinstance(key, str)}
+                return {"paused": isinstance(key, str) and key in self.hardware_paused}
             if operation == "target-resume":
                 key = message.get("key")
                 pause_token = message.get("pauseToken")
@@ -940,6 +951,7 @@ class Service:
                             self.hardware_paused.discard(key)
                     poller = self.hardware.get(key)
                     if poller:
+                        poller.monitor_paused = key in self.hardware_paused
                         poller.invalidate_installed()
                         poller.last_poll = 0.0
                         poller.operation_finished()
@@ -971,6 +983,11 @@ class Service:
             if isinstance(owner.get("pid"), int) and _pid_exists(owner["pid"])
         ]
         return len(live), sum(operation_blocks_drain(owner) for owner in live)
+
+    def _new_hardware_poller(self, key: str, probe: dict) -> HardwarePoller:
+        poller = HardwarePoller(probe)
+        poller.monitor_paused = key in self.hardware_paused
+        return poller
 
     def _device_rows(self) -> list[dict]:
         rows = [poller.snapshot() for poller in self.hardware.copy().values()]
@@ -1231,7 +1248,9 @@ class Service:
                 self.hardware_paused.discard(key)
                 poller = self.hardware.get(key)
                 if poller:
+                    poller.monitor_paused = False
                     poller.invalidate_installed()
+                    poller.last_poll = 0.0
                     poller.operation_finished()
 
         with self.cancel_lock:
@@ -1416,7 +1435,7 @@ class Service:
                         continue
                     present.add(key)
                     if key not in self.hardware:
-                        self.hardware[key] = HardwarePoller(probe)
+                        self.hardware[key] = self._new_hardware_poller(key, probe)
                         added.append(self.hardware[key])
                 # Reconcile detached probes and removed remote endpoints. A failed
                 # transport-wide inventory is not evidence that its devices vanished.
@@ -2047,7 +2066,7 @@ def device_snapshot(*, refresh: bool = False) -> list[dict]:
 def pause_device_monitor(key: str, pause_token: str, pid: int, wait_seconds: float) -> None:
     """Hand a monitored target connection to a foreground device operation."""
     try:
-        request(
+        response = request(
             {
                 "op": "target-pause",
                 "key": key,
@@ -2057,6 +2076,8 @@ def pause_device_monitor(key: str, pause_token: str, pid: int, wait_seconds: flo
             },
             timeout=60.0,
         )
+        if response.get("paused") is not True:
+            raise RuntimeError(f"GWProv daemon refused to pause the monitor for {key}: {response}")
     except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
         # No service owns a monitor connection, so the foreground backend can
         # proceed to its process-shared lease and direct adapter connection.
